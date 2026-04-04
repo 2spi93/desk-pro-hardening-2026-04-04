@@ -1,0 +1,10 @@
+services:
+  market-data:
+    environment:
+      GOLDAPI_API_KEY_FILE: /workspace/secrets/goldapi_api_key
+      TWELVEDATA_API_KEY_FILE: /workspace/secrets/twelvedata_api_key
+      METALSAPI_API_KEY_FILE: /workspace/secrets/metalsapi_api_key
+      MARKET_SHARD_INDEX: "0"
+      MARKET_SYNC_SECONDS: "12"
+      MARKET_DEPTH_STREAM_ENABLED: "1"
+      MARKET_SHARD_TOTAL: "1"

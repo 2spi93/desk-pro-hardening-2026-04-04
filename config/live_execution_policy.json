@@ -1,0 +1,30 @@
+{
+  "enabled": true,
+  "providers": {
+    "bingx": {
+      "enabled": true,
+      "require_route_flag": true,
+      "allowed_system_modes": [
+        "managed_live"
+      ],
+      "allow_smoke_test_in_modes": [
+        "guarded_auto",
+        "managed_live"
+      ],
+      "max_order_notional_usd": 10.0,
+      "default_order_notional_usd": 7.0,
+      "smoke_test_notional_usd": 7.0,
+      "smoke_limit_offset_bps": 3500,
+      "primary_live_instrument": "BTCUSDT",
+      "conditional_live_rules": {
+        "SOLUSDT": {
+          "allowed_regimes": [
+            "TREND"
+          ],
+          "min_confidence": 0.78,
+          "reason": "sol_only_in_momentum"
+        }
+      }
+    }
+  }
+}

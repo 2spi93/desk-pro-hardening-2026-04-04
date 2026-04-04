@@ -1,1 +1,2 @@
-# desk-pro-hardening-20260404
+# TXT-
+Trader eXelle Terminal: Plateforme de trading humaine &amp; IA

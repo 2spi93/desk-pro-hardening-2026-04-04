@@ -1,0 +1,18 @@
+# Exclude secrets and local env from build context
+.env
+.env.*
+!.env.example
+secrets/
+
+# VCS and editor
+.git/
+.gitignore
+.vscode/
+
+# Build/runtime artifacts
+.next/
+node_modules/
+__pycache__/
+*.pyc
+*.log
+logs/

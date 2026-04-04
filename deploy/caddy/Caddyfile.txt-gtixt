@@ -1,0 +1,91 @@
+{
+	email ops@gtixt.com
+	admin off
+}
+
+(txt_common) {
+	encode zstd gzip
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "SAMEORIGIN"
+		Referrer-Policy "strict-origin-when-cross-origin"
+	}
+}
+
+# TXT root: canonical entry goes to the app.
+txt.gtixt.com {
+	import txt_common
+	redir https://app.txt.gtixt.com{uri} permanent
+}
+
+staging.txt.gtixt.com {
+	import txt_common
+	reverse_proxy 127.0.0.1:3000
+}
+
+app.txt.gtixt.com {
+	import txt_common
+	reverse_proxy 127.0.0.1:3000
+}
+
+api.staging.txt.gtixt.com {
+	import txt_common
+
+	@marketQuotesWs path /ws/v1/market/quotes*
+	handle @marketQuotesWs {
+		reverse_proxy 127.0.0.1:8000
+	}
+
+	@marketWs path /ws/v1/market/*
+	handle @marketWs {
+		reverse_proxy 127.0.0.1:8003
+	}
+
+	@executionWs path /ws/v1/execution/*
+	handle @executionWs {
+		reverse_proxy 127.0.0.1:8000
+	}
+
+	@connectorsWs path /v1/connectors/ws
+	handle @connectorsWs {
+		reverse_proxy 127.0.0.1:8000
+	}
+
+	handle {
+		reverse_proxy 127.0.0.1:8000
+	}
+}
+
+api.txt.gtixt.com {
+	import txt_common
+
+	@marketQuotesWs path /ws/v1/market/quotes*
+	handle @marketQuotesWs {
+		reverse_proxy 127.0.0.1:8000
+	}
+
+	@marketWs path /ws/v1/market/*
+	handle @marketWs {
+		reverse_proxy 127.0.0.1:8003
+	}
+
+	@executionWs path /ws/v1/execution/*
+	handle @executionWs {
+		reverse_proxy 127.0.0.1:8000
+	}
+
+	@connectorsWs path /v1/connectors/ws
+	handle @connectorsWs {
+		reverse_proxy 127.0.0.1:8000
+	}
+
+	handle {
+		reverse_proxy 127.0.0.1:8000
+	}
+}
+
+control.txt.gtixt.com {
+	import txt_common
+	reverse_proxy 127.0.0.1:8001
+}

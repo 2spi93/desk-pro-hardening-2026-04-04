@@ -1,0 +1,44 @@
+{
+  "name": "tradingview",
+  "label": "TradingView",
+  "palette": {
+    "up": "#26A69A",
+    "down": "#EF5350",
+    "wick": "#6B7280",
+    "background": "#111827",
+    "backgroundAccent": "#121C2A",
+    "text": "#E5EDF8",
+    "crosshair": "#9DD6FF",
+    "labelBackground": "#162233"
+  },
+  "rendering": {
+    "bodyOpacity": 0.95,
+    "verticalGradientPct": 0.12,
+    "wickWidthPx": 1.35,
+    "borderWidthPx": 0.4,
+    "bodyRadiusPx": 2,
+    "antiAliasing": "msaa-4x",
+    "floatingPositioning": true,
+    "extremeWickGlow": 0.15
+  },
+  "motion": {
+    "transitionMs": 100,
+    "easing": "cubic-bezier(0.25, 0.8, 0.25, 1)",
+    "wickAppearanceMs": 35,
+    "bodyInertia": 0.06,
+    "breathePx": 0.4,
+    "directionBounce": 0.03
+  },
+  "perception": {
+    "intraCandleSmoothing": 0.24,
+    "horizontalStabilization": 0.68,
+    "comfortZonePct": 0.52,
+    "strictBucketAlignment": true,
+    "domWickSmoothing": false,
+    "lastCandleGlow": 0.1,
+    "wickDomShiftPct": 0
+  },
+  "frame": {
+    "minFrameMs": 16
+  }
+}

@@ -1,0 +1,37 @@
+name: rust-execution-engine
+
+on:
+  pull_request:
+    paths:
+      - rust-execution-engine/**
+      - .github/workflows/rust-execution-engine.yml
+  push:
+    branches:
+      - main
+    paths:
+      - rust-execution-engine/**
+      - .github/workflows/rust-execution-engine.yml
+
+jobs:
+  cargo-build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust-execution-engine
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.77.0
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo check
+        run: cargo check --all-targets
+      - name: cargo build release
+        run: cargo build --release
+      - name: cargo build hft bench
+        run: cargo build --release --bin hft_ring_bench
+
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build rust execution image
+        run: docker build -f rust-execution-engine/Dockerfile -t rust-execution-engine:ci .

@@ -1,0 +1,39 @@
+{
+  "name": "mission-control-ui",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "predev": "rm -rf .next",
+    "dev": "next dev -H 0.0.0.0 -p 3000",
+    "lint": "tsc --noEmit",
+    "build": "next build",
+    "start": "next start -p 3000",
+    "qa:smoke": "sh scripts/qa-smoke.sh",
+    "qa:ui-regression": "sh scripts/qa-regression-ui.sh",
+    "qa:ui-regression:chart": "PLAYWRIGHT_TEST_GREP=@chart sh scripts/qa-regression-ui.sh",
+    "qa:ui-regression:hud": "PLAYWRIGHT_TEST_PATH=tests/e2e/chart-trading-hud.spec.ts sh scripts/qa-regression-ui.sh",
+    "qa:all": "sh scripts/qa-all.sh",
+    "qa:real-control-plane": "sh scripts/qa-real-control-plane.sh",
+    "qa:real-control-plane:staging": "sh scripts/qa-real-control-plane.sh staging",
+    "qa:real-control-plane:prod": "sh scripts/qa-real-control-plane.sh prod",
+    "deps:check-next": "sh scripts/check-next-version.sh",
+    "test:ohlcv-kernel-regression": "sh scripts/test-ohlcv-kernel-regression.sh",
+    "test:risk-workspace": "node scripts/risk-workspace.integration.js",
+    "test:e2e": "playwright test",
+    "test:e2e:install": "playwright install --with-deps"
+  },
+  "dependencies": {
+    "jszip": "^3.10.1",
+    "lightweight-charts": "4.2.3",
+    "next": "15.5.10",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "react-resizable-panels": "^2.1.9"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.58.2",
+    "@types/node": "25.5.0",
+    "@types/react": "19.2.14",
+    "typescript": "5.9.3"
+  }
+}

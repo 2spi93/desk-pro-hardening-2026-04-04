@@ -1,0 +1,7 @@
+FROM python:3.11-slim
+
+WORKDIR /workspace
+
+# Install Python dependencies once at image build time.
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt

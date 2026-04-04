@@ -1,0 +1,14 @@
+{
+  "flags": {
+    "kairos_live": true,
+    "kairos_strategy_arena": true,
+    "memory_v2_causal_strict": true,
+    "auto_dream_safe_mode": true,
+    "meta_governor_global": true,
+    "execution_learning_required": true,
+    "mutation_engine": false,
+    "aggressive_mode": false,
+    "risk_off_mode": false,
+    "multi_venue_arbitrage": false
+  }
+}

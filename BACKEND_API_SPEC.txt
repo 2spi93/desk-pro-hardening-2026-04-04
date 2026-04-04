@@ -1,0 +1,574 @@
+================================================================================
+MISSION CONTROL BACKEND API SPECIFICATION (v1.0)
+Production-Grade Trading Terminal Integration
+================================================================================
+
+Status: PLUG-AND-PLAY READY (Shadow Mode Compatible)
+Last Updated: 2026-03-21
+Target: Zero fallback rate, < 2% divergence in shadow mode
+
+================================================================================
+🟦 A. AUTHENTICATION ENDPOINTS (CRITICAL PATH)
+================================================================================
+
+1. GET /v1/auth/preferences
+   Description: Fetch user UI/trading preferences
+   Auth: Bearer token
+   Query Params: (none)
+   
+   Response 200:
+   {
+     "preferences": {
+       "ui_mode": "novice",                    // novice|intermediate|expert
+       "theme": "dark",                        // dark|light
+       "chart": {
+         "type": "candles",                    // candles|bars|line
+         "timezone": "UTC",
+         "interval": "1m",
+         "overlay": ["sma20", "sma50"]
+       },
+       "notifications": {
+         "risk_alert": true,
+         "execution_report": true,
+         "system_status": true
+       },
+       "defaults": {
+         "order_qty": 0.1,
+         "leverage": 1.0,
+         "slippage_tolerance_bps": 10
+       }
+     }
+   }
+   
+   Cache: 5 minutes (stale-while-revalidate)
+   Fallback: {} (empty prefs, use frontend defaults)
+
+
+2. PUT /v1/auth/preferences
+   Description: Update user preferences
+   Auth: Bearer token
+   Body: (same as GET response payload)
+   
+   Response 200:
+   {
+     "status": "ok",
+     "persisted": true,
+     "timestamp": "2026-03-21T22:15:00Z"
+   }
+   
+   Fallback: {status: "ok", persisted: false} (client-side caching)
+
+
+3. POST /v1/auth/login
+   Description: OAuth/token exchange
+   Auth: None (initial)
+   Body:
+   {
+     "email": "user@example.com",
+     "password": "***",
+     "mfa_code": "123456"
+   }
+   
+   Response 200:
+   {
+     "token": "eyJhbGc...",
+     "expires_in": 3600,
+     "user": {
+       "id": "user_abc123",
+       "email": "user@example.com"
+     }
+   }
+
+
+4. POST /v1/auth/logout
+   Description: Invalidate session
+   Auth: Bearer token
+   
+   Response 200:
+   {
+     "status": "ok"
+   }
+
+
+5. GET /v1/auth/ws-token
+   Description: Get WebSocket auth token (short-lived)
+   Auth: Bearer token (HTTP)
+   
+   Response 200:
+   {
+     "token": "ws_eyJhbGc...",
+     "expires_in": 60
+   }
+   
+   Note: Required for real-time subscriptions
+
+
+================================================================================
+🟩 B. RISK ENGINE ENDPOINTS (CORE METRICS)
+================================================================================
+
+1. GET /v1/mt5/orders/risk-history
+   Description: Fetch recent trade execution quality metrics
+   Auth: Bearer token
+   Query Params:
+     - symbol: string (BTCUSD, EURUSD, etc.)
+     - account_id: string (mt5-demo-01, mt5-prod-01)
+     - limit: int (default 50, max 500)
+     - fromTs: ISO8601 timestamp
+     - toTs: ISO8601 timestamp
+   
+   Response 200:
+   [
+     {
+       "id": "trade_1234567890",
+       "symbol": "BTCUSD",
+       "side": "buy",                         // buy|sell
+       "entry_price": 42150.50,
+       "exit_price": 42180.75,
+       "qty": 0.1,
+       "pnl_usd": 30.25,
+       "pnl_pct": 0.072,
+       "slippage_bps": 12,                    // basis points
+       "latency_ms": 145,
+       "execution_quality_score": 0.87,      // 0.0-1.0
+       "filled_pct": 100,
+       "timestamp": "2026-03-21T22:15:30Z",
+       "duration_sec": 45,
+       "route": "primary",
+       "route_latency_ms": 140,
+       "market_impact_bps": 5
+     }
+   ]
+   
+   Cache: 30 seconds (real-time updated)
+   Fallback: [] (empty array, UI shows "no recent trades")
+   
+   SLA: P99 < 500ms
+
+
+2. GET /v1/mt5/orders/risk-history/summary
+   Description: Aggregate performance metrics (risk KPIs)
+   Auth: Bearer token
+   Query Params:
+     - window: int (lookback minutes, default 60)
+     - miss_threshold: float (miss_pct threshold, default 0.05)
+     - symbol: string (optional filter)
+     - account_id: string
+   
+   Response 200:
+   {
+     "window_sec": 3600,
+     "trades_total": 47,
+     "trades_win": 29,
+     "trades_loss": 18,
+     "winrate": 0.6170,
+     "avg_pnl_usd": 45.20,
+     "avg_slippage_bps": 11.3,
+     "p95_latency_ms": 340,
+     "drawdown": 0.0820,                      // max consecutive loss
+     "max_loss_single": -120.50,
+     "risk_score": 0.713,                     // composite (0.0-1.0)
+     "execution_quality_avg": 0.84,
+     "alerts": {
+       "stale": false,
+       "hard_alert": false,
+       "hard_alert_reason": null,
+       "miss_pct": 0.021,
+       "miss_threshold": 0.05
+     },
+     "timestamp": "2026-03-21T22:25:00Z"
+   }
+   
+   Cache: 60 seconds
+   Fallback:
+   {
+     "window_sec": window_param,
+     "trades_total": 0,
+     "winrate": 0.5,
+     "avg_pnl_usd": 0,
+     "risk_score": 0.5,
+     "alerts": {all false},
+     "timestamp": now()
+   }
+   
+   SLA: P99 < 800ms
+
+
+3. GET /v1/risk/settings
+   Description: Fetch risk engine configuration
+   Auth: Bearer token
+   
+   Response 200:
+   {
+     "risk_limits": {
+       "max_position_usd": 10000,
+       "max_leverage": 10.0,
+       "max_correlation": 0.95,
+       "stop_loss_pct": 2.0
+     },
+     "hard_alert_threshold": 75,              // % of max loss
+     "miss_threshold_pct": 5.0,
+     "latency_sla_ms": 200
+   }
+   
+   Cache: 24 hours (rarely changes)
+
+
+4. GET /v1/risk/confirm-required
+   Description: Check if order needs risk confirmation
+   Auth: Bearer token
+   Query Params:
+     - symbol: string
+     - side: string (buy|sell)
+     - qty: float
+     - leverage: float
+     - current_drawdown_pct: float
+   
+   Response 200:
+   {
+     "confirm_required": true|false,
+     "reason": "drawdown_near_limit",
+     "risk_score": 0.82,
+     "estimated_max_loss_usd": 250
+   }
+   
+   SLA: P99 < 150ms (pre-order gate)
+
+
+================================================================================
+🟧 C. MARKET DATA ENDPOINTS (REAL-TIME)
+================================================================================
+
+1. GET /v1/market/quotes
+   Description: Current market prices (REST fallback)
+   Auth: Bearer token
+   Query Params:
+     - symbols: "BTCUSD,EURUSD" (comma-separated)
+   
+   Response 200:
+   {
+     "quotes": [
+       {
+         "symbol": "BTCUSD",
+         "bid": 42150.00,
+         "ask": 42151.50,
+         "last": 42150.75,
+         "volume_24h": 1250000,
+         "timestamp": "2026-03-21T22:25:30Z"
+       }
+     ]
+   }
+   
+   Note: WebSocket preferred for real-time
+
+
+2. GET /v1/market/orderbook
+   Description: Level 2 orderbook snapshot
+   Auth: Bearer token
+   Query Params:
+     - symbol: string
+     - depth: int (default 20)
+   
+   Response 200:
+   {
+     "symbol": "BTCUSD",
+     "bids": [
+       {"price": 42150.00, "size": 5.2},
+       {"price": 42149.50, "size": 3.1}
+     ],
+     "asks": [
+       {"price": 42151.50, "size": 4.8},
+       {"price": 42152.00, "size": 2.9}
+     ],
+     "timestamp": "2026-03-21T22:25:30.123Z"
+   }
+
+
+3. WS /ws/v1/market/quotes
+   Description: Real-time quote stream
+   Auth: Bearer (ws_token)
+   
+   Subscribe Message:
+   {
+     "type": "subscribe",
+     "channel": "quotes",
+     "symbols": ["BTCUSD", "EURUSD"]
+   }
+   
+   Update Message:
+   {
+     "type": "quote",
+     "symbol": "BTCUSD",
+     "bid": 42150.00,
+     "ask": 42151.50,
+     "timestamp": "2026-03-21T22:25:30.456Z"
+   }
+
+
+4. WS /ws/v1/execution
+   Description: Real-time execution status stream
+   Auth: Bearer (ws_token)
+   
+   Subscribe:
+   {
+     "type": "subscribe",
+     "channel": "executions"
+   }
+   
+   Update:
+   {
+     "type": "execution",
+     "trade_id": "trade_xyz",
+     "status": "filled",                      // pending|filled|rejected|cancelled
+     "filled_qty": 0.1,
+     "fill_price": 42150.75,
+     "timestamp": "2026-03-21T22:25:30.789Z"
+   }
+
+
+================================================================================
+🟥 D. ORDER EXECUTION ENDPOINTS
+================================================================================
+
+1. POST /v1/orders/preview
+   Description: Dry-run order without execution (risk gate)
+   Auth: Bearer token
+   Body:
+   {
+     "symbol": "BTCUSD",
+     "side": "buy",                           // buy|sell
+     "qty": 0.1,
+     "order_type": "market",                  // market|limit|stop
+     "limit_price": 42000.00,                 // if limit
+     "leverage": 1.0,
+     "route": "primary",                      // primary|secondary|aggregated
+     "risk_check": true
+   }
+   
+   Response 200:
+   {
+     "preview_id": "prev_12345",
+     "symbol": "BTCUSD",
+     "slippage_expected_bps": 15,
+     "fee_estimated_usd": 5.00,
+     "pnl_scenario": {
+       "best_case_usd": 150,
+       "worst_case_usd": -80
+     },
+     "risk_check": {
+       "passed": true,
+       "violations": []
+     },
+     "ready_to_submit": true
+   }
+   
+   SLA: P99 < 200ms
+
+
+2. POST /v1/orders
+   Description: Submit order for execution
+   Auth: Bearer token
+   Body: (same as preview + preview_id)
+   
+   Response 200:
+   {
+     "order_id": "ord_54321",
+     "trade_id": "trade_xyz",
+     "status": "submitted",
+     "timestamp": "2026-03-21T22:25:35Z"
+   }
+   
+   Response 400:
+   {
+     "error": "order_validation_failed",
+     "reason": "insufficient_margin",
+     "details": {}
+   }
+   
+   SLA: P99 < 300ms
+
+
+3. POST /v1/orders/cancel
+   Description: Cancel pending order
+   Auth: Bearer token
+   Body:
+   {
+     "order_id": "ord_54321"
+   }
+   
+   Response 200:
+   {
+     "status": "cancelled",
+     "timestamp": "2026-03-21T22:25:40Z"
+   }
+
+
+================================================================================
+🟪 E. SYSTEM / HEALTH ENDPOINTS
+================================================================================
+
+1. GET /health
+   Description: Simple health check (no auth)
+   
+   Response 200:
+   {
+     "status": "ok",
+     "uptime_sec": 12345,
+     "timestamp": "2026-03-21T22:25:45Z"
+   }
+   
+   SLA: P99 < 50ms
+
+
+2. GET /v1/system/status
+   Description: Detailed system status
+   Auth: Bearer token
+   
+   Response 200:
+   {
+     "api": "ok",
+     "database": "ok",
+     "cache": "ok",
+     "message_queue": "ok",
+     "websocket": "ok",
+     "backend_version": "1.2.3",
+     "timestamp": "2026-03-21T22:25:45Z",
+     "dependencies": {
+       "control_plane": "ok",
+       "market_data_service": "ok",
+       "risk_engine": "ok"
+     }
+   }
+
+
+================================================================================
+🟨 F. GLOBAL STANDARDS (MUST HAVE FOR STABILITY)
+================================================================================
+
+1. PROTOCOL
+   ✅ HTTPS only (TLS 1.2+)
+   ✅ HTTP/2 preferred
+   ✅ No HTTP fallback
+
+2. AUTHENTICATION
+   ✅ Bearer token (JWT or opaque)
+   ✅ HMAC signature for webhooks
+   ✅ Token refresh via /v1/auth/token-refresh
+   ✅ CORS headers for browser clients
+
+3. REQUEST/RESPONSE FORMAT
+   ✅ application/json everywhere
+   ✅ Content-Type: application/json; charset=utf-8
+   ✅ No null values (use empty objects/arrays instead)
+   ✅ ISO8601 timestamps (Z suffix for UTC)
+   ✅ Decimal numbers as strings (e.g., "42150.50") for precision
+
+4. ERROR HANDLING
+   ✅ 400: Bad Request (validation error)
+   ✅ 401: Unauthorized (expired token)
+   ✅ 403: Forbidden (insufficient permissions)
+   ✅ 404: Not Found (resource doesn't exist)
+   ✅ 429: Rate Limited (backoff 60s)
+   ✅ 500: Server Error (retry with exponential backoff)
+   
+   Error Response Format:
+   {
+     "error": "error_code",
+     "message": "human-readable message",
+     "details": {},
+     "request_id": "req_xyz123"
+   }
+
+5. VERSIONING
+   ✅ /v1/ in all routes
+   ✅ Major version changes = V2 route separate
+   ✅ Backward compatibility for at least 2 versions
+
+6. CACHING
+   ✅ Cache-Control headers (public/private, max-age, s-maxage)
+   ✅ ETag for conditional requests
+   ✅ Stale-while-revalidate for graceful degradation
+
+7. RATE LIMITING
+   ✅ 1000 requests/min per user (Bearer token)
+   ✅ 100 requests/sec per IP (public endpoints)
+   ✅ Burst capacity: 150% of rate limit
+   ✅ X-RateLimit-Remaining header
+
+8. LOGGING / OBSERVABILITY
+   ✅ All requests logged with request_id
+   ✅ Latency tracked (p50, p95, p99)
+   ✅ Error rates monitored
+   ✅ Structured JSON logs for parsing
+
+9. TESTING
+   ✅ 100% endpoint coverage in QA suite
+   ✅ Load testing: 500 concurrent users
+   ✅ Chaos testing: simulate 404/500 responses
+   ✅ Latency injection: test fallback behavior
+
+10. DEPLOYMENT
+    ✅ Health check gate before production
+    ✅ Gradual rollout (10% → 50% → 100% users)
+    ✅ Automatic rollback on error rate > 5%
+    ✅ Feature flags for shadow/dual mode
+
+
+================================================================================
+🔥 IMPLEMENTATION CHECKLIST (FOR BACKEND TEAM)
+================================================================================
+
+PHASE 1 — Foundation (Week 1)
+  ☐ /v1/auth/preferences (GET/PUT) — CRITICAL
+  ☐ Error response format standardized
+  ☐ HTTPS + CORS configured
+  ☐ Bearer token validation working
+  ☐ Health check (/health) passing
+
+PHASE 2 — Risk Core (Week 2)
+  ☐ /v1/mt5/orders/risk-history (GET) — CRITICAL
+  ☐ /v1/mt5/orders/risk-history/summary (GET) — CRITICAL
+  ☐ /v1/risk/confirm-required (GET)
+  ☐ Latency: P99 < 500ms
+  ☐ Load tested: 50 concurrent requests
+
+PHASE 3 — Trading (Week 3)
+  ☐ /v1/orders/preview (POST)
+  ☐ /v1/orders (POST)
+  ☐ /v1/orders/cancel (POST)
+  ☐ Risk gates integrated (preview before submit)
+
+PHASE 4 — Real-Time (Week 4)
+  ☐ WS /ws/v1/market/quotes
+  ☐ WS /ws/v1/execution
+  ☐ Quote stream: < 500ms latency
+  ☐ Connection resilience (auto-reconnect)
+
+PHASE 5 — Production Hardening (Week 5)
+  ☐ Circuit breaker for degraded services
+  ☐ Fallback behavior documented
+  ☐ Shadow mode testing complete
+  ☐ Gradual rollout to 10% users
+  ☐ Monitor fallback_rate metric
+
+
+================================================================================
+📊 SUCCESS METRICS (SHADOW MODE)
+================================================================================
+
+Target State:
+  fallback_rate          < 1%     (< 1 fallback per 100 calls)
+  shadow_diff            < 2%     (< 2% divergence between fallback & real)
+  response_time_p99      < 500ms
+  error_rate             < 0.5%
+  availability           > 99.9%
+
+Monitoring:
+  [TXT][SHADOW_OK]       = backend working, using real data
+  [TXT][SHADOW_FAIL]     = backend failed, falling back
+  [TXT][SHADOW_DIFF]     = real data differs from fallback (investigate)
+
+
+================================================================================
+END API SPEC
+================================================================================

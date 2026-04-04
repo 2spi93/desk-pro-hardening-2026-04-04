@@ -1,0 +1,44 @@
+{
+  "name": "txt-signature",
+  "label": "TXT Signature",
+  "palette": {
+    "up": "#00C46A",
+    "down": "#FF4D4D",
+    "wick": "#222222",
+    "background": "#0D0F12",
+    "backgroundAccent": "#0B0C0E",
+    "text": "#EAF2FF",
+    "crosshair": "#8FE1FF",
+    "labelBackground": "#101A24"
+  },
+  "rendering": {
+    "bodyOpacity": 0.96,
+    "verticalGradientPct": 0.14,
+    "wickWidthPx": 1.4,
+    "borderWidthPx": 0.45,
+    "bodyRadiusPx": 2,
+    "antiAliasing": "msaa-8x",
+    "floatingPositioning": true,
+    "extremeWickGlow": 0.16
+  },
+  "motion": {
+    "transitionMs": 80,
+    "easing": "linear",
+    "wickAppearanceMs": 40,
+    "bodyInertia": 0.12,
+    "breathePx": 0.35,
+    "directionBounce": 0.04
+  },
+  "perception": {
+    "intraCandleSmoothing": 0.35,
+    "horizontalStabilization": 0.75,
+    "comfortZonePct": 0.56,
+    "strictBucketAlignment": true,
+    "domWickSmoothing": true,
+    "lastCandleGlow": 0.12,
+    "wickDomShiftPct": 0.03
+  },
+  "frame": {
+    "minFrameMs": 16
+  }
+}

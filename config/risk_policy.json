@@ -1,0 +1,29 @@
+{
+  "policy_version": "mvp-2026-04-03-small-cap-btc-first",
+  "allowed_system_modes": [
+    "suggest",
+    "guarded_auto",
+    "managed_live"
+  ],
+  "max_trade_notional_usd": 10,
+  "daily_notional_limit_usd": 30,
+  "max_leverage": 2.0,
+  "max_slippage_bps": 10,
+  "min_confidence": 0.7,
+  "blocked_venues": [],
+  "blocked_instruments": [],
+  "paper_only": true,
+  "preferred_live_instruments": [
+    "BTCUSDT"
+  ],
+  "conditional_instrument_rules": {
+    "SOLUSDT": {
+      "allowed_regimes": [
+        "TREND"
+      ],
+      "min_confidence": 0.78,
+      "max_trade_notional_usd": 7,
+      "reason": "sol_only_in_momentum"
+    }
+  }
+}

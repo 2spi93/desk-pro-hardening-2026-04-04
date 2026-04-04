@@ -1,0 +1,49 @@
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+secrets/
+
+# Build/runtime artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.tsbuildinfo
+.venv/
+.next/
+.next-runtime/
+node_modules/
+logs/
+*.log
+
+# Diagnostic / temporary
+*.cache
+*.local
+*.env.local
+coverage/
+dist/
+data/certbot/
+data/mission-control/
+data/predictor_v8/
+rust-execution-engine/target/
+
+# Screenshots / diagnostic captures (Playwright, manual)
+*.png
+*.jpg
+*.jpeg
+
+# Test results
+ui/mission-control/test-results/
+ui/mission-control/playwright-report/
+
+# Diagnostic scripts (one-off, not production code)
+ui/mission-control/scripts/
+
+# Smoke scripts at root
+ui/mission-control/final_smoke.js
+ui/mission-control/sidecar_smoke.js
+
+# Artifacts
+artifacts/
+ui/mission-control/artifacts/

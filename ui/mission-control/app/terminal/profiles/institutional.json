@@ -1,0 +1,44 @@
+{
+  "name": "institutional",
+  "label": "Institutional",
+  "palette": {
+    "up": "#00C46A",
+    "down": "#FF4D4D",
+    "wick": "#1A1A1A",
+    "background": "#0D0F12",
+    "backgroundAccent": "#0B0C0E",
+    "text": "#E8F0F9",
+    "crosshair": "#9FD9FF",
+    "labelBackground": "#12161C"
+  },
+  "rendering": {
+    "bodyOpacity": 0.95,
+    "verticalGradientPct": 0.11,
+    "wickWidthPx": 1.3,
+    "borderWidthPx": 0.35,
+    "bodyRadiusPx": 2,
+    "antiAliasing": "msaa-4x",
+    "floatingPositioning": true,
+    "extremeWickGlow": 0.12
+  },
+  "motion": {
+    "transitionMs": 70,
+    "easing": "linear",
+    "wickAppearanceMs": 30,
+    "bodyInertia": 0.04,
+    "breathePx": 0.2,
+    "directionBounce": 0.02
+  },
+  "perception": {
+    "intraCandleSmoothing": 0.15,
+    "horizontalStabilization": 0.9,
+    "comfortZonePct": 0.6,
+    "strictBucketAlignment": true,
+    "domWickSmoothing": false,
+    "lastCandleGlow": 0.08,
+    "wickDomShiftPct": 0.03
+  },
+  "frame": {
+    "minFrameMs": 16
+  }
+}
