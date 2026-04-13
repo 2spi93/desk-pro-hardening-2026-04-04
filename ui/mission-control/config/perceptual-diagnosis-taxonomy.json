@@ -1,0 +1,35 @@
+{
+  "canonicalOrder": [
+    "too_thin_bodies",
+    "too_loose_spacing",
+    "underdeveloped_wicks",
+    "too_thick_bodies",
+    "too_dense_spacing",
+    "overgrown_wicks",
+    "underfilled_viewport",
+    "overfilled_viewport",
+    "fragmented_horizontal_mass",
+    "balanced_structure"
+  ],
+  "runtime": {
+    "too_thin_bodies": "too_thin_bodies",
+    "too_thick_bodies": "too_thick_bodies",
+    "too_loose_spacing": "too_loose_spacing",
+    "too_dense_spacing": "too_dense_spacing",
+    "underdeveloped_wicks": "underdeveloped_wicks",
+    "overgrown_wicks": "overgrown_wicks",
+    "balanced_structure": "balanced_structure"
+  },
+  "benchmark": {
+    "too_thin_bodies": "too_thin_bodies",
+    "too_thick_bodies": "too_thick_bodies",
+    "too_loose_spacing": "too_loose_spacing",
+    "too_dense_spacing": "too_dense_spacing",
+    "underdeveloped_wicks": "underdeveloped_wicks",
+    "overgrown_wicks": "overgrown_wicks",
+    "underfilled_viewport": "underfilled_viewport",
+    "overfilled_viewport": "overfilled_viewport",
+    "fragmented_horizontal_mass": "fragmented_horizontal_mass",
+    "balanced_structure": "balanced_structure"
+  }
+}

@@ -1,4 +1,5 @@
 import { applyVisualProfile, DEFAULT_VISUAL_PROFILE, type VisualProfileName } from "./visualProfiles";
+import type { SmartCandleMetrics, SmartCandleRole, SmartNoiseClass } from "./smartChartTypes";
 
 export type PerceptionDensity = "expanded" | "balanced" | "compressed";
 
@@ -15,6 +16,10 @@ export type PerceptionVisualMetadata = {
   importance: number;
   wickType: "absorption" | "rejection" | "neutral";
   lastCandleEmphasis: number;
+  qualityScore: number;
+  candleRole: SmartCandleRole;
+  noiseClass: SmartNoiseClass;
+  microstructureNoise: number;
 };
 
 export type PerceptionCandle = {
@@ -25,6 +30,7 @@ export type PerceptionCandle = {
   close: number;
   volume: number;
   __visual?: PerceptionVisualMetadata;
+  __smart?: SmartCandleMetrics;
 };
 
 export type PerceptionContext = {
@@ -36,10 +42,41 @@ export type PerceptionContext = {
   averageRange?: number;
   averageVolume?: number;
   isLast?: boolean;
+  microstructureNoiseRatio?: number;
 };
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
+}
+
+function timeframeSeconds(timeframe: string): number {
+  const match = String(timeframe || "").trim().match(/^(\d+)([smhdwM])$/);
+  if (!match) {
+    return 60;
+  }
+
+  const value = Number(match[1]);
+  const unit = match[2];
+  if (!Number.isFinite(value) || value <= 0) {
+    return 60;
+  }
+
+  switch (unit) {
+    case "s":
+      return value;
+    case "m":
+      return value * 60;
+    case "h":
+      return value * 3600;
+    case "d":
+      return value * 86400;
+    case "w":
+      return value * 604800;
+    case "M":
+      return value * 2592000;
+    default:
+      return 60;
+  }
 }
 
 function resolveSmoothingAlpha(ctx: PerceptionContext): number {
@@ -57,6 +94,95 @@ function resolveMinimumRange(candle: PerceptionCandle, ctx: PerceptionContext): 
   const densityFactor = ctx.density === "compressed" ? 0.00014 : ctx.density === "balanced" ? 0.0001 : 0.00008;
   const volatilityFloor = clamp(ctx.volatility * reference * 0.55, reference * 0.00002, reference * 0.0014);
   return Math.max(reference * densityFactor, volatilityFloor);
+}
+
+function resolveBodyRatio(candle: PerceptionCandle, minimumRange: number): number {
+  const range = Math.max(candle.high - candle.low, minimumRange, 1e-6);
+  return clamp(Math.abs(candle.close - candle.open) / range, 0, 1);
+}
+
+function resolveDirectionalClosePosition(candle: PerceptionCandle, minimumRange: number): number {
+  const range = Math.max(candle.high - candle.low, minimumRange, 1e-6);
+  if (candle.close >= candle.open) {
+    return clamp((candle.close - candle.low) / range, 0, 1);
+  }
+  return clamp((candle.high - candle.close) / range, 0, 1);
+}
+
+function resolveAdaptiveNoiseThreshold(candle: PerceptionCandle, ctx: PerceptionContext): number {
+  const seconds = timeframeSeconds(ctx.timeframe);
+  const referencePrice = Math.max(Math.abs(candle.close), Math.abs(candle.open), 1);
+  const atrProxyRatio = Math.max(ctx.averageRange ?? 0, resolveMinimumRange(candle, ctx)) / referencePrice;
+  const base = seconds <= 5
+    ? 0.25
+    : seconds <= 30
+      ? 0.35
+      : seconds <= 300
+        ? 0.24
+        : 0.18;
+  const lowVolBoost = clamp((0.0012 - atrProxyRatio) / 0.0012, 0, 1) * 0.08;
+  const highVolRelief = clamp((atrProxyRatio - 0.0035) / 0.008, 0, 1) * 0.08;
+  const densityBoost = ctx.density === "compressed" ? 0.02 : ctx.density === "balanced" ? 0.01 : -0.01;
+  const microstructureBoost = clamp(ctx.microstructureNoiseRatio ?? 0, 0, 1) * (seconds <= 5 ? 0.08 : seconds <= 30 ? 0.05 : 0.02);
+  const domRelief = clamp(Math.abs(ctx.domImbalance ?? 0) * 0.08, 0, 0.05);
+  return clamp(base + lowVolBoost - highVolRelief + densityBoost + microstructureBoost - domRelief, 0.12, 0.58);
+}
+
+export function classifyCleanCandle(candle: PerceptionCandle, ctx: PerceptionContext): SmartNoiseClass {
+  const minimumRange = resolveMinimumRange(candle, ctx);
+  const bodyRatio = resolveBodyRatio(candle, minimumRange);
+  const adaptiveThreshold = resolveAdaptiveNoiseThreshold(candle, ctx);
+  if (bodyRatio < adaptiveThreshold * 0.72) {
+    return "noise";
+  }
+  if (bodyRatio < adaptiveThreshold) {
+    return "weak";
+  }
+  return "valid";
+}
+
+export function scoreCandleQuality(candle: PerceptionCandle, ctx: PerceptionContext): SmartCandleMetrics {
+  const minimumRange = resolveMinimumRange(candle, ctx);
+  const range = Math.max(candle.high - candle.low, minimumRange, 1e-6);
+  const body = Math.abs(candle.close - candle.open);
+  const bodyRatio = resolveBodyRatio(candle, minimumRange);
+  const directionalClosePosition = resolveDirectionalClosePosition(candle, minimumRange);
+  const averageVolume = Math.max(ctx.averageVolume ?? Math.max(1, candle.volume), 1e-6);
+  const volumeRatio = Math.max(0, candle.volume) / averageVolume;
+  const volumeScore = clamp(volumeRatio / (timeframeSeconds(ctx.timeframe) <= 30 ? 1.7 : 2.2), 0, 1);
+  const wickSize = Math.max(0, range - body);
+  const wickToBodyRatio = wickSize / Math.max(body, minimumRange * 0.08, 1e-6);
+  const noiseClass = classifyCleanCandle(candle, ctx);
+  const microstructurePenalty = clamp(ctx.microstructureNoiseRatio ?? 0, 0, 1) * (timeframeSeconds(ctx.timeframe) <= 5 ? 0.18 : 0.1);
+  const wickOpacityPenalty = wickToBodyRatio > 2 && volumeRatio < 0.9
+    ? clamp((wickToBodyRatio - 2) * 0.08 + (0.9 - volumeRatio) * 0.18, 0, 0.36)
+    : 0;
+  const qualityPenalty = (noiseClass === "noise" ? 0.22 : noiseClass === "weak" ? 0.1 : 0) + microstructurePenalty + wickOpacityPenalty * 0.35;
+  const qualityScore = clamp(
+    bodyRatio * 0.35
+      + directionalClosePosition * 0.25
+      + volumeScore * 0.4
+      - qualityPenalty,
+    0,
+    1,
+  );
+  const role: SmartCandleRole = qualityScore < 0.4 ? "noise" : qualityScore < 0.65 ? "context" : "trigger";
+
+  return {
+    range,
+    body,
+    bodyRatio,
+    directionalClosePosition,
+    volumeRatio,
+    volumeScore,
+    wickToBodyRatio,
+    noiseClass,
+    qualityScore,
+    role,
+    wickOpacityPenalty,
+    adaptiveThreshold: resolveAdaptiveNoiseThreshold(candle, ctx),
+    microstructurePenalty,
+  };
 }
 
 function resolveWickProfile(candle: PerceptionCandle): {
@@ -129,7 +255,8 @@ export function getCandleVisualStyle(candle: PerceptionCandle, ctx: PerceptionCo
   importance: number;
 } {
   const profile = applyVisualProfile(ctx.visualProfile ?? DEFAULT_VISUAL_PROFILE);
-  const importance = candleImportance(candle, ctx);
+  const smartMetrics = scoreCandleQuality(candle, ctx);
+  const importance = clamp(candleImportance(candle, ctx) * 0.58 + smartMetrics.qualityScore * 0.42, 0, 1);
   const wickProfile = resolveWickProfile(candle);
   const wickWeight = wickIntensity(candle, ctx);
   const signalType = wickProfile.type;
@@ -154,9 +281,13 @@ export function getCandleVisualStyle(candle: PerceptionCandle, ctx: PerceptionCo
   const averageVolume = Math.max(ctx.averageVolume ?? 0, 1e-6);
   const volumeRatio = clamp(Math.max(0, candle.volume) / averageVolume, 0.65, 1.35);
   const bodyPresenceBoost = lowRange ? (ctx.isLast ? 0.22 : 0.16) : 0;
+  const roleBoost = smartMetrics.role === "trigger" ? 0.08 : smartMetrics.role === "noise" ? -0.06 : 0;
+  const noiseOpacityPenalty = smartMetrics.noiseClass === "noise" ? 0.14 : smartMetrics.noiseClass === "weak" ? 0.06 : 0;
   const bodyBoost = rangeRatio * (1 + importance * 0.04 + lastCandleEmphasis * 0.8)
     + bodyPresenceBoost
-    + (volumeRatio - 1) * 0.08;
+    + (volumeRatio - 1) * 0.08
+    + roleBoost
+    - smartMetrics.microstructurePenalty * 0.12;
   const wickWidth = wickSignalPriority
     ? 1.8
     : wickMediumPriority
@@ -172,24 +303,30 @@ export function getCandleVisualStyle(candle: PerceptionCandle, ctx: PerceptionCo
 
   return {
     opacity: clamp(
-      baseOpacity
-        - (ctx.isLast ? 0.04 : 0)
-        + importance * 0.04
-        + lastCandleEmphasis * 0.4
-        + (lowRange ? 0.03 : 0)
-        + (ctx.isLast && lowRange ? 0.03 : 0),
+      clamp(
+        baseOpacity
+          - (ctx.isLast ? 0.04 : 0)
+          + importance * 0.04
+          + smartMetrics.qualityScore * 0.05
+          + lastCandleEmphasis * 0.4
+          + (lowRange ? 0.03 : 0)
+          + (ctx.isLast && lowRange ? 0.03 : 0),
+        opacityFloor,
+        formingOpacityCap,
+      ) - noiseOpacityPenalty,
       opacityFloor,
       formingOpacityCap,
     ),
     wickWidth,
     bodyBoost,
-    intensity: intensity + lastCandleEmphasis,
+    intensity: intensity + lastCandleEmphasis + smartMetrics.qualityScore * 0.05,
     wickOpacity: clamp(
       (wickSignalPriority ? 1 : wickMediumPriority ? 0.85 : 0.4)
         + signalBoost * 0.1
         + wickWeight * (wickSignalPriority ? 0.06 : wickMediumPriority ? 0.03 : 0)
         - (lowRange && signalType === "neutral" ? 0.05 : 0)
-        - (signalType === "neutral" ? densePenalty : densePenalty * 0.4),
+        - (signalType === "neutral" ? densePenalty : densePenalty * 0.4)
+        - smartMetrics.wickOpacityPenalty,
       wickOpacityFloor,
       wickOpacityCeiling,
     ),
@@ -197,20 +334,41 @@ export function getCandleVisualStyle(candle: PerceptionCandle, ctx: PerceptionCo
   };
 }
 
-export function enhanceWick(candle: PerceptionCandle, ctx: PerceptionContext): {
+export function enhanceWick(candle: PerceptionCandle, ctx: PerceptionContext, smartMetrics?: SmartCandleMetrics): {
   high: number;
   low: number;
   wickBoost: number;
 } {
   const profile = applyVisualProfile(ctx.visualProfile ?? DEFAULT_VISUAL_PROFILE);
   const wickWeight = wickIntensity(candle, ctx);
+  const wickProfile = resolveWickProfile(candle);
+  const smartBoost = smartMetrics
+    ? clamp(
+      (smartMetrics.role === "trigger" ? 0.1 : smartMetrics.noiseClass === "noise" ? 0.08 : 0.04)
+        + smartMetrics.qualityScore * 0.08
+        + smartMetrics.microstructurePenalty * 0.14,
+      0,
+      0.24,
+    )
+    : 0;
   const minWick = Math.max(
     candle.close * 0.0005,
-    resolveMinimumRange(candle, ctx) * (ctx.density === "compressed" ? 0.72 : 0.48) * (1 + wickWeight * 0.24),
+    resolveMinimumRange(candle, ctx) * (ctx.density === "compressed" ? 0.72 : 0.48) * (1 + wickWeight * 0.24 + smartBoost),
   );
   const profileBias = 1 + profile.motion.directionBounce * 0.5;
-  const nextHigh = Math.max(candle.high, candle.close + minWick * profileBias, candle.open + minWick * 0.22);
-  const nextLow = Math.min(candle.low, candle.close - minWick * profileBias, candle.open - minWick * 0.22);
+  const outwardExtension = minWick * clamp((wickWeight > 0.45 ? 0.08 : 0.03) + smartBoost * 0.4, 0.02, 0.16);
+  const nextHigh = Math.max(
+    candle.high,
+    candle.close + minWick * profileBias,
+    candle.open + minWick * 0.22,
+    candle.high + outwardExtension * (wickProfile.type === "rejection" ? 1 : 0.55),
+  );
+  const nextLow = Math.min(
+    candle.low,
+    candle.close - minWick * profileBias,
+    candle.open - minWick * 0.22,
+    candle.low - outwardExtension * (wickProfile.type === "absorption" ? 1 : 0.55),
+  );
   const wickBoost = Math.max(nextHigh - candle.high, candle.low - nextLow, 0);
 
   return {
@@ -266,13 +424,16 @@ export function perceptionTransform(
   const smoothingAlpha = resolveSmoothingAlpha(ctx);
   const direction: 1 | -1 = candle.close >= candle.open ? 1 : -1;
   const profile = applyVisualProfile(ctx.visualProfile ?? DEFAULT_VISUAL_PROFILE);
+  const smartMetrics = scoreCandleQuality(candle, ctx);
   const visualStyle = getCandleVisualStyle(candle, ctx);
   const momentum = momentumBoost(candle, prev, ctx);
   const signalType = wickType(candle);
-  const wick = enhanceWick(candle, ctx);
+  const wick = enhanceWick(candle, ctx, smartMetrics);
 
   return {
     ...candle,
+    high: wick.high,
+    low: wick.low,
     __visual: {
       intensity: visualStyle.intensity,
       direction,
@@ -286,7 +447,12 @@ export function perceptionTransform(
       importance: visualStyle.importance,
       wickType: signalType,
       lastCandleEmphasis: ctx.isLast ? 0.03 + profile.perception.lastCandleGlow : 0,
+      qualityScore: smartMetrics.qualityScore,
+      candleRole: smartMetrics.role,
+      noiseClass: smartMetrics.noiseClass,
+      microstructureNoise: smartMetrics.microstructurePenalty,
     },
+    __smart: smartMetrics,
   };
 }
 
@@ -315,6 +481,10 @@ export function applyPerceptionPipeline(candles: PerceptionCandle[], ctx: Percep
   }
 
   return transformed;
+}
+
+export function applySmartCleanPipeline(candles: PerceptionCandle[], ctx: PerceptionContext): PerceptionCandle[] {
+  return applyPerceptionPipeline(candles, ctx);
 }
 
 export function shouldConflatePerceptualUpdate(

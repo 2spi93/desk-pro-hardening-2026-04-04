@@ -5,11 +5,16 @@ import { cpFetch } from "../lib/controlPlane";
 import { readHealthwatchDashboard } from "../lib/healthwatchDashboard";
 import { getLatestLocalTerminalCapture } from "../lib/localTerminalCapture";
 import { readLocalTerminalCaptureStore } from "../lib/localTerminalCaptureStore";
+import { getConnectorHealthView } from "../lib/connectorHealth";
 import HelpHint from "../components/HelpHint";
-import TxtMiniGuide from "../components/ui/TxtMiniGuide";
+import OperatorPanelGuide from "../components/ui/OperatorPanelGuide";
 import { getRoleGroup, getRoleDisplayLabel, isClientRole } from "../lib/roleGroups";
 
 type RecordItem = Record<string, unknown>;
+
+function asRecordItem(value: unknown): RecordItem {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as RecordItem : {};
+}
 
 async function getJson(path: string): Promise<unknown> {
   const response = await cpFetch(path);
@@ -20,7 +25,7 @@ async function getJson(path: string): Promise<unknown> {
 }
 
 export default async function Page() {
-  const [me, overview, audit, positions, quotes, balances, pending, strategies, healthwatchDashboard, localTerminalCaptureStore] = await Promise.all([
+  const [me, overview, audit, positions, quotes, balances, pending, strategies, connectorsStatus, healthwatchDashboard, localTerminalCaptureStore] = await Promise.all([
     getJson("/v1/auth/me") as Promise<RecordItem | null>,
     getJson("/v1/dashboard/overview") as Promise<RecordItem | null>,
     getJson("/v1/audit") as Promise<RecordItem[] | null>,
@@ -29,6 +34,7 @@ export default async function Page() {
     getJson("/v1/broker/balance") as Promise<RecordItem | null>,
     getJson("/v1/intents/pending") as Promise<Record<string, RecordItem> | null>,
     getJson("/v1/strategies") as Promise<RecordItem[] | null>,
+    getJson("/v1/connectors/status") as Promise<RecordItem | null>,
     readHealthwatchDashboard(),
     readLocalTerminalCaptureStore(),
   ]);
@@ -69,6 +75,15 @@ export default async function Page() {
   const safeBalances = balances || { balances: [] };
   const safePending = pending || {};
   const safeStrategies = strategies || [];
+  const safeConnectors = Array.isArray(connectorsStatus?.connectors)
+    ? connectorsStatus.connectors.filter((item): item is RecordItem => Boolean(item) && typeof item === "object" && !Array.isArray(item))
+    : [];
+  const connectorByName = new Map(safeConnectors.map((item) => [String(item.name || "").toLowerCase(), item]));
+  const executionVenueRows = safeConnectors.filter((item) => Number(asRecordItem(item.broker_capabilities).linked_trade_accounts || 0) > 0);
+  const marketVenueRows = ["okx", "binance", "bybit"]
+    .map((provider) => connectorByName.get(provider))
+    .filter((item): item is RecordItem => Boolean(item));
+  const okxTradeLinked = executionVenueRows.some((item) => String(item.name || "").toLowerCase() === "okx");
   const publicChartVisibility = (healthwatchDashboard?.public_chart_visibility && typeof healthwatchDashboard.public_chart_visibility === "object"
     ? healthwatchDashboard.public_chart_visibility
     : null) as RecordItem | null;
@@ -83,11 +98,11 @@ export default async function Page() {
   return (
     <main className="shell txt-page-shell">
       <section className="hero txt-page-hero-grid">
-        <div className="panel txt-page-hero">
-          <div className="eyebrow">TXT Dashboard <HelpHint text="Vue macro: supervision execution, strategies, audit et approbations." examples={["Commence ici le matin: regarde System mode, Pending approvals et Open net exposure.", "Si quelque chose semble bloque, ouvre ensuite Incidents ou Trading Terminal pour agir vite."]} /></div>
+        <div id="global-guide-dashboard-hero" className="panel txt-page-hero">
+          <div className="eyebrow">TXT Dashboard</div>
           <h1 className="title">Trader eXelle Terminal</h1>
           <p className="subtle">Plateforme de trading humaine: lisible pour debutants, puissante pour experts.</p>
-          <TxtMiniGuide
+          <OperatorPanelGuide
             title="Guide Dashboard"
             what="Une vue simplifiee de la sante trading: exposition, approvals, balances et alertes." 
             why="Aider un debutant a savoir quoi verifier avant toute action, sans noyer les infos critiques."
@@ -126,6 +141,42 @@ export default async function Page() {
           <p className="subtle">Les approbations passent par bearer token, rôle et signature HMAC.</p>
           <div className="row"><span>Policy version</span><span>{String(safeOverview.policy_version)}</span></div>
           <div className="row"><span>Paper only</span><span className="warn">{String(safeOverview.paper_only)}</span></div>
+        </div>
+      </section>
+
+      <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1.1fr 0.9fr" }}>
+        <div className="panel">
+          <div className="eyebrow">Venue Health <HelpHint text="Badge unifie backend pour savoir si l'execution est bloquee, reduite ou nominale." examples={["Si le badge passe en REDUCE SIZE, la taille live backend est deja rabotee.", "Si le badge passe en LIVE BLOCKED, ne cherche pas a forcer un smoke test: le control-plane coupe deja l'execution."]} /></div>
+          {executionVenueRows.length === 0 ? <p className="subtle">Aucune venue d'execution live liee.</p> : null}
+          {executionVenueRows.map((item) => {
+            const badge = getConnectorHealthView(item);
+            return (
+              <div className="row" key={`execution-venue-${String(item.name)}`}>
+                <span>{String(item.name).toUpperCase()} | trade accounts {String(asRecordItem(item.broker_capabilities).linked_trade_accounts || 0)}</span>
+                <span className="connector-health-stack">
+                  <span className={badge.badgeClassName}>{badge.label}</span>
+                  <span className={badge.noteClassName}>{badge.message}</span>
+                </span>
+              </div>
+            );
+          })}
+        </div>
+        <div className="panel">
+          <div className="eyebrow">Data Mesh Health <HelpHint text="Supervision des venues de marche prioritaires pour la migration venue-aware." examples={["OKX, Binance et Bybit servent ici de thermometre data/market-health.", "Une venue peut etre bonne en data mais non prete en execution si aucun compte trade n'est lie."]} /></div>
+          {marketVenueRows.length === 0 ? <p className="subtle">Aucune venue de data prioritaire visible.</p> : null}
+          {marketVenueRows.map((item) => {
+            const badge = getConnectorHealthView(item);
+            return (
+              <div className="row" key={`market-venue-${String(item.name)}`}>
+                <span>{String(item.name).toUpperCase()}</span>
+                <span className="connector-health-stack">
+                  <span className={badge.badgeClassName}>{badge.compactLabel}</span>
+                  <span className={badge.noteClassName}>{badge.message}</span>
+                </span>
+              </div>
+            );
+          })}
+          {!okxTradeLinked ? <p className="warn" style={{ marginTop: 12 }}>OKX n'est pas encore lie en execution live.</p> : null}
         </div>
       </section>
 

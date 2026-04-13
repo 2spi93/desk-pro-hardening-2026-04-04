@@ -1,10 +1,13 @@
 type JsonMap = Record<string, unknown>;
 
 import { normalizeOhlcvRows, type NormalizedOhlcvBar } from "./ohlcvIntegrity";
-import { MarketDataEngineV5, type GapRange } from "./marketDataEngineV5";
+import { MarketDataEngineV5, type GapRange, type SyncedMarketFrame } from "./marketDataEngineV5";
 import type { DepthRow } from "./marketDataEngineV4";
 import { clearChartFrame, publishChartFrame, type LiveChartCandle } from "./chartFrameFeed";
+import { GoldenFrameSequenceGuard } from "./goldenFrameSequenceGuard";
+import { GoldenFrameWorkerAdapter, type GoldenFrameWorkerEvent, type GoldenFrameWorkerFrameInput, type GoldenFrameWorkerTelemetry } from "./goldenFrameWorkerAdapter";
 import { PriceFusionEngineV6, type RouteCandidate, type VenueQuote } from "./priceFusionEngineV6";
+import { OrderflowRuntimeEngine, type OrderflowRuntimeSnapshot } from "./orderflowRuntimeEngine";
 import { timeframeToMs } from "./ohlcvDataEngine";
 
 export type OhlcvBar = NormalizedOhlcvBar;
@@ -30,6 +33,7 @@ export type MarketDataBusSnapshot = {
   chartLoading: boolean;
   ohlcvStreamState: "offline" | "connecting" | "live";
   depthStreamState: "offline" | "connecting" | "live";
+  orderflowRuntime: OrderflowRuntimeSnapshot | null;
   kernelTelemetry: MarketDataBusKernelTelemetry;
   lastSyncAt: string | null;
 };
@@ -45,6 +49,19 @@ export type MarketDataBusKernelTelemetry = {
   bufferBacklog: number;
   drainedTicksPerFrame: number;
   skippedFrames: number;
+  renderedFrames: number;
+  atomicFrames: number;
+  partialFrames: number;
+  coalescedFrames: number;
+  stallFrames: number;
+  partialFrameRate: number;
+  frameSyncConfidence: number;
+  frameSyncStatus: "atomic" | "loose-sync" | "coalesced";
+  syncGapCount: number;
+  sequenceQueueDepth: number;
+  dynamicBufferMs: number;
+  adaptiveGraceMs: number;
+  maxFrameStallMs: number;
   schedulerBudgetMs: number;
   schedulerPullLimit: number;
   cpuLoadHint: number;
@@ -78,6 +95,28 @@ const TRADE_PULL_LIMIT_PER_FRAME = 320;
 const TRADE_PULL_BUDGET_MS = 5;
 const SYNTHETIC_HEARTBEAT_MS = 1_000;
 const MICRO_TF_HEARTBEAT_MAX_MS = 10_000;
+const RENDER_FRAME_STALL_TIMEOUT_MS = 150;
+const RENDER_BUFFER_DEFAULT_MS = 50;
+const RENDER_BUFFER_MIN_MS = 20;
+const RENDER_BUFFER_MAX_MS = 80;
+const RENDER_JITTER_SAMPLE_SIZE = 32;
+const RENDER_COALESCE_BACKLOG_THRESHOLD = 500;
+
+type PendingRenderFrame = {
+  feedKey: string;
+  candles: LiveChartCandle[];
+  createdAt: number;
+  tradeTsMs: number | null;
+  depthTsMs: number | null;
+  depthSequence: number | null;
+  coalesced: boolean;
+  dynamicBufferMs: number;
+};
+
+type WorkerPendingRenderFrame = PendingRenderFrame & {
+  backlog: number;
+  adaptiveGraceMs: number;
+};
 
 type StreamKind = "ohlcv" | "depth";
 
@@ -92,6 +131,43 @@ function buildRequestHeaders(requestType: MarketBusRequestType, instrument: stri
     "x-mc-priority": requestType === "execution" ? "execution" : requestType === "ai" ? "high" : "low",
     "x-mc-symbol": instrument,
     "x-mc-origin": "terminal",
+  };
+}
+
+function createKernelTelemetryDefaults(): MarketDataBusKernelTelemetry {
+  return {
+    tickLatencyMs: 0,
+    bufferBacklog: 0,
+    drainedTicksPerFrame: 0,
+    skippedFrames: 0,
+    renderedFrames: 0,
+    atomicFrames: 0,
+    partialFrames: 0,
+    coalescedFrames: 0,
+    stallFrames: 0,
+    partialFrameRate: 0,
+    frameSyncConfidence: 1,
+    frameSyncStatus: "atomic",
+    syncGapCount: 0,
+    sequenceQueueDepth: 0,
+    dynamicBufferMs: RENDER_BUFFER_DEFAULT_MS,
+    adaptiveGraceMs: 5,
+    maxFrameStallMs: 0,
+    schedulerBudgetMs: TRADE_PULL_BUDGET_MS,
+    schedulerPullLimit: TRADE_PULL_LIMIT_PER_FRAME,
+    cpuLoadHint: 1,
+    fpsHint: 60,
+    frameTimeHintMs: 16.7,
+    backlogPressure: 0,
+    framesProcessed: 0,
+    benchmarkMode: false,
+    benchmarkTicksPerSec: 0,
+    benchmarkInjectedTicks: 0,
+    receivedTicks: 0,
+    candleUpdates: 0,
+    syntheticHeartbeatOpens: 0,
+    lastCandleUpdateAt: null,
+    lastDrainAt: null,
   };
 }
 
@@ -495,32 +571,14 @@ class MarketDataBus {
     chartLoading: false,
     ohlcvStreamState: "offline",
     depthStreamState: "offline",
-    kernelTelemetry: {
-      tickLatencyMs: 0,
-      bufferBacklog: 0,
-      drainedTicksPerFrame: 0,
-      skippedFrames: 0,
-      schedulerBudgetMs: TRADE_PULL_BUDGET_MS,
-      schedulerPullLimit: TRADE_PULL_LIMIT_PER_FRAME,
-      cpuLoadHint: 1,
-      fpsHint: 60,
-      frameTimeHintMs: 16.7,
-      backlogPressure: 0,
-      framesProcessed: 0,
-      benchmarkMode: false,
-      benchmarkTicksPerSec: 0,
-      benchmarkInjectedTicks: 0,
-      receivedTicks: 0,
-      candleUpdates: 0,
-      syntheticHeartbeatOpens: 0,
-      lastCandleUpdateAt: null,
-      lastDrainAt: null,
-    },
+    orderflowRuntime: null,
+    kernelTelemetry: createKernelTelemetryDefaults(),
     lastSyncAt: null,
   };
   private config: MarketDataBusConfig | null = null;
   // ── MarketDataEngine V5 : pipeline unifié (candles + microstructure + gaps) ──
   private engine: MarketDataEngineV5 | null = null;
+  private orderflowRuntimeEngine: OrderflowRuntimeEngine | null = null;
   private fusionEngine: PriceFusionEngineV6 | null = null;
   private pendingGaps: GapRange[] = [];
   private sideRefreshTimer: number | null = null;
@@ -545,6 +603,13 @@ class MarketDataBus {
   private benchmarkTimer: number | null = null;
   private benchmarkTick = 0;
   private syntheticHeartbeatTimer: number | null = null;
+  private renderGateTimer: number | null = null;
+  private sequenceGuardTimer: number | null = null;
+  private pendingRenderFrame: PendingRenderFrame | null = null;
+  private readonly sequenceGuard = new GoldenFrameSequenceGuard<PendingRenderFrame>({
+    graceWindowMs: 5,
+    maxQueueDepth: 512,
+  });
   private depthSnapshotsByVenue = new Map<string, JsonMap>();
   private snapshotFailureCooldownUntil = 0;
   private streamFailureCount: Record<StreamKind, number> = { ohlcv: 0, depth: 0 };
@@ -553,6 +618,21 @@ class MarketDataBus {
   private seenTradeQueue: string[] = [];
   private lastLiveReactCommitAt = 0;
   private lastLiveReactBarTime = "";
+  private currentDynamicBufferMs = RENDER_BUFFER_DEFAULT_MS;
+  private lastDepthEventTsMs = 0;
+  private lastDepthSequence: number | null = null;
+  private lastTradeEventTsMs = 0;
+  private tradeArrivalGapSamples: number[] = [];
+  private depthArrivalGapSamples: number[] = [];
+  private lastTradeArrivalAt = 0;
+  private lastDepthArrivalAt = 0;
+  private goldenFrameWorker: GoldenFrameWorkerAdapter | null = null;
+
+  constructor() {
+    this.goldenFrameWorker = new GoldenFrameWorkerAdapter((event) => {
+      this.handleGoldenFrameWorkerEvent(event);
+    });
+  }
 
   subscribe(listener: MarketDataBusListener): () => void {
     this.listeners.add(listener);
@@ -611,6 +691,10 @@ class MarketDataBus {
     this.config = config;
     // Engine V5 : pipeline unifié (candles depuis trades + microstructure)
     this.engine = new MarketDataEngineV5(config.timeframe, config.instrument, config.venue);
+    this.orderflowRuntimeEngine = new OrderflowRuntimeEngine({
+      configKey: nextKey,
+      timeframe: config.timeframe,
+    });
     this.fusionEngine = new PriceFusionEngineV6();
     // Backfill callback : V5 nous notifie quand des gaps sont détectés
     this.engine.onGapDetected((startMs, endMs) => {
@@ -628,25 +712,25 @@ class MarketDataBus {
       orderbook: null,
       marketDepth: null,
       routingScore: null,
-      busMeta: null,
+      busMeta: this.buildWorkerBusMeta(null, createKernelTelemetryDefaults()),
       chartLoading: true,
       ohlcvStreamState: "connecting",
       depthStreamState: "connecting",
+      orderflowRuntime: null,
       kernelTelemetry: {
-        ...this.snapshot.kernelTelemetry,
-        bufferBacklog: 0,
-        drainedTicksPerFrame: 0,
-        skippedFrames: 0,
-        backlogPressure: 0,
-        framesProcessed: 0,
-        benchmarkInjectedTicks: 0,
-        receivedTicks: 0,
-        candleUpdates: 0,
-        syntheticHeartbeatOpens: 0,
-        lastCandleUpdateAt: null,
+        ...createKernelTelemetryDefaults(),
       },
       lastSyncAt: null,
     };
+    this.clearRenderGate();
+    this.currentDynamicBufferMs = RENDER_BUFFER_DEFAULT_MS;
+    this.lastDepthEventTsMs = 0;
+    this.lastDepthSequence = null;
+    this.lastTradeEventTsMs = 0;
+    this.tradeArrivalGapSamples = [];
+    this.depthArrivalGapSamples = [];
+    this.lastTradeArrivalAt = 0;
+    this.lastDepthArrivalAt = 0;
     this.emit();
     this.configureSyntheticHeartbeat();
     this.connectOhlcvSocket();
@@ -659,6 +743,7 @@ class MarketDataBus {
     this.disconnectSockets();
     this.config = null;
     this.engine = null;
+    this.orderflowRuntimeEngine = null;
     this.fusionEngine = null;
     this.pendingGaps = [];
     this.stopSyntheticHeartbeat();
@@ -672,31 +757,32 @@ class MarketDataBus {
       orderbook: null,
       marketDepth: null,
       routingScore: null,
-      busMeta: null,
+      busMeta: this.buildWorkerBusMeta(null, createKernelTelemetryDefaults()),
       chartLoading: false,
       ohlcvStreamState: "offline",
       depthStreamState: "offline",
+      orderflowRuntime: null,
       kernelTelemetry: {
-        ...this.snapshot.kernelTelemetry,
-        bufferBacklog: 0,
-        drainedTicksPerFrame: 0,
-        backlogPressure: 0,
-        benchmarkInjectedTicks: 0,
-        receivedTicks: 0,
-        candleUpdates: 0,
-        syntheticHeartbeatOpens: 0,
-        lastCandleUpdateAt: null,
-        lastDrainAt: null,
+        ...createKernelTelemetryDefaults(),
       },
       lastSyncAt: null,
     };
     clearChartFrame(previousKey);
+    this.clearRenderGate();
     this.depthSnapshotsByVenue.clear();
     this.tradeRingsByVenue.clear();
     this.seenTradeKeys.clear();
     this.seenTradeQueue = [];
     this.lastLiveReactCommitAt = 0;
     this.lastLiveReactBarTime = "";
+    this.currentDynamicBufferMs = RENDER_BUFFER_DEFAULT_MS;
+    this.lastDepthEventTsMs = 0;
+    this.lastDepthSequence = null;
+    this.lastTradeEventTsMs = 0;
+    this.tradeArrivalGapSamples = [];
+    this.depthArrivalGapSamples = [];
+    this.lastTradeArrivalAt = 0;
+    this.lastDepthArrivalAt = 0;
     this.emit();
   }
 
@@ -725,6 +811,379 @@ class MarketDataBus {
     return lastClose > 0 ? lastClose : this.resolveObservableMarketPrice();
   }
 
+  private clearRenderGate(): void {
+    if (this.renderGateTimer !== null) {
+      window.clearTimeout(this.renderGateTimer);
+      this.renderGateTimer = null;
+    }
+    if (this.sequenceGuardTimer !== null) {
+      window.clearTimeout(this.sequenceGuardTimer);
+      this.sequenceGuardTimer = null;
+    }
+    this.sequenceGuard.reset();
+    this.pendingRenderFrame = null;
+    this.goldenFrameWorker?.reset();
+  }
+
+  private buildWorkerBusMeta(
+    baseMeta: JsonMap | null | undefined,
+    kernelTelemetry: MarketDataBusKernelTelemetry = this.snapshot.kernelTelemetry,
+  ): JsonMap {
+    const baseWorker = baseMeta?.worker && typeof baseMeta.worker === "object"
+      ? baseMeta.worker as JsonMap
+      : null;
+    const workerAvailable = Boolean(this.goldenFrameWorker?.isAvailable());
+    const workerActive = Boolean(this.config && workerAvailable);
+    return {
+      ...(baseMeta || {}),
+      worker: {
+        ...(baseWorker || {}),
+        available: workerAvailable,
+        active: workerActive,
+        mode: workerAvailable ? "worker" : "best-effort",
+        queueDepth: kernelTelemetry.sequenceQueueDepth,
+        dynamicBufferMs: kernelTelemetry.dynamicBufferMs,
+        adaptiveGraceMs: kernelTelemetry.adaptiveGraceMs,
+        frameSyncStatus: kernelTelemetry.frameSyncStatus,
+        frameSyncConfidence: kernelTelemetry.frameSyncConfidence,
+      },
+    };
+  }
+
+  private applyGoldenFrameWorkerTelemetry(telemetry: GoldenFrameWorkerTelemetry): void {
+    const nextKernelTelemetry = {
+      ...this.snapshot.kernelTelemetry,
+      sequenceQueueDepth: telemetry.sequenceQueueDepth,
+      syncGapCount: this.snapshot.kernelTelemetry.syncGapCount + telemetry.syncGapCountDelta,
+      adaptiveGraceMs: telemetry.adaptiveGraceMs,
+      coalescedFrames: this.snapshot.kernelTelemetry.coalescedFrames + telemetry.coalescedFramesDelta,
+    };
+    this.snapshot = {
+      ...this.snapshot,
+      busMeta: this.buildWorkerBusMeta(this.snapshot.busMeta, nextKernelTelemetry),
+      kernelTelemetry: {
+        ...nextKernelTelemetry,
+      },
+    };
+  }
+
+  private handleGoldenFrameWorkerEvent(event: GoldenFrameWorkerEvent): void {
+    this.applyGoldenFrameWorkerTelemetry(event.telemetry);
+    if (event.type !== "publish-frame") {
+      return;
+    }
+    if (event.frame.feedKey !== this.snapshot.configKey) {
+      return;
+    }
+
+    publishChartFrame(event.frame.feedKey, event.frame.candles, event.frame.meta);
+    const partial = event.frame.meta.partial;
+    const renderedFrames = this.snapshot.kernelTelemetry.renderedFrames + 1;
+    const atomicFrames = this.snapshot.kernelTelemetry.atomicFrames + (partial ? 0 : 1);
+    const partialFrames = this.snapshot.kernelTelemetry.partialFrames + (partial ? 1 : 0);
+    const nextKernelTelemetry = {
+      ...this.snapshot.kernelTelemetry,
+      renderedFrames,
+      atomicFrames,
+      partialFrames,
+      stallFrames: this.snapshot.kernelTelemetry.stallFrames + (partial ? 1 : 0),
+      partialFrameRate: partialFrames / Math.max(1, renderedFrames),
+      frameSyncConfidence: event.frame.meta.confidence,
+      frameSyncStatus: event.frame.meta.syncStatus,
+      dynamicBufferMs: event.frame.meta.dynamicBufferMs,
+      maxFrameStallMs: Math.max(this.snapshot.kernelTelemetry.maxFrameStallMs, partial ? event.frame.meta.stallAgeMs : 0),
+    };
+    this.snapshot = {
+      ...this.snapshot,
+      busMeta: this.buildWorkerBusMeta(this.snapshot.busMeta, nextKernelTelemetry),
+      kernelTelemetry: {
+        ...nextKernelTelemetry,
+      },
+    };
+  }
+
+  private pushArrivalGapSample(target: number[], deltaMs: number): void {
+    if (!(deltaMs > 0) || !Number.isFinite(deltaMs)) {
+      return;
+    }
+    target.push(deltaMs);
+    while (target.length > RENDER_JITTER_SAMPLE_SIZE) {
+      target.shift();
+    }
+  }
+
+  private recordArrival(kind: "trade" | "depth", arrivalAt = Date.now()): void {
+    if (kind === "trade") {
+      if (this.lastTradeArrivalAt > 0) {
+        this.pushArrivalGapSample(this.tradeArrivalGapSamples, arrivalAt - this.lastTradeArrivalAt);
+      }
+      this.lastTradeArrivalAt = arrivalAt;
+      return;
+    }
+    if (this.lastDepthArrivalAt > 0) {
+      this.pushArrivalGapSample(this.depthArrivalGapSamples, arrivalAt - this.lastDepthArrivalAt);
+    }
+    this.lastDepthArrivalAt = arrivalAt;
+  }
+
+  private computeJitterStdDev(samples: number[]): number {
+    if (samples.length < 4) {
+      return 0;
+    }
+    const mean = samples.reduce((total, value) => total + value, 0) / samples.length;
+    const variance = samples.reduce((total, value) => total + (value - mean) ** 2, 0) / samples.length;
+    return Math.sqrt(Math.max(0, variance));
+  }
+
+  private resolveDynamicRenderBufferMs(backlog: number): number {
+    const mergedSamples = [
+      ...this.tradeArrivalGapSamples.slice(-16),
+      ...this.depthArrivalGapSamples.slice(-16),
+    ];
+    const jitterStdDev = this.computeJitterStdDev(mergedSamples);
+    if (backlog >= RENDER_COALESCE_BACKLOG_THRESHOLD || jitterStdDev >= 22) {
+      return RENDER_BUFFER_MAX_MS;
+    }
+    if (backlog <= 48 && mergedSamples.length >= 8 && jitterStdDev <= 6) {
+      return RENDER_BUFFER_MIN_MS;
+    }
+    return RENDER_BUFFER_DEFAULT_MS;
+  }
+
+  private resolveAdaptiveSequenceGraceMs(): number {
+    const mergedSamples = [
+      ...this.tradeArrivalGapSamples.slice(-16),
+      ...this.depthArrivalGapSamples.slice(-16),
+    ].filter((value) => Number.isFinite(value) && value > 0);
+    const averageArrivalGapMs = mergedSamples.length > 0
+      ? mergedSamples.reduce((total, value) => total + value, 0) / mergedSamples.length
+      : 0;
+    const jitterStdDev = this.computeJitterStdDev(mergedSamples);
+    const streamSkewMs = this.lastTradeEventTsMs > 0 && this.lastDepthEventTsMs > 0
+      ? Math.abs(this.lastTradeEventTsMs - this.lastDepthEventTsMs)
+      : 0;
+    const latencyHintMs = Math.max(0, this.snapshot.kernelTelemetry.tickLatencyMs);
+    const adaptiveGraceMs = Math.max(
+      5,
+      averageArrivalGapMs * 0.5,
+      jitterStdDev * 1.35,
+      streamSkewMs * 0.35,
+      latencyHintMs * 0.08,
+    );
+    return Math.max(5, Math.min(50, Math.round(adaptiveGraceMs)));
+  }
+
+  private isPendingFrameAtomic(frame: PendingRenderFrame): boolean {
+    if (!(frame.tradeTsMs && frame.tradeTsMs > 0)) {
+      return true;
+    }
+    if (!(frame.depthTsMs && frame.depthTsMs > 0)) {
+      return false;
+    }
+    return Math.abs(frame.tradeTsMs - frame.depthTsMs) <= Math.max(8, frame.dynamicBufferMs);
+  }
+
+  private computeFrameConfidence(frame: PendingRenderFrame, partial: boolean, stallAgeMs: number): number {
+    const backlogPenalty = Math.min(0.42, this.snapshot.kernelTelemetry.bufferBacklog / 1200);
+    const syncPenalty = partial ? 0.34 : 0;
+    const stallPenalty = Math.min(0.28, stallAgeMs / 600);
+    const coalescePenalty = frame.coalesced ? 0.12 : 0;
+    const confidence = 1 - backlogPenalty - syncPenalty - stallPenalty - coalescePenalty;
+    return Math.max(0.05, Math.min(1, confidence));
+  }
+
+  private scheduleRenderGate(delayMs: number): void {
+    if (typeof window === "undefined") {
+      this.flushRenderGate(true);
+      return;
+    }
+    if (this.renderGateTimer !== null) {
+      window.clearTimeout(this.renderGateTimer);
+    }
+    this.renderGateTimer = window.setTimeout(() => {
+      this.renderGateTimer = null;
+      this.flushRenderGate(false);
+    }, Math.max(0, Math.min(RENDER_FRAME_STALL_TIMEOUT_MS, Math.round(delayMs))));
+  }
+
+  private scheduleSequenceGuard(delayMs: number): void {
+    if (typeof window === "undefined") {
+      this.advanceSequencedFrames();
+      return;
+    }
+    if (this.sequenceGuardTimer !== null) {
+      window.clearTimeout(this.sequenceGuardTimer);
+    }
+    this.sequenceGuardTimer = window.setTimeout(() => {
+      this.sequenceGuardTimer = null;
+      this.advanceSequencedFrames();
+    }, Math.max(1, Math.round(delayMs)));
+  }
+
+  private armRenderFrame(frame: PendingRenderFrame): void {
+    this.pendingRenderFrame = frame;
+    this.snapshot = {
+      ...this.snapshot,
+      kernelTelemetry: {
+        ...this.snapshot.kernelTelemetry,
+        dynamicBufferMs: frame.dynamicBufferMs,
+        adaptiveGraceMs: this.sequenceGuard.getGraceWindowMs(),
+      },
+    };
+    this.scheduleRenderGate(frame.dynamicBufferMs);
+  }
+
+  private advanceSequencedFrames(): void {
+    if (this.pendingRenderFrame) {
+      return;
+    }
+    const adaptiveGraceMs = this.resolveAdaptiveSequenceGraceMs();
+    this.sequenceGuard.setGraceWindowMs(adaptiveGraceMs);
+    const result = this.sequenceGuard.poll(Date.now());
+    this.snapshot = {
+      ...this.snapshot,
+      kernelTelemetry: {
+        ...this.snapshot.kernelTelemetry,
+        sequenceQueueDepth: result.queueDepth,
+        syncGapCount: this.snapshot.kernelTelemetry.syncGapCount + result.skippedGapCount,
+        adaptiveGraceMs,
+      },
+    };
+    if (result.ready) {
+      this.armRenderFrame(result.ready.payload);
+      return;
+    }
+    if (result.nextWakeDelayMs !== null) {
+      this.scheduleSequenceGuard(result.nextWakeDelayMs);
+    }
+  }
+
+  private flushRenderGate(force: boolean): void {
+    const pending = this.pendingRenderFrame;
+    if (!pending) {
+      return;
+    }
+    const now = Date.now();
+    const stallAgeMs = Math.max(0, now - pending.createdAt);
+    const atomic = this.isPendingFrameAtomic(pending);
+    if (!force && !atomic && stallAgeMs < RENDER_FRAME_STALL_TIMEOUT_MS) {
+      this.scheduleRenderGate(Math.min(pending.dynamicBufferMs, RENDER_FRAME_STALL_TIMEOUT_MS - stallAgeMs));
+      return;
+    }
+    const partial = !atomic;
+    const syncStatus: "atomic" | "loose-sync" | "coalesced" = partial
+      ? "loose-sync"
+      : pending.coalesced
+        ? "coalesced"
+        : "atomic";
+    const confidence = this.computeFrameConfidence(pending, partial, stallAgeMs);
+    publishChartFrame(pending.feedKey, pending.candles, {
+      syncStatus,
+      partial,
+      coalesced: pending.coalesced,
+      confidence,
+      dynamicBufferMs: pending.dynamicBufferMs,
+      stallAgeMs: partial ? stallAgeMs : 0,
+      depthSequence: pending.depthSequence,
+      depthEventTs: pending.depthTsMs,
+      tradeEventTs: pending.tradeTsMs,
+    });
+    const renderedFrames = this.snapshot.kernelTelemetry.renderedFrames + 1;
+    const atomicFrames = this.snapshot.kernelTelemetry.atomicFrames + (partial ? 0 : 1);
+    const partialFrames = this.snapshot.kernelTelemetry.partialFrames + (partial ? 1 : 0);
+    this.snapshot = {
+      ...this.snapshot,
+      kernelTelemetry: {
+        ...this.snapshot.kernelTelemetry,
+        renderedFrames,
+        atomicFrames,
+        partialFrames,
+        stallFrames: this.snapshot.kernelTelemetry.stallFrames + (partial ? 1 : 0),
+        partialFrameRate: partialFrames / Math.max(1, renderedFrames),
+        frameSyncConfidence: confidence,
+        frameSyncStatus: syncStatus,
+        dynamicBufferMs: pending.dynamicBufferMs,
+        maxFrameStallMs: Math.max(this.snapshot.kernelTelemetry.maxFrameStallMs, partial ? stallAgeMs : 0),
+      },
+    };
+    this.pendingRenderFrame = null;
+    this.advanceSequencedFrames();
+  }
+
+  private queueRenderFrame(
+    candles: LiveChartCandle[],
+    feedKey: string,
+    input?: { tradeTsMs?: number | null; depthTsMs?: number | null; depthSequence?: number | null; coalesced?: boolean },
+  ): void {
+    const now = Date.now();
+    const backlog = this.computeTradeBacklog();
+    const dynamicBufferMs = this.resolveDynamicRenderBufferMs(backlog);
+    const adaptiveGraceMs = this.resolveAdaptiveSequenceGraceMs();
+    this.sequenceGuard.setGraceWindowMs(adaptiveGraceMs);
+    this.currentDynamicBufferMs = dynamicBufferMs;
+    const nextFrame: WorkerPendingRenderFrame = {
+      feedKey,
+      candles,
+      createdAt: now,
+      tradeTsMs: Number.isFinite(input?.tradeTsMs) ? Number(input?.tradeTsMs) : null,
+      depthTsMs: Number.isFinite(input?.depthTsMs) ? Number(input?.depthTsMs) : this.lastDepthEventTsMs || null,
+      depthSequence: Number.isFinite(input?.depthSequence) ? Number(input?.depthSequence) : this.lastDepthSequence,
+      coalesced: Boolean(input?.coalesced),
+      dynamicBufferMs,
+      backlog,
+      adaptiveGraceMs,
+    };
+    if (this.goldenFrameWorker?.isAvailable()) {
+      this.snapshot = {
+        ...this.snapshot,
+        kernelTelemetry: {
+          ...this.snapshot.kernelTelemetry,
+          dynamicBufferMs,
+          adaptiveGraceMs,
+        },
+      };
+      this.goldenFrameWorker.queueFrame(nextFrame as GoldenFrameWorkerFrameInput);
+      return;
+    }
+    if (Number.isFinite(nextFrame.depthSequence)) {
+      this.sequenceGuard.enqueue(Number(nextFrame.depthSequence), nextFrame, now);
+      this.snapshot = {
+        ...this.snapshot,
+        kernelTelemetry: {
+          ...this.snapshot.kernelTelemetry,
+          coalescedFrames: this.snapshot.kernelTelemetry.coalescedFrames + (input?.coalesced ? 1 : 0),
+          sequenceQueueDepth: this.sequenceGuard.size(),
+          adaptiveGraceMs,
+        },
+      };
+      this.advanceSequencedFrames();
+      return;
+    }
+    if (!this.pendingRenderFrame || this.pendingRenderFrame.feedKey !== feedKey) {
+      this.armRenderFrame(nextFrame);
+      return;
+    }
+    this.pendingRenderFrame.candles = candles;
+    this.pendingRenderFrame.tradeTsMs = Number.isFinite(input?.tradeTsMs)
+      ? Number(input?.tradeTsMs)
+      : this.pendingRenderFrame.tradeTsMs;
+    this.pendingRenderFrame.depthTsMs = Number.isFinite(input?.depthTsMs)
+      ? Number(input?.depthTsMs)
+      : this.pendingRenderFrame.depthTsMs;
+    this.pendingRenderFrame.coalesced = this.pendingRenderFrame.coalesced || Boolean(input?.coalesced);
+    this.pendingRenderFrame.dynamicBufferMs = dynamicBufferMs;
+    this.snapshot = {
+      ...this.snapshot,
+      kernelTelemetry: {
+        ...this.snapshot.kernelTelemetry,
+        dynamicBufferMs,
+        adaptiveGraceMs,
+        coalescedFrames: this.snapshot.kernelTelemetry.coalescedFrames + 1,
+      },
+    };
+    this.scheduleRenderGate(dynamicBufferMs);
+  }
+
   private stopSyntheticHeartbeat(): void {
     if (this.syntheticHeartbeatTimer !== null) {
       window.clearInterval(this.syntheticHeartbeatTimer);
@@ -734,21 +1193,7 @@ class MarketDataBus {
 
   private configureSyntheticHeartbeat(): void {
     this.stopSyntheticHeartbeat();
-    const config = this.config;
-    if (!config) {
-      return;
-    }
-    if (timeframeToMs(config.timeframe) > MICRO_TF_HEARTBEAT_MAX_MS) {
-      return;
-    }
-
-    this.syntheticHeartbeatTimer = window.setInterval(() => {
-      const heartbeatPrice = this.resolveSyntheticHeartbeatPrice();
-      if (!(heartbeatPrice > 0)) {
-        return;
-      }
-      this.ingestPriceTick(heartbeatPrice, Date.now(), "synthetic-heartbeat");
-    }, SYNTHETIC_HEARTBEAT_MS);
+    // Live terminal now runs strict data-integrity mode: no synthetic heartbeat bars.
   }
 
   async refreshNow(requestType: MarketBusRequestType = "ai"): Promise<void> {
@@ -887,12 +1332,26 @@ class MarketDataBus {
     const fallbackDepth = busPayload.depth_snapshot && typeof busPayload.depth_snapshot === "object"
       ? busPayload.depth_snapshot as JsonMap
       : null;
+    if (fallbackDepth && this.orderflowRuntimeEngine) {
+      const depthPayload = (fallbackDepth.depth_payload as JsonMap | undefined) || fallbackDepth;
+      this.orderflowRuntimeEngine.ingestDepthSnapshot({
+        bids: MarketDataBus._toDepthRows(depthPayload.bids),
+        asks: MarketDataBus._toDepthRows(depthPayload.asks),
+        tsMs: typeof busPayload.as_of === "string" ? Date.parse(busPayload.as_of) : Date.now(),
+      });
+    }
+    if (this.orderflowRuntimeEngine && rawTrades.length > 0) {
+      this.orderflowRuntimeEngine.ingestTrades(rawTrades.map((trade) => ({
+        price: toNumber(trade.price ?? trade.p, 0),
+        size: toNumber(trade.size ?? trade.q ?? trade.qty, 0),
+        side: String(trade.side || (trade.m === true ? "sell" : "buy")).toLowerCase() === "sell" ? "sell" : "buy",
+        tsMs: tradeTimestampMs(trade),
+        source: String(trade.venue || config.venue || "market-bus-snapshot"),
+      })));
+    }
     const effectiveDepth = fallbackDepth
       ? (this.setVenueDepthSnapshot(config.venue, fallbackDepth) || fallbackDepth)
       : this.snapshot.marketDepth;
-    const hasFallbackBars = fallbackBars.length > 0;
-    const hasFallbackDepth = fallbackDepth !== null || ((busPayload.orderbook as JsonMap | null | undefined) || null) !== null;
-
     this.snapshot = {
       ...this.snapshot,
       ohlcvBars: canonicalBars.length > 0 ? canonicalBars : this.snapshot.ohlcvBars,
@@ -904,10 +1363,10 @@ class MarketDataBus {
       orderbook: (busPayload.orderbook as JsonMap | null | undefined) || null,
       marketDepth: effectiveDepth,
       routingScore: this._buildRoutingScore((busPayload.routing_score as JsonMap | null | undefined) || null),
-      busMeta: (busPayload.meta as JsonMap | null | undefined) || null,
+      busMeta: this.buildWorkerBusMeta((busPayload.meta as JsonMap | null | undefined) || null),
       chartLoading: canonicalBars.length > 0 ? false : this.snapshot.chartLoading,
       ohlcvStreamState: canonicalBars.length > 0 || rawTrades.length > 0 ? "live" : this.snapshot.ohlcvStreamState,
-      depthStreamState: this.snapshot.depthStreamState === "live" || hasFallbackDepth ? "live" : this.snapshot.depthStreamState,
+      depthStreamState: this.snapshot.depthStreamState,
       lastSyncAt: typeof busPayload.as_of === "string" ? busPayload.as_of : new Date().toISOString(),
     };
     releaseSideFetch();
@@ -916,6 +1375,13 @@ class MarketDataBus {
   }
 
   private emit(): void {
+    const nextOrderflowRuntime = this.orderflowRuntimeEngine ? this.orderflowRuntimeEngine.getSnapshot() : null;
+    if (this.snapshot.orderflowRuntime !== nextOrderflowRuntime) {
+      this.snapshot = {
+        ...this.snapshot,
+        orderflowRuntime: nextOrderflowRuntime,
+      };
+    }
     for (const listener of this.listeners) {
       listener(this.snapshot);
     }
@@ -1043,7 +1509,17 @@ class MarketDataBus {
     this.emit();
   }
 
-  private publishEngineFrame(sourceBars?: OhlcvBar[], feedKey?: string): OhlcvBar[] {
+  private publishEngineFrame(
+    sourceBars?: OhlcvBar[],
+    feedKey?: string,
+    frameContext?: {
+      mode?: "immediate" | "gated";
+      tradeTsMs?: number | null;
+      depthTsMs?: number | null;
+      depthSequence?: number | null;
+      coalesced?: boolean;
+    },
+  ): OhlcvBar[] {
     const bars = sourceBars || (this.engine ? this.engine.getSeries() : this.snapshot.ohlcvBars);
     const activeFeedKey = feedKey || this.snapshot.configKey;
     if (!bars.length || !activeFeedKey) {
@@ -1053,11 +1529,51 @@ class MarketDataBus {
       this.engine.prepareFrame(bars, this.config?.timeframe);
       const swapped = this.engine.swapFrame(this.config?.timeframe);
       if (swapped.length > 0) {
-        publishChartFrame(activeFeedKey, barsToLiveCandles(swapped));
+        const candles = barsToLiveCandles(swapped);
+        if (frameContext?.mode === "gated") {
+          this.queueRenderFrame(candles, activeFeedKey, {
+            tradeTsMs: frameContext.tradeTsMs,
+            depthTsMs: frameContext.depthTsMs,
+            depthSequence: frameContext.depthSequence,
+            coalesced: frameContext.coalesced,
+          });
+        } else {
+          publishChartFrame(activeFeedKey, candles, {
+            syncStatus: "atomic",
+            partial: false,
+            coalesced: false,
+            confidence: 1,
+            dynamicBufferMs: this.currentDynamicBufferMs,
+            stallAgeMs: 0,
+            depthSequence: this.lastDepthSequence,
+            depthEventTs: this.lastDepthEventTsMs || null,
+            tradeEventTs: this.lastTradeEventTsMs || null,
+          });
+        }
         return swapped;
       }
     }
-    publishChartFrame(activeFeedKey, barsToLiveCandles(bars));
+    const candles = barsToLiveCandles(bars);
+    if (frameContext?.mode === "gated") {
+      this.queueRenderFrame(candles, activeFeedKey, {
+        tradeTsMs: frameContext.tradeTsMs,
+        depthTsMs: frameContext.depthTsMs,
+        depthSequence: frameContext.depthSequence,
+        coalesced: frameContext.coalesced,
+      });
+    } else {
+      publishChartFrame(activeFeedKey, candles, {
+        syncStatus: "atomic",
+        partial: false,
+        coalesced: false,
+        confidence: 1,
+        dynamicBufferMs: this.currentDynamicBufferMs,
+        stallAgeMs: 0,
+        depthSequence: this.lastDepthSequence,
+        depthEventTs: this.lastDepthEventTsMs || null,
+        tradeEventTs: this.lastTradeEventTsMs || null,
+      });
+    }
     return bars;
   }
 
@@ -1146,6 +1662,16 @@ class MarketDataBus {
 
     if (acceptedTrades.length === 0) {
       return;
+    }
+
+    if (this.orderflowRuntimeEngine) {
+      this.orderflowRuntimeEngine.ingestTrades(acceptedTrades.map((trade) => ({
+        price: toNumber(trade.raw_price ?? trade.price ?? trade.p, 0),
+        size: toNumber(trade.size ?? trade.q ?? trade.qty, 0),
+        side: String(trade.side || (trade.m === true ? "sell" : "buy")).toLowerCase() === "sell" ? "sell" : "buy",
+        tsMs: tradeTimestampMs(trade),
+        source: String(trade.venue || this.config?.venue || "live-trades"),
+      })));
     }
 
     this.engine.syncLatencyFromV4();
@@ -1336,6 +1862,7 @@ class MarketDataBus {
   }
 
   private disconnectSockets(): void {
+    this.clearRenderGate();
     if (this.sideRefreshTimer !== null) {
       window.clearTimeout(this.sideRefreshTimer);
       this.sideRefreshTimer = null;
@@ -1492,7 +2019,9 @@ class MarketDataBus {
     const venues = [...this.tradeRingsByVenue.keys()].sort((left, right) => tradeVenuePriority(left) - tradeVenuePriority(right));
     const previewTrades: JsonMap[] = [];
     let processed = 0;
+    let latestTradeTsMs = 0;
     const startedAt = typeof performance !== "undefined" ? performance.now() : frameTs;
+    const coalescingActive = backlogBeforeDrain >= RENDER_COALESCE_BACKLOG_THRESHOLD;
 
     for (const venue of venues) {
       const ring = this.tradeRingsByVenue.get(venue);
@@ -1511,6 +2040,7 @@ class MarketDataBus {
         const size = this.tradeDrainScratch[1];
         const sideFlag = this.tradeDrainScratch[2];
         const tsMs = this.tradeDrainScratch[3];
+        latestTradeTsMs = Math.max(latestTradeTsMs, tsMs);
         this.engine.ingestTradeFast(price, size, sideFlag, tsMs, venue);
         this.fusionEngine?.updateTickFast(venue, price, size, tsMs);
         if (previewTrades.length < 24) {
@@ -1560,7 +2090,14 @@ class MarketDataBus {
       : this.snapshot.kernelTelemetry.skippedFrames;
 
     this.engine.syncLatencyFromV4();
-    const mergedBars = this.publishEngineFrame();
+    this.lastTradeEventTsMs = Math.max(this.lastTradeEventTsMs, latestTradeTsMs);
+    const mergedBars = this.publishEngineFrame(undefined, undefined, {
+      mode: "gated",
+      tradeTsMs: latestTradeTsMs || this.lastTradeEventTsMs,
+      depthTsMs: this.lastDepthEventTsMs || null,
+      depthSequence: this.lastDepthSequence,
+      coalesced: coalescingActive,
+    });
     this.snapshot = {
       ...this.snapshot,
       nativeTrades: [...previewTrades.reverse(), ...this.snapshot.nativeTrades].slice(0, LIVE_NATIVE_TRADES_LIMIT),
@@ -1665,6 +2202,7 @@ class MarketDataBus {
 
     socket.onmessage = (event) => {
       try {
+        const arrivalAt = Date.now();
         const payload = JSON.parse(String(event.data || "{}")) as JsonMap;
         if (!payload || typeof payload !== "object") {
           return;
@@ -1672,10 +2210,14 @@ class MarketDataBus {
         if (payload.type === "snapshot") {
           const items = Array.isArray(payload.items) ? payload.items as JsonMap[] : [];
           let queued = 0;
+          let latestTradeTsMs = 0;
           for (let index = 0; index < items.length; index += 1) {
             queued += enqueueTradePayloadIntoRing(items[index], tradeRing);
+            latestTradeTsMs = Math.max(latestTradeTsMs, tradeTimestampMs(items[index]));
           }
           if (queued > 0) {
+            this.recordArrival("trade", arrivalAt);
+            this.lastTradeEventTsMs = Math.max(this.lastTradeEventTsMs, latestTradeTsMs);
             this.snapshot = {
               ...this.snapshot,
               kernelTelemetry: {
@@ -1695,6 +2237,8 @@ class MarketDataBus {
           if (item) {
             const queued = enqueueTradePayloadIntoRing(item, tradeRing);
             if (queued > 0) {
+              this.recordArrival("trade", arrivalAt);
+              this.lastTradeEventTsMs = Math.max(this.lastTradeEventTsMs, tradeTimestampMs(item));
               this.snapshot = {
                 ...this.snapshot,
                 kernelTelemetry: {
@@ -1764,6 +2308,9 @@ class MarketDataBus {
     if (!fusion) {
       return baseRouting;
     }
+    const baseArbitrage = baseRouting?.arbitrage && typeof baseRouting.arbitrage === "object" && !Array.isArray(baseRouting.arbitrage)
+      ? baseRouting.arbitrage as JsonMap
+      : null;
     const baseCandidates = Array.isArray(baseRouting?.candidates)
       ? baseRouting.candidates as JsonMap[]
       : [];
@@ -1788,11 +2335,16 @@ class MarketDataBus {
       fusion_price: fusion.fusionPrice,
       display_price: fusion.displayPrice,
       arbitrage: {
+        ...(baseArbitrage || {}),
         opportunity: fusion.arbitrage.opportunity,
         spread: fusion.arbitrage.spread,
         net_spread: fusion.arbitrage.netSpread,
         buy: fusion.arbitrage.buy,
         sell: fusion.arbitrage.sell,
+        buy_venue: fusion.arbitrage.buy || baseArbitrage?.buy_venue,
+        sell_venue: fusion.arbitrage.sell || baseArbitrage?.sell_venue,
+        buyVenue: fusion.arbitrage.buy || baseArbitrage?.buyVenue,
+        sellVenue: fusion.arbitrage.sell || baseArbitrage?.sellVenue,
       },
       best: candidates[0] || ((baseRouting?.best as JsonMap | undefined) || null),
       backup: candidates[1] || ((baseRouting?.backup as JsonMap | undefined) || null),
@@ -1869,16 +2421,36 @@ class MarketDataBus {
 
     socket.onmessage = (event) => {
       try {
+        const arrivalAt = Date.now();
         const payload = JSON.parse(String(event.data || "{}")) as JsonMap;
         if (!payload || typeof payload !== "object") {
           return;
         }
         const currentVenueDepth = (this.depthSnapshotsByVenue.get(venue) as JsonMap | undefined) || null;
         if (payload.type === "snapshot") {
+          const payloadDepth = (payload.depth_payload as JsonMap | undefined) || payload;
+          const eventTime = toNumber(payloadDepth.event_time, Date.now());
+          const sequence = toNumber(payloadDepth.lastUpdateId ?? payloadDepth.update_id, NaN);
+          this.recordArrival("depth", arrivalAt);
+          this.lastDepthEventTsMs = eventTime;
+          this.lastDepthSequence = Number.isFinite(sequence) ? sequence : this.lastDepthSequence;
           const mergedDepth = this.setVenueDepthSnapshot(venue, payload);
           const effectiveDepth = mergedDepth || payload;
           this._feedDepthToV5(effectiveDepth);
-          const nextBars = this.publishEngineFrame(this.snapshot.ohlcvBars);
+          if (this.orderflowRuntimeEngine) {
+            const depthPayload = (effectiveDepth.depth_payload as JsonMap | undefined) || effectiveDepth;
+            this.orderflowRuntimeEngine.ingestDepthSnapshot({
+              bids: MarketDataBus._toDepthRows(depthPayload.bids),
+              asks: MarketDataBus._toDepthRows(depthPayload.asks),
+              tsMs: eventTime,
+              sequence: Number.isFinite(sequence) ? sequence : null,
+            });
+          }
+          const nextBars = this.publishEngineFrame(this.snapshot.ohlcvBars, undefined, {
+            mode: "gated",
+            depthTsMs: eventTime,
+            depthSequence: Number.isFinite(sequence) ? sequence : null,
+          });
           this.snapshot = {
             ...this.snapshot,
             marketDepth: effectiveDepth,
@@ -1889,11 +2461,28 @@ class MarketDataBus {
           return;
         }
         if (payload.type === "delta") {
+          const eventTime = toNumber(payload.event_time, Date.now());
+          const sequence = toNumber(payload.update_id, NaN);
+          this.recordArrival("depth", arrivalAt);
+          this.lastDepthEventTsMs = eventTime;
+          this.lastDepthSequence = Number.isFinite(sequence) ? sequence : this.lastDepthSequence;
           const nextVenueDepth = mergeDepthDelta(currentVenueDepth, payload);
           const mergedDepth = this.setVenueDepthSnapshot(venue, nextVenueDepth);
           const effectiveDepth = mergedDepth || nextVenueDepth;
           this._feedDepthToV5(effectiveDepth);
-          const nextBars = this.publishEngineFrame(this.snapshot.ohlcvBars);
+          if (this.orderflowRuntimeEngine) {
+            this.orderflowRuntimeEngine.ingestDepthDelta({
+              bids: MarketDataBus._toDepthRows(payload.bids),
+              asks: MarketDataBus._toDepthRows(payload.asks),
+              tsMs: eventTime,
+              sequence: Number.isFinite(sequence) ? sequence : null,
+            });
+          }
+          const nextBars = this.publishEngineFrame(this.snapshot.ohlcvBars, undefined, {
+            mode: "gated",
+            depthTsMs: eventTime,
+            depthSequence: Number.isFinite(sequence) ? sequence : null,
+          });
           this.snapshot = {
             ...this.snapshot,
             marketDepth: effectiveDepth,
@@ -1993,6 +2582,17 @@ class MarketDataBus {
     this.connectDepthSocketForVenue(config.venue, false);
     this.connectAuxDepthSockets();
   }
+
+  getSyncedFrame(bidsRaw?: DepthRow[], asksRaw?: DepthRow[]): SyncedMarketFrame | null {
+    if (!this.engine) return null;
+    const effectiveDepth = (this.snapshot.marketDepth as JsonMap | null) || this.snapshot.orderbook;
+    const depthPayload = effectiveDepth && typeof effectiveDepth === "object"
+      ? ((effectiveDepth.depth_payload as JsonMap | undefined) || effectiveDepth)
+      : null;
+    const effectiveBids = bidsRaw ?? MarketDataBus._toDepthRows(depthPayload?.bids);
+    const effectiveAsks = asksRaw ?? MarketDataBus._toDepthRows(depthPayload?.asks);
+    return this.engine.getSyncedFrame(effectiveBids, effectiveAsks);
+  }
 }
 
 export function createMarketDataBus(): {
@@ -2003,6 +2603,7 @@ export function createMarketDataBus(): {
   ingestPriceTick: (price: number, tsMs?: number) => void;
   setSchedulerHint: (hint: MarketDataBusSchedulerHint) => void;
   setBenchmarkMode: (enabled: boolean, ticksPerSec?: number) => void;
+  getSyncedFrame: (bidsRaw?: DepthRow[], asksRaw?: DepthRow[]) => SyncedMarketFrame | null;
 } {
   const bus = new MarketDataBus();
   return {
@@ -2013,5 +2614,6 @@ export function createMarketDataBus(): {
     ingestPriceTick: (price, tsMs) => bus.ingestPriceTick(price, tsMs),
     setSchedulerHint: (hint) => bus.setSchedulerHint(hint),
     setBenchmarkMode: (enabled, ticksPerSec) => bus.setBenchmarkMode(enabled, ticksPerSec),
+    getSyncedFrame: (bidsRaw, asksRaw) => bus.getSyncedFrame(bidsRaw, asksRaw),
   };
 }

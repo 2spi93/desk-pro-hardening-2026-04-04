@@ -52,10 +52,30 @@ export interface MetricEvent {
 
 // Global metrics accumulator
 const metrics = new Map<string, number>();
+
+function isTruthyEnvFlag(name: string): boolean {
+  const raw = String(process.env[name] || '').toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on';
+}
+
+function isShadowNoiseSuppressed(): boolean {
+  if (String(process.env.MC_SHADOW_SILENT || '').trim()) {
+    return isTruthyEnvFlag('MC_SHADOW_SILENT');
+  }
+  if (String(process.env.MC_E2E_DEV_DEGRADED_SILENT || '').trim()) {
+    return isTruthyEnvFlag('MC_E2E_DEV_DEGRADED_SILENT');
+  }
+  return isTruthyEnvFlag('PLAYWRIGHT_TEST');
+}
+
 function recordMetric(event: MetricEvent) {
   const key = `${event.type}_${event.route}`;
   metrics.set(key, (metrics.get(key) || 0) + 1);
-  
+
+  if (isShadowNoiseSuppressed()) {
+    return;
+  }
+
   // Structured log for observability
   console.warn('[TXT][SHADOW_METRIC]', {
     event: event.type,
@@ -278,13 +298,15 @@ export async function executeWithShadowMode<T>(config: ShadowConfig, {
         reason: divergenceReason,
         timestamp: new Date().toISOString(),
       });
-      
-      console.warn('[TXT][SHADOW_DIFF]', {
-        route: config.route,
-        divergence: divergenceReason,
-        backend_latency_ms: backendLatency,
-        timestamp: new Date().toISOString(),
-      });
+
+      if (!isShadowNoiseSuppressed()) {
+        console.warn('[TXT][SHADOW_DIFF]', {
+          route: config.route,
+          divergence: divergenceReason,
+          backend_latency_ms: backendLatency,
+          timestamp: new Date().toISOString(),
+        });
+      }
     }
   }
   

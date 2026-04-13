@@ -248,6 +248,7 @@ type ExecutionSidecarCardProps = {
   onApproveAll: () => void;
   onApproveAllAndSend: () => void;
   approveAllAndSendLabel: string;
+  approveAllAndSendDisabled?: boolean;
   showCriticalActions: boolean;
   previewOpen: boolean;
   onTogglePreview: () => void;
@@ -275,6 +276,7 @@ export function ExecutionSidecarCard({
   onApproveAll,
   onApproveAllAndSend,
   approveAllAndSendLabel,
+  approveAllAndSendDisabled = false,
   showCriticalActions,
   previewOpen,
   onTogglePreview,
@@ -314,7 +316,7 @@ export function ExecutionSidecarCard({
             {showCriticalActions ? (
               <>
                 <button type="button" className="chart-chip active" onClick={onApproveAll}>Approve All</button>
-                <button type="button" className="chart-chip chart-buy-btn" onClick={onApproveAllAndSend}>{approveAllAndSendLabel}</button>
+                <button type="button" className="chart-chip chart-buy-btn" disabled={approveAllAndSendDisabled} onClick={onApproveAllAndSend}>{approveAllAndSendLabel}</button>
               </>
             ) : null}
           </div>

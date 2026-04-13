@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { redirect } from "next/navigation";
 
+import OperatorPanelGuide from "../../components/ui/OperatorPanelGuide";
 import { cpFetch } from "../../lib/controlPlane";
 
 type MePayload = {
@@ -12,17 +13,28 @@ type MePayload = {
 export default async function ChangePasswordPage({
   searchParams,
 }: {
-  searchParams?: { error?: string };
+  searchParams?: { error?: string; next?: string };
 }) {
   const response = await cpFetch("/v1/auth/me");
   if (!response.ok) {
     return (
-      <main className="shell">
-        <section className="hero" style={{ gridTemplateColumns: "1fr" }}>
-          <div className="panel" style={{ maxWidth: 560, margin: "0 auto" }}>
+      <main className="shell txt-page-shell">
+        <section className="hero txt-page-hero-grid" style={{ gridTemplateColumns: "1fr" }}>
+          <div className="panel txt-page-hero" style={{ maxWidth: 560, margin: "0 auto" }}>
             <div className="eyebrow">TXT</div>
             <h1 className="title" style={{ fontSize: 34 }}>Session requise</h1>
             <p className="subtle">Connecte-toi avant de changer ton mot de passe.</p>
+            <OperatorPanelGuide
+              title="Guide Acces"
+              what="Le changement de mot de passe reste reserve a une session operateur valide."
+              why="Eviter une rotation hors contexte ou une action anonyme sur un compte sensible."
+              example="Si la session n'est plus valide, reconnecte-toi puis reviens ici depuis le cockpit."
+              compact
+            />
+            <div className="txt-page-guide-note">
+              <strong>Note operateur</strong>
+              Reviens d'abord sur le login, restaure une session propre, puis valide ensuite l'etat global sur Dashboard et Terminal.
+            </div>
             <p><Link href="/login">Aller au login</Link></p>
           </div>
         </section>
@@ -36,18 +48,25 @@ export default async function ChangePasswordPage({
   }
 
   return (
-    <main className="shell">
-      <section className="hero" style={{ gridTemplateColumns: "1fr" }}>
-        <div className="panel" style={{ maxWidth: 620, margin: "0 auto" }}>
+    <main className="shell txt-page-shell">
+      <section className="hero txt-page-hero-grid" style={{ gridTemplateColumns: "1fr" }}>
+        <div className="panel txt-page-hero" style={{ maxWidth: 620, margin: "0 auto" }}>
           <div className="eyebrow">Change Password</div>
           <h1 className="title" style={{ fontSize: 34 }}>Rotation obligatoire du mot de passe</h1>
           <p className="subtle">Compte: {String(me.username)} ({String(me.role)}). Choisis un nouveau mot de passe d’au moins 12 caracteres.</p>
-          <div className="txt-auth-guide" aria-label="Guide rotation mot de passe">
-            <strong>Guide rapide</strong>
-            <p className="subtle">1) Saisis l'ancien mot de passe. 2) Definis un nouveau mot de passe fort (12+). 3) Reconnecte-toi et valide l'etat global sur Dashboard puis Terminal.</p>
+          <OperatorPanelGuide
+            title="Guide Rotation"
+            what="La rotation remplace le secret courant et force un retour a une session propre."
+            why="Couper les credentials faibles ou exposes avant toute exploitation live."
+            example="Saisis l'ancien mot de passe, definis un secret 12+ caracteres, reconnecte-toi puis relis Dashboard et Terminal."
+          />
+          <div className="txt-page-guide-note">
+            <strong>Note operateur</strong>
+            Ne valide pas la rotation si tu n'es pas pret a rouvrir une session et a recontroler le mode systeme juste apres.
           </div>
           {searchParams?.error ? <p className="warn">Le changement de mot de passe a echoue.</p> : null}
           <form action="/api/auth/change-password" method="post" className="form-grid" style={{ marginTop: 16 }}>
+            <input type="hidden" name="next" value={searchParams?.next || ""} />
             <label className="subtle" htmlFor="old_password">Mot de passe actuel</label>
             <input id="old_password" name="old_password" type="password" required />
             <label className="subtle" htmlFor="new_password">Nouveau mot de passe</label>

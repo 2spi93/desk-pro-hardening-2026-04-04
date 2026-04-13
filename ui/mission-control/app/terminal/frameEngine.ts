@@ -2,6 +2,14 @@ export type LatestFrameScheduler<T> = {
   schedule: (payload: T, render: (payload: T) => void) => void;
   cancel: () => void;
   configure: (options: LatestFrameSchedulerOptions) => void;
+  getDiagnostics: () => LatestFrameSchedulerDiagnostics;
+};
+
+export type LatestFrameSchedulerDiagnostics = {
+  scheduledCount: number;
+  flushedCount: number;
+  overwrittenPendingCount: number;
+  minFrameDeferralCount: number;
 };
 
 export type LatestFrameSchedulerOptions = {
@@ -19,9 +27,16 @@ export function createLatestFrameScheduler<T>(initialOptions?: LatestFrameSchedu
     minFrameMs: Math.max(8, Math.round(initialOptions?.minFrameMs ?? 16)),
     strictBucketAlignment: initialOptions?.strictBucketAlignment ?? true,
   };
+  const diagnostics: LatestFrameSchedulerDiagnostics = {
+    scheduledCount: 0,
+    flushedCount: 0,
+    overwrittenPendingCount: 0,
+    minFrameDeferralCount: 0,
+  };
 
   const flush = (frameTime: number) => {
     if (frameTime - lastFrameTime < options.minFrameMs) {
+      diagnostics.minFrameDeferralCount += 1;
       rafId = window.requestAnimationFrame(flush);
       return;
     }
@@ -37,6 +52,7 @@ export function createLatestFrameScheduler<T>(initialOptions?: LatestFrameSchedu
     lastPayload = null;
 
     if (nextPayload !== null && nextRender) {
+      diagnostics.flushedCount += 1;
       nextRender(nextPayload);
     }
 
@@ -48,6 +64,10 @@ export function createLatestFrameScheduler<T>(initialOptions?: LatestFrameSchedu
 
   return {
     schedule(payload, render) {
+      diagnostics.scheduledCount += 1;
+      if (pending && lastPayload !== null) {
+        diagnostics.overwrittenPendingCount += 1;
+      }
       lastPayload = payload;
       lastRender = render;
 
@@ -81,6 +101,9 @@ export function createLatestFrameScheduler<T>(initialOptions?: LatestFrameSchedu
         minFrameMs: Math.max(8, Math.round(nextOptions.minFrameMs ?? options.minFrameMs)),
         strictBucketAlignment: nextOptions.strictBucketAlignment ?? options.strictBucketAlignment,
       };
+    },
+    getDiagnostics() {
+      return { ...diagnostics };
     },
   };
 }

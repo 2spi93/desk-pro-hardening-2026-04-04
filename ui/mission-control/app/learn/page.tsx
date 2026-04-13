@@ -1,6 +1,7 @@
 import Link from "next/link";
 
-import TxtMiniGuide from "../../components/ui/TxtMiniGuide";
+import OperatorPanelGuide from "../../components/ui/OperatorPanelGuide";
+import TxtWorkspaceHelper from "../../components/ui/TxtWorkspaceHelper";
 
 const TOPICS = [
   "Comprendre les bougies",
@@ -15,11 +16,11 @@ const TOPICS = [
 export default function LearnPage() {
   return (
     <main className="shell txt-page-shell">
-      <section className="panel txt-page-hero">
+      <section id="global-guide-learn-hero" className="panel txt-page-hero">
         <div className="eyebrow">TXT Learn</div>
         <h1 className="title" style={{ fontSize: 34 }}>Apprendre le trading de facon claire</h1>
         <p className="subtle">Parcours pedagogique concu pour les debutants avec exemples, schemas et vocabulaire simple.</p>
-        <TxtMiniGuide
+        <OperatorPanelGuide
           title="Guide Learn"
           what="Des modules pedagogiques progressifs pour comprendre le trading sans pre-requis institutionnel."
           why="Permettre a un debutant d'etre autonome et de lire le terminal rapidement."
@@ -27,6 +28,8 @@ export default function LearnPage() {
           terms={["dom", "footprint", "vwap"]}
         />
       </section>
+
+      <TxtWorkspaceHelper />
 
       <section className="grid" style={{ gridTemplateColumns: "repeat(3, minmax(0, 1fr))" }}>
         {TOPICS.map((topic) => (

@@ -8,6 +8,8 @@ export type ChartSnapEnabled = boolean;
 export type ChartSnapPriority = "execution" | "vwap" | "liquidity";
 export type ChartReleaseSendMode = "one-click" | "confirm-required";
 export type ChartHapticMode = "off" | "light" | "medium";
+export type TerminalChartBarModePreference = "time" | "delta" | "event";
+export type TerminalDeskViewModePreference = "auto" | "flow" | "hybrid" | "candle";
 export type TerminalLayoutProfileMap = Record<string, Record<string, unknown>>;
 export type UserUiPreferencesProfile = {
   uiMode: UiMode;
@@ -16,6 +18,8 @@ export type UserUiPreferencesProfile = {
   chartSnapPriority: ChartSnapPriority;
   chartReleaseSendMode: ChartReleaseSendMode;
   chartHapticMode: ChartHapticMode;
+  terminalDeskViewMode?: TerminalDeskViewModePreference;
+  terminalChartBarModeBySymbol?: Record<string, TerminalChartBarModePreference>;
   terminalLayoutByAccount?: TerminalLayoutProfileMap;
   terminalWorkspacesByAccount?: TerminalLayoutProfileMap;
   terminalFloatingPresetsByAccount?: TerminalLayoutProfileMap;
@@ -40,6 +44,8 @@ const CHART_SNAP_ENABLED_STORAGE_KEY = "gtixt.chart.snap.enabled.v1";
 const CHART_SNAP_PRIORITY_STORAGE_KEY = "gtixt.chart.snap.priority.v1";
 const CHART_RELEASE_SEND_MODE_STORAGE_KEY = "gtixt.chart.release.send-mode.v1";
 const CHART_HAPTIC_MODE_STORAGE_KEY = "gtixt.chart.haptic.mode.v1";
+const TERMINAL_DESK_VIEW_MODE_STORAGE_KEY = "gtixt.terminal.desk-view-mode.v1";
+const TERMINAL_CHART_BAR_MODE_BY_SYMBOL_STORAGE_KEY = "gtixt.terminal.chart-bar-mode.by-symbol.v1";
 const USER_UI_PREFS_LOCAL_UPDATED_AT_KEY = "gtixt.ui.prefs.updated-at.v1";
 const BACKEND_PREFS_FETCH_DEDUPE_MS = 2000;
 
@@ -52,6 +58,46 @@ function normalizeChartMotionPreset(preset: string | null | undefined): ChartMot
   if (preset === "balanced") return "auto";
   if (preset === "scalping" || preset === "swing" || preset === "auto") return preset;
   return "auto";
+}
+
+function normalizeTerminalChartBarMode(mode: string | null | undefined): TerminalChartBarModePreference {
+  return mode === "delta" || mode === "event" ? mode : "time";
+}
+
+function normalizeTerminalDeskViewMode(mode: string | null | undefined): TerminalDeskViewModePreference {
+  return mode === "flow" || mode === "hybrid" || mode === "candle" ? mode : "auto";
+}
+
+function normalizeTerminalChartBarModeSymbol(symbol: string | null | undefined): string {
+  return String(symbol || "").trim().toUpperCase();
+}
+
+function readStoredTerminalChartBarModeMap(): Record<string, TerminalChartBarModePreference> {
+  if (typeof window === "undefined") return {};
+  try {
+    const raw = window.localStorage.getItem(TERMINAL_CHART_BAR_MODE_BY_SYMBOL_STORAGE_KEY);
+    if (!raw) {
+      return {};
+    }
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    return Object.entries(parsed || {}).reduce<Record<string, TerminalChartBarModePreference>>((acc, [symbol, value]) => {
+      const normalizedSymbol = normalizeTerminalChartBarModeSymbol(symbol);
+      if (!normalizedSymbol) {
+        return acc;
+      }
+      acc[normalizedSymbol] = normalizeTerminalChartBarMode(String(value || "time"));
+      return acc;
+    }, {});
+  } catch {
+    return {};
+  }
+}
+
+function setStoredTerminalChartBarModeMap(value: Record<string, TerminalChartBarModePreference>): void {
+  if (typeof window !== "undefined") {
+    window.localStorage.setItem(TERMINAL_CHART_BAR_MODE_BY_SYMBOL_STORAGE_KEY, JSON.stringify(value));
+  }
+  touchLocalPrefsUpdatedAt();
 }
 
 function applyMode(mode: UiMode): void {
@@ -123,6 +169,42 @@ function setStoredChartHapticMode(value: ChartHapticMode): void {
     window.localStorage.setItem(CHART_HAPTIC_MODE_STORAGE_KEY, value);
   }
   touchLocalPrefsUpdatedAt();
+}
+
+export function readStoredTerminalDeskViewMode(): TerminalDeskViewModePreference {
+  if (typeof window === "undefined") return "auto";
+  return normalizeTerminalDeskViewMode(window.localStorage.getItem(TERMINAL_DESK_VIEW_MODE_STORAGE_KEY));
+}
+
+export function setStoredTerminalDeskViewMode(value: TerminalDeskViewModePreference): void {
+  if (typeof window !== "undefined") {
+    window.localStorage.setItem(TERMINAL_DESK_VIEW_MODE_STORAGE_KEY, normalizeTerminalDeskViewMode(value));
+  }
+  touchLocalPrefsUpdatedAt();
+}
+
+export function readStoredTerminalChartBarMode(symbol: string): TerminalChartBarModePreference {
+  const normalizedSymbol = normalizeTerminalChartBarModeSymbol(symbol);
+  if (!normalizedSymbol) {
+    return "time";
+  }
+  return readStoredTerminalChartBarModeMap()[normalizedSymbol] || "time";
+}
+
+export function readStoredTerminalChartBarModes(): Record<string, TerminalChartBarModePreference> {
+  return readStoredTerminalChartBarModeMap();
+}
+
+export function setStoredTerminalChartBarMode(symbol: string, mode: TerminalChartBarModePreference): void {
+  const normalizedSymbol = normalizeTerminalChartBarModeSymbol(symbol);
+  if (!normalizedSymbol) {
+    return;
+  }
+  const next = {
+    ...readStoredTerminalChartBarModeMap(),
+    [normalizedSymbol]: normalizeTerminalChartBarMode(mode),
+  };
+  setStoredTerminalChartBarModeMap(next);
 }
 
 export function readStoredUiMode(): UiMode {
@@ -261,6 +343,8 @@ export function readLocalUserUiPreferences(): UserUiPreferencesProfile {
     chartSnapPriority: readStoredChartSnapPriority(),
     chartReleaseSendMode: readStoredChartReleaseSendMode(),
     chartHapticMode: readStoredChartHapticMode(),
+    terminalDeskViewMode: readStoredTerminalDeskViewMode(),
+    terminalChartBarModeBySymbol: readStoredTerminalChartBarModes(),
   };
 }
 
@@ -289,6 +373,25 @@ export function applyLocalUserUiPreferences(profile: Partial<UserUiPreferencesPr
   }
   if (profile.chartHapticMode === "off" || profile.chartHapticMode === "light" || profile.chartHapticMode === "medium") {
     setStoredChartHapticMode(profile.chartHapticMode);
+  }
+  if (
+    profile.terminalDeskViewMode === "auto"
+    || profile.terminalDeskViewMode === "flow"
+    || profile.terminalDeskViewMode === "hybrid"
+    || profile.terminalDeskViewMode === "candle"
+  ) {
+    setStoredTerminalDeskViewMode(profile.terminalDeskViewMode);
+  }
+  if (profile.terminalChartBarModeBySymbol && typeof profile.terminalChartBarModeBySymbol === "object") {
+    const normalized = Object.entries(profile.terminalChartBarModeBySymbol).reduce<Record<string, TerminalChartBarModePreference>>((acc, [symbol, mode]) => {
+      const normalizedSymbol = normalizeTerminalChartBarModeSymbol(symbol);
+      if (!normalizedSymbol) {
+        return acc;
+      }
+      acc[normalizedSymbol] = normalizeTerminalChartBarMode(String(mode || "time"));
+      return acc;
+    }, {});
+    setStoredTerminalChartBarModeMap(normalized);
   }
 }
 

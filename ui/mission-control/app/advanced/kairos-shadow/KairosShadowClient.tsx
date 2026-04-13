@@ -2,6 +2,9 @@
 
 import { useEffect, useState } from "react";
 
+import HelpHint from "../../../components/HelpHint";
+import OperatorPanelGuide from "../../../components/ui/OperatorPanelGuide";
+
 type JsonMap = Record<string, unknown>;
 
 type RuntimeStatus = {
@@ -258,6 +261,12 @@ export default function KairosShadowClient() {
               Cette vue lit le journal SQL du premier loop Kairos shadow. Aucun ordre réel n’est envoyé ici: la page affiche les cycles,
               les décisions, le verdict predictor, et la recommandation Memory V2 appliquée ou non.
             </p>
+            <OperatorPanelGuide
+              title="Guide Kairos"
+              what="Une lecture simple de ce que Kairos aurait fait en mode observation."
+              why="Verifier le comportement du moteur avant d'autoriser un usage plus sensible."
+              example="Regarde une decision recente, puis compare le sens choisi, le filtre memoire et les raisons du blocage ou du passage."
+            />
           </div>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
             <button type="button" className="btn" onClick={() => void runAction("/api/ai/kairos/shadow/start")} disabled={acting}>

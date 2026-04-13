@@ -4,7 +4,7 @@ import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 
 import HelpHint from "../../components/HelpHint";
-import TxtMiniGuide from "../../components/ui/TxtMiniGuide";
+import OperatorPanelGuide from "../../components/ui/OperatorPanelGuide";
 
 type JsonMap = Record<string, unknown>;
 
@@ -64,20 +64,52 @@ export default function IncidentsPage() {
 
   const slaBreachedCount = items.filter((x) => Boolean(x.sla_breached)).length;
   const visibleItems = items.filter((item) => !providerFilter || String(item.provider || "") === providerFilter);
+  const visibleUnassignedItems = visibleItems.filter((item) => !String(item.assignee || "").trim() && String(item.status || "") !== "closed");
+  const visibleAssignedItems = visibleItems.filter((item) => String(item.assignee || "").trim() && String(item.status || "") !== "closed");
+
+  async function mutateIncident(ticketKey: string, action: "assign" | "close"): Promise<void> {
+    const path = action === "assign"
+      ? `/api/incidents/${encodeURIComponent(ticketKey)}/assign`
+      : `/api/incidents/${encodeURIComponent(ticketKey)}/close`;
+    const payload = action === "assign" ? {} : { resolution_note: resolutionNote };
+    const response = await fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}));
+      throw new Error(String(body?.detail || `${action}_failed`));
+    }
+  }
+
+  async function mutateManyIncidents(itemsToProcess: JsonMap[], action: "assign" | "close"): Promise<void> {
+    if (itemsToProcess.length === 0) {
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      for (const item of itemsToProcess) {
+        const ticketKey = String(item.ticket_key || "").trim();
+        if (!ticketKey) {
+          continue;
+        }
+        await mutateIncident(ticketKey, action);
+      }
+      await loadIncidents(statusFilter);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Erreur inconnue");
+    } finally {
+      setBusy(false);
+    }
+  }
 
   async function assignTicket(ticketKey: string): Promise<void> {
     setBusy(true);
     setError(null);
     try {
-      const response = await fetch(`/api/incidents/${encodeURIComponent(ticketKey)}/assign`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({}),
-      });
-      if (!response.ok) {
-        const payload = await response.json();
-        throw new Error(String(payload?.detail || "Assignation impossible"));
-      }
+      await mutateIncident(ticketKey, "assign");
       await loadIncidents(statusFilter);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Erreur inconnue");
@@ -90,15 +122,7 @@ export default function IncidentsPage() {
     setBusy(true);
     setError(null);
     try {
-      const response = await fetch(`/api/incidents/${encodeURIComponent(ticketKey)}/close`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ resolution_note: resolutionNote }),
-      });
-      if (!response.ok) {
-        const payload = await response.json();
-        throw new Error(String(payload?.detail || "Cloture impossible"));
-      }
+      await mutateIncident(ticketKey, "close");
       await loadIncidents(statusFilter);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Erreur inconnue");
@@ -110,11 +134,11 @@ export default function IncidentsPage() {
   return (
     <main className="shell txt-page-shell">
       <section className="hero txt-page-hero-grid" style={{ gridTemplateColumns: "1.4fr 1fr" }}>
-        <div className="panel txt-page-hero">
-          <div className="eyebrow">Incident Desk <HelpHint text="Console d'incidents: suivi, assignation, cloture, traçabilite operationnelle." examples={["Exemple simple: filtre open, assigne un ticket a toi, corrige, puis close avec une note claire.", "Si un incident touche execution ou broker, ouvre aussi Trading Terminal pour voir l'etat global."]} /></div>
+        <div id="global-guide-incidents-hero" className="panel txt-page-hero">
+          <div className="eyebrow">Incident Desk</div>
           <h1 className="title" style={{ fontSize: 34 }}>Incidents Operations</h1>
           <p className="subtle">Pilote les incidents ouverts par le chatbot et les operateurs.</p>
-          <TxtMiniGuide
+          <OperatorPanelGuide
             title="Guide Incidents"
             what="Backlog des incidents operationnels avec assignation et cloture tracees."
             why="Reagir vite sans perdre la traçabilite des decisions prises en exploitation."
@@ -132,7 +156,7 @@ export default function IncidentsPage() {
           {error ? <p className="warn">{error}</p> : null}
         </div>
         <div className="panel">
-          <div className="eyebrow">Filtres <HelpHint text="Filtre rapide par statut incident." examples={["Choisis open pour traiter d'abord le backlog critique du moment.", "Resolution note sera reutilisee a la cloture, donc ecris directement une phrase utile."]} /></div>
+          <div className="eyebrow">Filtres <HelpHint text="Ces filtres servent à faire ressortir vite les incidents qui demandent ton attention." examples={["Commence souvent par les incidents ouverts.", "Prépare une note de résolution claire dès que tu comprends le problème."]} /></div>
           {slaBreachedCount > 0 ? (
             <p className="warn">Alerte: {slaBreachedCount} incident(s) non assignes au-dela de {slaMinutes} min.</p>
           ) : null}
@@ -154,6 +178,22 @@ export default function IncidentsPage() {
             </button>
             <input value={resolutionNote} onChange={(e) => setResolutionNote(e.target.value)} placeholder="Resolution note" />
           </div>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 12 }}>
+            <button
+              type="button"
+              disabled={busy || visibleUnassignedItems.length === 0}
+              onClick={() => void mutateManyIncidents(visibleUnassignedItems, "assign")}
+            >
+              {busy ? "Traitement..." : `Assigner tous les non assignés (${visibleUnassignedItems.length})`}
+            </button>
+            <button
+              type="button"
+              disabled={busy || visibleAssignedItems.length === 0}
+              onClick={() => void mutateManyIncidents(visibleAssignedItems, "close")}
+            >
+              {busy ? "Traitement..." : `Clore tous les assignés visibles (${visibleAssignedItems.length})`}
+            </button>
+          </div>
         </div>
       </section>
 
@@ -168,6 +208,7 @@ export default function IncidentsPage() {
           <div className="row"><span>Open</span><span>{String(asMap(summary.status).open || 0)}</span></div>
           <div className="row"><span>Assigned</span><span>{String(asMap(summary.status).assigned || 0)}</span></div>
           <div className="row"><span>Closed</span><span>{String(asMap(summary.status).closed || 0)}</span></div>
+          <div className="row"><span>Visible non assignés</span><span className={visibleUnassignedItems.length > 0 ? "warn" : "good"}>{visibleUnassignedItems.length}</span></div>
         </div>
         <div className="panel">
           <div className="eyebrow">Severity</div>
@@ -210,7 +251,7 @@ export default function IncidentsPage() {
 
       <section className="grid" style={{ gridTemplateColumns: "1fr" }}>
         <div className="panel">
-          <div className="eyebrow">Liste incidents <HelpHint text="Assigner un ticket a soi puis le cloturer avec note de resolution." examples={["Assign to me quand tu prends la main sur le sujet.", "Close seulement quand la cause est comprise et que la note de resolution permet a un autre operateur de suivre."]} /></div>
+          <div className="eyebrow">Liste incidents <HelpHint text="La liste te permet de prendre un ticket, suivre son état et le fermer proprement." examples={["Assigne-toi le ticket dès que tu prends la main.", "Ne ferme l'incident que si la cause est comprise et bien écrite dans la note."]} /></div>
           {visibleItems.length === 0 ? <p className="subtle">Aucun incident.</p> : null}
           {visibleItems.map((item) => {
             const key = String(item.ticket_key || "");

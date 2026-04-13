@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 
 import { loginIfRequired } from "./helpers/terminal";
 
@@ -12,9 +12,12 @@ const HOT_COMPUTE_LABELS = [
   "multiAnchorVwap",
   "predictorOrderbookSignals",
   "predictorOrderflowSnapshot",
+  "domSnapshot",
+  "executionFootprintSnapshot",
+  "dataReliabilitySnapshot",
 ];
 
-async function seedKairosHarnessReplay(page: Parameters<typeof test>[0]["page"]) {
+async function seedKairosHarnessReplay(page: Page) {
   const result = await page.evaluate(async () => {
     const response = await fetch("/api/execution/replay/seed/kairos-harness", {
       method: "POST",
@@ -40,7 +43,7 @@ async function seedKairosHarnessReplay(page: Parameters<typeof test>[0]["page"])
   };
 }
 
-async function snapshotTerminalComputePerf(page: Parameters<typeof test>[0]["page"]) {
+async function snapshotTerminalComputePerf(page: Page) {
   return page.evaluate(() => {
     const store = (window as Window & {
       __MC_TERMINAL_COMPUTE_PERF__?: {
@@ -70,11 +73,11 @@ async function snapshotTerminalComputePerf(page: Parameters<typeof test>[0]["pag
         }
         return right.count - left.count;
       })
-      .slice(0, 6);
+      .slice(0, 12);
   });
 }
 
-async function fetchRecentRealityGapRows(page: Parameters<typeof test>[0]["page"]) {
+async function fetchRecentRealityGapRows(page: Page) {
   return page.evaluate(async () => {
     const response = await fetch("/api/execution/reality-gap/recent?limit=24", { cache: "no-store" });
     const payload = await response.json().catch(() => ({}));

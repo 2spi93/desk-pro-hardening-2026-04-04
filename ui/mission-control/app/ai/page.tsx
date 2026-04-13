@@ -4,7 +4,7 @@ import Link from "next/link";
 import { useEffect, useMemo, useState, type FormEvent } from "react";
 
 import HelpHint from "../../components/HelpHint";
-import TxtMiniGuide from "../../components/ui/TxtMiniGuide";
+import OperatorPanelGuide from "../../components/ui/OperatorPanelGuide";
 import { openOpsCopilotPrompt } from "../../lib/opsCopilot";
 
 type JsonMap = Record<string, unknown>;
@@ -290,12 +290,25 @@ export default function AiPage() {
         return;
       }
 
+      if (selectedSource.source_type !== "wallet") {
+        const syncResponse = await fetch(`/api/accounts/${encodeURIComponent(selectedSource.account_id)}/sync`, { method: "POST" });
+        const syncPayload = await syncResponse.json().catch(() => ({}));
+        if (!syncResponse.ok) {
+          throw new Error(String((syncPayload as JsonMap).detail || "Sync source impossible"));
+        }
+      }
+
       const verificationResponse = await fetch(`/api/internal/accounts/${encodeURIComponent(selectedSource.account_id)}/verification`, { cache: "no-store" });
       const verificationPayload = await verificationResponse.json().catch(() => ({}));
       if (!verificationResponse.ok) {
         throw new Error(String((verificationPayload as JsonMap).detail || "Verification source impossible"));
       }
       setSourceVerification(verificationPayload as JsonMap);
+      try {
+        await reloadDesk();
+      } catch {
+        // noop: la vérification source reste valide même si un autre bloc du desk recharge mal.
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Verification source impossible");
     } finally {
@@ -425,21 +438,24 @@ export default function AiPage() {
     <main className="shell txt-page-shell">
       <section className="hero txt-page-hero-grid" style={{ gridTemplateColumns: "1.35fr 0.85fr" }}>
         <div className="panel txt-page-hero">
-          <div className="eyebrow">AI Desk Institutionnelle <HelpHint text="Desk buy-side pour gouverner les routes IA, surveiller les providers, piloter le local inference, executer des taches critiques et simuler les scenarios de regime." examples={["Avant une tache critique, verifie la posture remote/local, les circuit breakers et le budget de route.", "Si le desk est en mode degrade, bascule le workflow vers gouvernance et simulation plutot que vers execution automatique."]} /></div>
-          <h1 className="title" style={{ fontSize: 34 }}>Institutional AI Desk</h1>
-          <p className="subtle">Une surface unique pour l'orchestration multi-modeles, la gouvernance de route, le pilotage des modeles locaux, la simulation regime/scenario et le journal d'execution IA.</p>
-          <TxtMiniGuide
+          <div className="eyebrow">AI Desk Institutionnelle</div>
+          <h1 className="title" style={{ fontSize: 34 }}>Desk IA operationnel</h1>
+          <p className="subtle txt-page-hero-copy">Une seule page pour verifier les routes IA disponibles, preparer les modeles locaux, lancer une tache et relire ce qui s'est vraiment passe.</p>
+          <OperatorPanelGuide
             title="Guide AI Desk"
-            what="Ce desk montre la posture IA reelle: routes disponibles, budget, fallback, circuit breakers, inference locale, historique et experiments memory."
-            why="Eviter de lancer des taches IA a l'aveugle alors que le routing, le local inference ou la memoire sont en etat degrade."
-            example="Le matin: verifie les providers disponibles, chauffe les modeles locaux si besoin, detecte le regime, teste un scenario geopolitique puis lance les taches critiques seulement si la gouvernance est saine."
-            terms={["latency", "brier", "allocation"]}
+            what="L'état réel des routes IA, des modèles locaux, des essais et de l'historique d'exécution."
+            why="Éviter de lancer une tâche alors que la route choisie ou le modèle local n'est pas fiable."
+            example="Commence par vérifier les routes disponibles, prépare le local si besoin, puis lance les tâches seulement si l'état est propre."
           />
+          <div className="txt-page-guide-note">
+            <strong>Ordre conseille</strong>
+            1. Verifie quelles routes sont vraiment disponibles. 2. Prepare le local seulement si tu comptes l'utiliser. 3. Lance la tache. 4. Relis la route choisie, le cout et la latence avant d'utiliser le resultat.
+          </div>
           <div style={{ marginTop: 12, display: "flex", flexWrap: "wrap", gap: 10 }}>
-            <span className="pill">Providers up {availableProviders.length}/{providerRows.length || 0}</span>
-            <span className="pill">Local {localReachable ? "reachable" : "offline"}</span>
+            <span className="pill">Routes actives {availableProviders.length}/{providerRows.length || 0}</span>
+            <span className="pill">Local {localReachable ? "pret" : "hors ligne"}</span>
             <span className="pill">Timeout {timeoutSeconds || 0}s</span>
-            <span className="pill">Retries {maxRetries}</span>
+            <span className="pill">Essais max {maxRetries}</span>
           </div>
           <p style={{ marginTop: 12 }}>
             <Link href="/terminal">Trading Terminal</Link>
@@ -477,31 +493,33 @@ export default function AiPage() {
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1.15fr 0.85fr" }}>
         <div className="panel">
-          <div className="eyebrow">Routing Governance <HelpHint text="Vue institutionnelle des routes IA, des providers, du cout et des garde-fous de circuit breaker." examples={["Si une route critique n'est pas disponible, le desk doit le rendre visible avant tout run.", "Si les providers sont en fallback permanent, le sujet n'est plus le prompt mais la gouvernance de route."]} /></div>
+          <div className="eyebrow">Routes IA disponibles <HelpHint text="Ce bloc montre quelles routes IA sont disponibles, combien elles coûtent et si une protection s'est déclenchée." examples={["Si une route importante manque, il faut le voir avant de lancer une tâche.", "Si une route tombe souvent en secours, le problème vient de l'infrastructure plus que du prompt."]} /></div>
           {providerRows.length === 0 ? <p className="subtle" style={{ marginTop: 12 }}>Aucun provider detecte.</p> : null}
-          {providerRows.map((row) => (
-            <div className="row" key={`${String(row.route)}-${String(row.model)}`}>
-              <span>{normalizeText(row.route)} | {normalizeText(row.provider)} | {normalizeText(row.kind)}</span>
-              <span>{Boolean(row.available) ? "up" : "down"} | {formatMoney(toNumber(row.estimated_cost_usd, 0))}</span>
+          <div className="txt-scroll-shell compact">
+            {providerRows.map((row) => (
+              <div className="row" key={`${String(row.route)}-${String(row.model)}`}>
+                <span>{normalizeText(row.route)} | {normalizeText(row.provider)} | {normalizeText(row.kind)}</span>
+                <span>{Boolean(row.available) ? "up" : "down"} | {formatMoney(toNumber(row.estimated_cost_usd, 0))}</span>
+              </div>
+            ))}
+            <div className="panel" style={{ borderRadius: 14 }}>
+              <div className="eyebrow">Circuit Breakers</div>
+              {circuitBreakers.length === 0 ? <p className="subtle" style={{ marginTop: 12 }}>Aucun circuit breaker remonte.</p> : null}
+              {circuitBreakers.map(([provider, value]) => {
+                const breaker = (value || {}) as JsonMap;
+                return (
+                  <div className="row" key={provider}>
+                    <span>{provider}</span>
+                    <span>{Boolean(breaker.open) ? "open" : "closed"} | failures {toNumber(breaker.failures, 0)} | until {normalizeText(breaker.opened_until, "-")}</span>
+                  </div>
+                );
+              })}
             </div>
-          ))}
-          <div className="panel" style={{ marginTop: 12, borderRadius: 14 }}>
-            <div className="eyebrow">Circuit Breakers</div>
-            {circuitBreakers.length === 0 ? <p className="subtle" style={{ marginTop: 12 }}>Aucun circuit breaker remonte.</p> : null}
-            {circuitBreakers.map(([provider, value]) => {
-              const breaker = (value || {}) as JsonMap;
-              return (
-                <div className="row" key={provider}>
-                  <span>{provider}</span>
-                  <span>{Boolean(breaker.open) ? "open" : "closed"} | failures {toNumber(breaker.failures, 0)} | until {normalizeText(breaker.opened_until, "-")}</span>
-                </div>
-              );
-            })}
           </div>
         </div>
 
         <div className="panel">
-          <div className="eyebrow">Infrastructure Posture <HelpHint text="Capacite machine et inference locale pour savoir si le desk peut tenir des workflows hybrides remote/local." examples={["CPU et RAM eleves sans GPU: le local fast peut rester utile mais le reasoning lourd sera probablement fragile.", "Si le endpoint local est unreachable, le desk doit pousser l'operateur vers les routes distantes ou les templates de degradation."]} /></div>
+          <div className="eyebrow">Capacite machine <HelpHint text="Ce bloc dit si la machine peut vraiment porter des tâches locales ou s'il vaut mieux s'appuyer sur le distant." examples={["Une machine sans GPU peut rester utile pour du léger mais pas pour du lourd.", "Si le local ne répond pas, il faut basculer vers les routes distantes prévues."]} /></div>
           <div className="row"><span>CPU</span><span>{toNumber(cap.cpus, 0)}</span></div>
           <div className="row"><span>Memory</span><span>{toNumber(cap.memory_gb, 0).toFixed(2)} GiB</span></div>
           <div className="row"><span>GPU</span><span>{String(Boolean(cap.has_gpu))}</span></div>
@@ -514,19 +532,21 @@ export default function AiPage() {
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1.15fr 0.85fr" }}>
         <div className="panel">
-          <div className="eyebrow">Capital Source Matrix <HelpHint text="Lecture compréhensible des fonds visibles derrière le desk: paper, live, exchange, wallet et état de canonisation." examples={["Paper = environnement de test, même si des chiffres apparaissent dans le scope agrégé.", "Exchange et wallet peuvent être branchés côté plateforme sans encore remonter un capital allocable canonique."]} /></div>
+          <div className="eyebrow">Origine des fonds visibles <HelpHint text="Ce bloc rappelle d'où viennent les fonds visibles derrière le desk: test, réel, exchange ou wallet." examples={["Un montant visible en mode test n'est pas du capital réel.", "Un exchange ou un wallet peut être branché sans être encore prêt pour une vraie allocation."]} /></div>
           <div className="term-report-body" style={{ marginTop: 12, marginBottom: 12 }}>
             <span>Broker live: <strong>{liveBrokerSources.length}</strong> · Broker paper: <strong>{paperBrokerSources.length}</strong>.</span>
             <span>Exchange: <strong>{exchangeSources.length}</strong> · Wallet: <strong>{walletSources.length}</strong>.</span>
             <span>Connecteurs sains: <strong>{healthyConnectors}/{totalConnectors}</strong>.</span>
           </div>
           {capitalSources.length === 0 ? <p className="subtle">Aucune source de capital visible.</p> : null}
-          {capitalSources.slice(0, 10).map((row) => (
-            <div className="row" key={row.id}>
-              <span>{row.venue} · {row.source_type} · {row.environment}</span>
-              <span>{row.canonical ? "canonique" : "connecteur seul"} · {row.status} · {row.latest_equity_usd !== null ? formatMoney(row.latest_equity_usd) : "fonds non synchronises"}</span>
-            </div>
-          ))}
+          <div className="txt-scroll-shell compact">
+            {capitalSources.slice(0, 10).map((row) => (
+              <div className="row" key={row.id}>
+                <span>{row.venue} · {row.source_type} · {row.environment}</span>
+                <span>{row.canonical ? "canonique" : "connecteur seul"} · {row.status} · {row.latest_equity_usd !== null ? formatMoney(row.latest_equity_usd) : "fonds non synchronises"}</span>
+              </div>
+            ))}
+          </div>
           <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginTop: 12 }}>
             <button type="button" onClick={() => openOpsCopilotPrompt({ message: "Explique-moi la différence entre les fonds paper, live, exchange et wallet visibles sur cette interface.", autoSend: true })}>
               Demander la distinction au Copilot
@@ -538,7 +558,7 @@ export default function AiPage() {
         </div>
 
         <div className="panel">
-          <div className="eyebrow">Verification Calls</div>
+          <div className="eyebrow">Verification de la source</div>
           <div className="form-grid" style={{ marginTop: 12 }}>
             <select value={selectedSource?.id || ""} onChange={(event) => setSelectedSourceId(event.target.value)}>
               <option value="">Choisir une source</option>
@@ -574,7 +594,7 @@ export default function AiPage() {
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1.15fr 0.85fr" }}>
         <div className="panel">
-          <div className="eyebrow">Execution Studio <HelpHint text="Zone de run controlee pour les taches IA critiques, avec budget, criticite et preference locale/distante." examples={["Si la tache est critique, laisse la criticite haute et lis la route finale avant de reutiliser la sortie.", "Prefer local n'est pertinent que si le endpoint local est atteignable et chauffe. Sinon il faut assumer la degradation/fallback."]} /></div>
+          <div className="eyebrow">Lancer une tache IA <HelpHint text="Zone de lancement contrôlée pour les tâches IA importantes, avec limite de coût et choix de route." examples={["Pour une tâche sensible, relis la route finale avant d'utiliser la réponse.", "Le mode local n'a de sens que si le service local répond bien."]} /></div>
           <form onSubmit={onExecute} className="form-grid" style={{ marginTop: 12 }}>
             <input value={task} onChange={(event) => setTask(event.target.value)} placeholder="task" required />
             <textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} rows={6} required />
@@ -596,12 +616,12 @@ export default function AiPage() {
               <input type="checkbox" checked={preferLocal} onChange={(event) => setPreferLocal(event.target.checked)} />
               <span>Prefer local open-source</span>
             </label>
-            <button type="submit" disabled={loading}>{loading ? "Execution..." : "Run institutional AI task"}</button>
+            <button type="submit" disabled={loading}>{loading ? "Execution..." : "Lancer la tache IA"}</button>
           </form>
         </div>
 
         <div className="panel">
-          <div className="eyebrow">Latest Decision</div>
+          <div className="eyebrow">Derniere decision de route</div>
           {!result ? <p className="subtle" style={{ marginTop: 12 }}>Aucune execution depuis ce desk pour le moment.</p> : null}
           {result ? (
             <>
@@ -624,29 +644,31 @@ export default function AiPage() {
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1fr 1fr" }}>
         <div className="panel">
-          <div className="eyebrow">Local Inference Desk <HelpHint text="Pilotage fin des modeles locaux pour warmup, reachability et discipline d'usage." examples={["Warmup All au debut de session si le local inference fait partie du runbook du desk.", "Si les modeles locaux restent unavailable, il faut traiter le sujet comme un incident d'infra, pas comme une erreur de prompt."]} /></div>
+          <div className="eyebrow">Modeles locaux <HelpHint text="Ce bloc sert à voir si les modèles locaux répondent et à les préparer au début de la session." examples={["Lance le préchauffage si tu comptes utiliser le local aujourd'hui.", "Si les modèles restent hors ligne, traite-le comme un souci d'infrastructure."]} /></div>
           <div className="row"><span>Endpoint</span><span>{normalizeText(localHealth?.endpoint)}</span></div>
           <div className="row"><span>Reachable</span><span>{String(localReachable)}</span></div>
           <div style={{ display: "flex", gap: 10, marginTop: 12, marginBottom: 12 }}>
-            <button type="button" onClick={() => warmup()} disabled={warming !== null}>{warming === "all" ? "Warmup..." : "Warmup all local models"}</button>
+            <button type="button" onClick={() => warmup()} disabled={warming !== null}>{warming === "all" ? "Preparation..." : "Preparer tous les modeles locaux"}</button>
           </div>
           {localRows.length === 0 ? <p className="subtle">Aucun modele local detecte.</p> : null}
-          {localRows.map((row) => (
-            <div className="row" key={String(row.route)}>
-              <span>{normalizeText(row.route)} | {normalizeText(row.model)}</span>
-              <span>{Boolean(row.available) ? "ready" : "cold"} | {formatMs(toNumber(row.avg_latency_ms, NaN))} | calls {toNumber(row.calls, 0)}</span>
-              <button type="button" onClick={() => warmup(String(row.route))} disabled={warming !== null}>{warming === String(row.route) ? "Warmup..." : "Warmup"}</button>
-            </div>
-          ))}
+          <div className="txt-scroll-shell compact">
+            {localRows.map((row) => (
+              <div className="row" key={String(row.route)}>
+                <span>{normalizeText(row.route)} | {normalizeText(row.model)}</span>
+                <span>{Boolean(row.available) ? "pret" : "froid"} | {formatMs(toNumber(row.avg_latency_ms, NaN))} | appels {toNumber(row.calls, 0)}</span>
+                <button type="button" onClick={() => warmup(String(row.route))} disabled={warming !== null}>{warming === String(row.route) ? "Preparation..." : "Preparer"}</button>
+              </div>
+            ))}
+          </div>
         </div>
 
         <div className="panel">
-          <div className="eyebrow">Regime Lab <HelpHint text="Simulation rapide du regime pour cadrer le routing et les robots a activer/desactiver." examples={["Un regime trend avec confiance correcte peut justifier l'activation de robots directionnels et la coupure du countertrend.", "Si la confiance est mediocre, traite le resultat comme guidance et pas comme ordre automatique."]} /></div>
+          <div className="eyebrow">Lecture du contexte de marche <HelpHint text="Petit laboratoire pour lire le contexte du marché et savoir quel style d'action reste le plus adapté." examples={["Si le contexte semble clairement orienté, tu peux favoriser les outils qui suivent le mouvement.", "Si la confiance reste moyenne, prends le résultat comme une aide et non comme un ordre."]} /></div>
           <div className="form-grid" style={{ marginTop: 12 }}>
             <input type="number" step="0.01" value={trendScore} onChange={(event) => setTrendScore(Number(event.target.value || 0))} placeholder="trend_score" />
             <input type="number" step="0.001" value={realizedVolatility} onChange={(event) => setRealizedVolatility(Number(event.target.value || 0))} placeholder="realized_volatility" />
             <input type="number" step="0.01" value={sentimentScore} onChange={(event) => setSentimentScore(Number(event.target.value || 0))} placeholder="sentiment_score" />
-            <button type="button" onClick={() => detectRegime()} disabled={regimeBusy}>{regimeBusy ? "Analyse..." : "Detect regime"}</button>
+            <button type="button" onClick={() => detectRegime()} disabled={regimeBusy}>{regimeBusy ? "Analyse..." : "Lire le contexte"}</button>
           </div>
           {regimeResult ? (
             <div className="panel" style={{ marginTop: 12, borderRadius: 14 }}>
@@ -668,13 +690,13 @@ export default function AiPage() {
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1fr 1fr" }}>
         <div className="panel">
-          <div className="eyebrow">Scenario Lab <HelpHint text="Backtest geopolitique express pour cadrer la resilience du mandat IA avant execution." examples={["Si resilience score descend sous 0.6, le desk doit passer en capital preservation ou kill switch event risk.", "Le scenario lab sert a la gouvernance pre-trade, pas a produire un faux sentiment de precision predictive."]} /></div>
+          <div className="eyebrow">Test de scenario <HelpHint text="Ce bloc teste rapidement un scénario pour voir si le cadre d'action tient encore debout." examples={["Si le score de tenue baisse fortement, adopte une posture plus prudente.", "Ce test sert à cadrer la décision, pas à promettre l'avenir."]} /></div>
           <div className="form-grid" style={{ marginTop: 12 }}>
             <input value={strategyName} onChange={(event) => setStrategyName(event.target.value)} placeholder="strategy_name" />
             <input value={assetClass} onChange={(event) => setAssetClass(event.target.value)} placeholder="asset_class" />
             <input value={scenario} onChange={(event) => setScenario(event.target.value)} placeholder="scenario" />
             <input type="number" step="1" value={horizonDays} onChange={(event) => setHorizonDays(Number(event.target.value || 0))} placeholder="horizon_days" />
-            <button type="button" onClick={() => runBacktest()} disabled={backtestBusy}>{backtestBusy ? "Stress..." : "Run geopolitical backtest"}</button>
+            <button type="button" onClick={() => runBacktest()} disabled={backtestBusy}>{backtestBusy ? "Stress..." : "Lancer le test"}</button>
             <button type="button" onClick={() => openOpsCopilotPrompt({ message: `Propose en langage naturel si la stratégie ${strategyName} peut être promue vers un usage live, en tenant compte des sources de capital et du scénario ${scenario}.`, autoSend: true })}>
               Demander une proposition d'agent
             </button>
@@ -698,36 +720,40 @@ export default function AiPage() {
         </div>
 
         <div className="panel">
-          <div className="eyebrow">Memory & Calibration <HelpHint text="Lecture institutionnelle du memory A/B et de la calibration des runs IA." examples={["Pas de samples -> pas de conclusion. Le desk doit afficher cette absence sans la maquiller.", "Une p-value faible avec delta positif soutient l'usage de la memoire; sinon le sujet reste ouvert."]} /></div>
+          <div className="eyebrow">Memoire et calibration <HelpHint text="Ce bloc dit simplement si l'aide mémoire semble utile ou si le sujet reste encore ouvert." examples={["Sans assez d'exemples, il ne faut pas tirer de conclusion.", "Si l'écart reste faible ou flou, garde une lecture prudente."]} /></div>
           <div className="row"><span>Winrate delta</span><span>{formatPct(toNumber(withVsWithout.winrate_delta, 0), 1)}</span></div>
           <div className="row"><span>p-value</span><span>{normalizeText(withVsWithout.p_value_two_sided, "n/a")}</span></div>
           <div className="row"><span>Significant @95%</span><span>{String(Boolean(withVsWithout.significant_95))}</span></div>
           <div className="row"><span>Samples memory_on</span><span>{toNumber((withVsWithout.samples as JsonMap | undefined)?.memory_on, 0)}</span></div>
           <div className="row"><span>Samples memory_off</span><span>{toNumber((withVsWithout.samples as JsonMap | undefined)?.memory_off, 0)}</span></div>
           {abArms.length === 0 ? <p className="subtle" style={{ marginTop: 12 }}>Pas assez de donnees A/B pour conclure.</p> : null}
-          {abArms.map((row) => (
-            <div className="row" key={String(row.arm)}>
-              <span>{normalizeText(row.arm)}</span>
-              <span>n {toNumber(row.samples, 0)} | win {formatPct(toNumber(row.win_rate, 0), 1)} | avg {toNumber(row.avg_outcome, 0).toFixed(3)}</span>
-            </div>
-          ))}
+          <div className="txt-scroll-shell compact">
+            {abArms.map((row) => (
+              <div className="row" key={String(row.arm)}>
+                <span>{normalizeText(row.arm)}</span>
+                <span>n {toNumber(row.samples, 0)} | win {formatPct(toNumber(row.win_rate, 0), 1)} | avg {toNumber(row.avg_outcome, 0).toFixed(3)}</span>
+              </div>
+            ))}
+          </div>
         </div>
       </section>
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1fr" }}>
         <div className="panel">
-          <div className="eyebrow">Execution Journal <HelpHint text="Journal persistant des runs IA pour audit, triage et hygiene de retention." examples={["Un historique rempli de degraded-template signale un sujet de capacité/routing, pas un succès silencieux.", "Clear old history sert au hygiene cleanup, pas a masquer un comportement degrade."]} /></div>
+          <div className="eyebrow">Journal des taches IA <HelpHint text="Historique des tâches IA pour revoir ce qui a tourné, ce qui a échoué et ce qui mérite un tri." examples={["Si l'historique montre beaucoup de passages dégradés, il faut regarder la capacité ou les routes.", "Nettoyer l'historique sert à garder un journal lisible, pas à cacher un problème."]} /></div>
           <div style={{ display: "flex", gap: 10, marginTop: 12, marginBottom: 12 }}>
-            <button type="button" onClick={() => clearOldHistory()} disabled={clearingHistory}>{clearingHistory ? "Clearing..." : "Clear old history"}</button>
-            <button type="button" onClick={() => reloadDesk().catch((err) => setError(err instanceof Error ? err.message : "Reload impossible"))} disabled={loading || warming !== null || clearingHistory || regimeBusy || backtestBusy}>Refresh desk</button>
+            <button type="button" onClick={() => clearOldHistory()} disabled={clearingHistory}>{clearingHistory ? "Nettoyage..." : "Nettoyer l'historique"}</button>
+            <button type="button" onClick={() => reloadDesk().catch((err) => setError(err instanceof Error ? err.message : "Reload impossible"))} disabled={loading || warming !== null || clearingHistory || regimeBusy || backtestBusy}>Rafraichir</button>
           </div>
           {history.length === 0 ? <p className="subtle">Aucune execution historisee.</p> : null}
-          {history.map((row) => (
-            <div className="row" key={String(row.id)}>
-              <span>{formatDateTime(row.created_at)} | {normalizeText(row.task)} | {normalizeText(row.provider_used)} / {normalizeText(row.model_used)}</span>
-              <span>{normalizeText(row.status)} | fallback {String(Boolean(row.fallback_used))} | {formatMs(toNumber(row.latency_ms, 0))}</span>
-            </div>
-          ))}
+          <div className="txt-scroll-shell">
+            {history.map((row) => (
+              <div className="row" key={String(row.id)}>
+                <span>{formatDateTime(row.created_at)} | {normalizeText(row.task)} | {normalizeText(row.provider_used)} / {normalizeText(row.model_used)}</span>
+                <span>{normalizeText(row.status)} | fallback {String(Boolean(row.fallback_used))} | {formatMs(toNumber(row.latency_ms, 0))}</span>
+              </div>
+            ))}
+          </div>
         </div>
       </section>
     </main>

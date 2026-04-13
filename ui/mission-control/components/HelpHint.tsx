@@ -1,26 +1,28 @@
 "use client";
 
-import HelpTooltip from "./ui/HelpTooltip";
-import { useUiMode } from "../lib/userUiPrefs";
+import OperatorPanelGuide from "./ui/OperatorPanelGuide";
 
 type HelpHintProps = {
   text: string;
   examples?: string[];
   label?: string;
+  whyItMatters?: string;
 };
 
-export default function HelpHint({ text, examples = [], label = "A quoi sert ce bloc ?" }: HelpHintProps) {
-  const [uiMode] = useUiMode();
-
+export default function HelpHint({
+  text,
+  examples = [],
+  label = "Pour lire ce bloc",
+  whyItMatters = "Lis cette aide pour comprendre rapidement ce que montre le bloc et ce qu'il faut regarder.",
+}: HelpHintProps) {
   return (
-    <HelpTooltip
-      mode={uiMode}
-      entry={{
-        label,
-        simple: text,
-        example: examples.join(" "),
-        whyItMatters: "Utilise ce repère pour interpréter le bloc sans dérouler toute la logique métier.",
-      }}
+    <OperatorPanelGuide
+      mode="hint"
+      title={label}
+      label={label}
+      what={text}
+      why={whyItMatters}
+      example={examples.join(" ")}
     />
   );
 }

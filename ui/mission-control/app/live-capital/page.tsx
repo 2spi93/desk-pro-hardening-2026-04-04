@@ -4,8 +4,13 @@ import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 
 import HelpHint from "../../components/HelpHint";
-import TxtMiniGuide from "../../components/ui/TxtMiniGuide";
+import OperatorPanelGuide from "../../components/ui/OperatorPanelGuide";
 import { EXCHANGE_CONNECTION_CATALOG, WALLET_CONNECTION_CATALOG } from "../../lib/connectionCatalog";
+import {
+  getExchangeCapability,
+  normalizeExchangeCapabilityMap,
+  type ExchangeCapability,
+} from "../../lib/exchangeCapabilities";
 import { openOpsCopilotPrompt } from "../../lib/opsCopilot";
 
 type JsonMap = Record<string, unknown>;
@@ -510,15 +515,45 @@ function balanceRowChangePct(row: JsonMap): number | null {
   return parseChangePct(payload?.change_24h_pct || payload?.priceChangePercent);
 }
 
+function normalizePocketKey(value: unknown): string {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (!normalized) {
+    return "other";
+  }
+  if (normalized.includes("spot")) {
+    return "spot";
+  }
+  if (normalized.includes("fund")) {
+    return "fund";
+  }
+  if (
+    normalized.includes("future")
+    || normalized.includes("perp")
+    || normalized.includes("swap")
+    || normalized.includes("contract")
+    || normalized.includes("deriv")
+  ) {
+    return "futures";
+  }
+  return normalized;
+}
+
+const VERIFICATION_POCKET_ORDER = new Map([
+  ["spot", 0],
+  ["fund", 1],
+  ["futures", 2],
+  ["other", 3],
+]);
+
 function balancePocketKey(row: JsonMap): string {
   const source = String(row.source || "").trim().toLowerCase();
   if (source.startsWith("bingx-")) {
-    return source.slice("bingx-".length);
+    return normalizePocketKey(source.slice("bingx-".length));
   }
   const assetSymbol = String(row.asset_symbol || row.asset || "").trim();
   if (assetSymbol.includes("-")) {
     const parts = assetSymbol.split("-");
-    return (parts[parts.length - 1] || "other").toLowerCase();
+    return normalizePocketKey(parts[parts.length - 1] || "other");
   }
   return "other";
 }
@@ -532,7 +567,7 @@ function balanceAssetLabel(row: JsonMap): string {
 }
 
 function pocketLabel(key: string): string {
-  switch (key) {
+  switch (normalizePocketKey(key)) {
     case "spot":
       return "Spot";
     case "fund":
@@ -567,14 +602,8 @@ function summarizeVerificationPockets(rows: unknown[]): VerificationPocketSummar
     }
     buckets.set(key, bucket);
   }
-  const pocketOrder = new Map([
-    ["spot", 0],
-    ["fund", 1],
-    ["futures", 2],
-    ["other", 3],
-  ]);
   return [...buckets.entries()]
-    .sort((left, right) => (pocketOrder.get(left[0]) ?? 99) - (pocketOrder.get(right[0]) ?? 99))
+    .sort((left, right) => (VERIFICATION_POCKET_ORDER.get(left[0]) ?? 99) - (VERIFICATION_POCKET_ORDER.get(right[0]) ?? 99))
     .map(([key, bucket]) => ({
       key,
       label: pocketLabel(key),
@@ -582,6 +611,46 @@ function summarizeVerificationPockets(rows: unknown[]): VerificationPocketSummar
       assetCount: bucket.assets.size,
       assets: [...bucket.assets].sort((left, right) => left.localeCompare(right)),
     }));
+}
+
+function mergeVerificationPocketSummaries(
+  balanceSummaries: VerificationPocketSummary[],
+  pocketViews: PocketCapitalView[],
+): VerificationPocketSummary[] {
+  const merged = new Map<string, VerificationPocketSummary>();
+  for (const summary of balanceSummaries) {
+    merged.set(summary.key, {
+      ...summary,
+      key: normalizePocketKey(summary.key),
+      label: pocketLabel(summary.key),
+    });
+  }
+  for (const pocketView of pocketViews) {
+    const key = normalizePocketKey(pocketView.pocket);
+    const existing = merged.get(key);
+    const fallbackAssets = pocketView.assets.filter(Boolean);
+    const fallbackAssetCount = pocketView.asset_count > 0 ? pocketView.asset_count : fallbackAssets.length;
+    const fallbackTotalUsd = pocketView.equivalent_usd > 0 ? pocketView.equivalent_usd : null;
+    if (!existing) {
+      merged.set(key, {
+        key,
+        label: pocketLabel(key),
+        totalUsd: fallbackTotalUsd,
+        assetCount: fallbackAssetCount,
+        assets: [...fallbackAssets].sort((left, right) => left.localeCompare(right)),
+      });
+      continue;
+    }
+    merged.set(key, {
+      ...existing,
+      key,
+      label: pocketLabel(key),
+      totalUsd: existing.totalUsd != null && existing.totalUsd > 0 ? existing.totalUsd : fallbackTotalUsd,
+      assetCount: Math.max(existing.assetCount, fallbackAssetCount),
+      assets: [...new Set([...existing.assets, ...fallbackAssets])].sort((left, right) => left.localeCompare(right)),
+    });
+  }
+  return [...merged.values()].sort((left, right) => (VERIFICATION_POCKET_ORDER.get(left.key) ?? 99) - (VERIFICATION_POCKET_ORDER.get(right.key) ?? 99));
 }
 
 function buildVerificationAssetRows(rows: unknown[]): VerificationAssetRow[] {
@@ -611,8 +680,7 @@ function buildVerificationAssetRows(rows: unknown[]): VerificationAssetRow[] {
       } satisfies VerificationAssetRow;
     })
     .sort((left, right) => {
-      const pocketOrder = new Map([["spot", 0], ["fund", 1], ["futures", 2], ["other", 3]]);
-      const byPocket = (pocketOrder.get(left.pocketKey) ?? 99) - (pocketOrder.get(right.pocketKey) ?? 99);
+      const byPocket = (VERIFICATION_POCKET_ORDER.get(left.pocketKey) ?? 99) - (VERIFICATION_POCKET_ORDER.get(right.pocketKey) ?? 99);
       if (byPocket !== 0) {
         return byPocket;
       }
@@ -634,7 +702,7 @@ function normalizeAttributionRow(row: JsonMap): AttributionRow {
 
 function normalizePocketCapitalView(row: JsonMap): PocketCapitalView {
   return {
-    pocket: String(row.pocket || "other").toLowerCase(),
+    pocket: normalizePocketKey(row.pocket || "other"),
     equivalent_usd: toNumber(row.equivalent_usd, 0),
     raw_cash_usd: toNumber(row.raw_cash_usd, 0),
     inventory_usd: toNumber(row.inventory_usd, 0),
@@ -751,6 +819,10 @@ export default function LiveCapitalPage() {
   const [exchangePassphrase, setExchangePassphrase] = useState("");
   const [exchangeAccessMode, setExchangeAccessMode] = useState("trade");
   const [exchangeClientId, setExchangeClientId] = useState("");
+  const [exchangeCapabilities, setExchangeCapabilities] = useState<Record<string, ExchangeCapability>>({});
+  const [credentialUpdateApiKey, setCredentialUpdateApiKey] = useState("");
+  const [credentialUpdateApiSecret, setCredentialUpdateApiSecret] = useState("");
+  const [credentialUpdatePassphrase, setCredentialUpdatePassphrase] = useState("");
 
   const [walletProviderId, setWalletProviderId] = useState(String(WALLET_CONNECTION_CATALOG[0]?.providerId || "metamask"));
   const [walletAccountId, setWalletAccountId] = useState("");
@@ -783,16 +855,24 @@ export default function LiveCapitalPage() {
   const [strategySetupType, setStrategySetupType] = useState("regime-execution");
   const [strategyNotes, setStrategyNotes] = useState("Live allocation linked to a governed source with hard USD cap and explicit venue controls.");
 
+  function upsertConnectorAccount(nextAccount: ConnectorAccountRow): void {
+    setConnectorAccounts((current) => {
+      const remaining = current.filter((row) => !(row.provider === nextAccount.provider && row.account_id === nextAccount.account_id));
+      return [...remaining, nextAccount].sort((left, right) => `${left.provider}:${left.account_id}`.localeCompare(`${right.provider}:${right.account_id}`));
+    });
+  }
+
   async function refreshDesk(): Promise<void> {
-    const [accountsRes, connectorsRes, portfoliosRes, strategiesRes, pendingRes] = await Promise.all([
+    const [accountsRes, connectorsRes, portfoliosRes, strategiesRes, pendingRes, capabilitiesRes] = await Promise.all([
       fetch("/api/accounts", { cache: "no-store" }),
       fetch("/api/connectors/accounts", { cache: "no-store" }),
       fetch("/api/portfolios", { cache: "no-store" }),
       fetch("/api/strategies", { cache: "no-store" }),
       fetch("/api/mt5/orders/live-pending", { cache: "no-store" }),
+      fetch("/api/connectors/exchange-capabilities", { cache: "no-store" }),
     ]);
 
-    if (!accountsRes.ok || !connectorsRes.ok || !portfoliosRes.ok || !strategiesRes.ok || !pendingRes.ok) {
+    if (!accountsRes.ok || !connectorsRes.ok || !portfoliosRes.ok || !strategiesRes.ok || !pendingRes.ok || !capabilitiesRes.ok) {
       throw new Error("Impossible de charger le desk Live Capital");
     }
 
@@ -801,12 +881,14 @@ export default function LiveCapitalPage() {
     const portfoliosPayload = await portfoliosRes.json().catch(() => []);
     const strategiesPayload = await strategiesRes.json().catch(() => []);
     const pendingPayload = await pendingRes.json().catch(() => []);
+    const capabilitiesPayload = await capabilitiesRes.json().catch(() => ({}));
 
     setAccounts(Array.isArray(accountsPayload) ? accountsPayload.map((item) => normalizeAccount(item as JsonMap)) : []);
     setConnectorAccounts(Array.isArray((connectorsPayload as JsonMap).accounts) ? ((connectorsPayload as JsonMap).accounts as JsonMap[]).map((item) => normalizeConnectorAccount(item)) : []);
     setPortfolios(Array.isArray(portfoliosPayload) ? portfoliosPayload.map((item) => normalizePortfolio(item as JsonMap)) : []);
     setStrategies(Array.isArray(strategiesPayload) ? strategiesPayload.map((item) => normalizeStrategy(item as JsonMap)) : []);
     setPendingLive(Array.isArray(pendingPayload) ? pendingPayload as JsonMap[] : []);
+    setExchangeCapabilities(normalizeExchangeCapabilityMap(capabilitiesPayload));
   }
 
   useEffect(() => {
@@ -893,6 +975,22 @@ export default function LiveCapitalPage() {
     () => (selectedSource?.canonical_account_id ? canonicalAccountMap.get(selectedSource.canonical_account_id) || null : null),
     [canonicalAccountMap, selectedSource],
   );
+  const selectedExchangeConnectorAccount = useMemo(() => {
+    if (!selectedSource || selectedSource.source_type !== "exchange") {
+      return null;
+    }
+    const providerKey = String(selectedSource.connector_type || selectedSource.platform || "").trim().toLowerCase();
+    const candidateIds = new Set(
+      [selectedSource.account_id, selectedSource.canonical_account_id, selectedCanonicalAccount?.external_ref]
+        .map((value) => String(value || "").trim())
+        .filter(Boolean),
+    );
+    return connectorAccounts.find((row) => {
+      const providerMatches = String(row.provider || "").trim().toLowerCase() === providerKey;
+      const accountMatches = candidateIds.has(String(row.account_id || "").trim());
+      return providerMatches && accountMatches;
+    }) || null;
+  }, [connectorAccounts, selectedCanonicalAccount?.external_ref, selectedSource]);
   const matchedPortfolios = useMemo(
     () => (selectedSource ? portfolios.filter((row) => row.client_id === selectedSource.client_id) : []),
     [portfolios, selectedSource],
@@ -901,12 +999,29 @@ export default function LiveCapitalPage() {
     () => EXCHANGE_CONNECTION_CATALOG.find((item) => item.providerId === exchangeProviderId) || EXCHANGE_CONNECTION_CATALOG[0],
     [exchangeProviderId],
   );
+  const selectedExchangeCapability = useMemo(
+    () => getExchangeCapability(exchangeCapabilities, exchangeProviderId),
+    [exchangeCapabilities, exchangeProviderId],
+  );
+  const exchangePassphraseRequired = useMemo(
+    () => selectedExchangeCapability.api_key_requires_passphrase || ["okx", "bitget"].includes(String(exchangeProviderId || "").trim().toLowerCase()),
+    [exchangeProviderId, selectedExchangeCapability],
+  );
+  const selectedExchangeConnectorCapability = useMemo(
+    () => getExchangeCapability(exchangeCapabilities, String(selectedExchangeConnectorAccount?.provider || "")),
+    [exchangeCapabilities, selectedExchangeConnectorAccount?.provider],
+  );
+  const credentialUpdatePassphraseRequired = useMemo(
+    () => selectedExchangeConnectorCapability.api_key_requires_passphrase || ["okx", "bitget"].includes(String(selectedExchangeConnectorAccount?.provider || "").trim().toLowerCase()),
+    [selectedExchangeConnectorAccount?.provider, selectedExchangeConnectorCapability],
+  );
   const selectedWalletProvider = useMemo(
     () => WALLET_CONNECTION_CATALOG.find((item) => item.providerId === walletProviderId) || WALLET_CONNECTION_CATALOG[0],
     [walletProviderId],
   );
   const verificationBalances = Array.isArray(verification?.balances) ? (verification.balances as unknown[]) : [];
   const verificationPositions = Array.isArray(verification?.positions) ? (verification.positions as unknown[]) : [];
+  const verificationOpenOrders = Array.isArray(verification?.open_orders) ? (verification.open_orders as JsonMap[]) : [];
   const verificationNormalizedState = verification?.normalized_state && typeof verification.normalized_state === "object" ? (verification.normalized_state as JsonMap) : null;
   const verificationNotes = Array.isArray(verificationNormalizedState?.notes)
     ? (verificationNormalizedState.notes as unknown[]).map((item) => String(item || "")).filter(Boolean)
@@ -940,12 +1055,31 @@ export default function LiveCapitalPage() {
     () => normalizeCapitalLedgerSummary(verificationCapitalLedger?.summary as JsonMap | null | undefined),
     [verificationCapitalLedger],
   );
-  const verificationPocketSummaries = useMemo(() => summarizeVerificationPockets(verificationBalances), [verificationBalances]);
+  const balanceVerificationPocketSummaries = useMemo(() => summarizeVerificationPockets(verificationBalances), [verificationBalances]);
+  const verificationPocketSummaries = useMemo(() => {
+    const merged = mergeVerificationPocketSummaries(balanceVerificationPocketSummaries, verificationPocketViews);
+    // For BingX accounts: always surface the Fund pocket even when empty,
+    // so the operator can see it was checked (earn/savings sub-account).
+    const providerKey = String(selectedSource?.connector_type || "").trim().toLowerCase();
+    if (providerKey === "bingx" && merged.length > 0 && !merged.some((p) => p.key === "fund")) {
+      merged.push({ key: "fund", label: "Fund", totalUsd: null, assetCount: 0, assets: [] });
+      merged.sort((l, r) => (VERIFICATION_POCKET_ORDER.get(l.key) ?? 99) - (VERIFICATION_POCKET_ORDER.get(r.key) ?? 99));
+    }
+    return merged;
+  }, [balanceVerificationPocketSummaries, verificationPocketViews, selectedSource]);
   const verificationAssetRows = useMemo(() => buildVerificationAssetRows(verificationBalances), [verificationBalances]);
   const verificationPocketHeadline = verificationPocketSummaries.length > 0
     ? verificationPocketSummaries.map((item) => `${item.label} ${item.totalUsd != null ? formatUsd(item.totalUsd) : `${item.assetCount} actif(s)`}`).join(" · ")
     : "";
   const verificationTotalUsd = useMemo(() => {
+    const byEquivalent = Number(verificationCashVsEquivalent?.total_equivalent_usd);
+    if (Number.isFinite(byEquivalent) && byEquivalent > 0) {
+      return byEquivalent;
+    }
+    const byPockets = verificationPocketSummaries.reduce<number>((sum, item) => sum + (item.totalUsd || 0), 0);
+    if (byPockets > 0) {
+      return byPockets;
+    }
     const byBalances = sumBalanceRowsUsd(verificationBalances);
     if (byBalances != null) {
       return byBalances;
@@ -962,7 +1096,7 @@ export default function LiveCapitalPage() {
       }
     }
     return null;
-  }, [selectedCanonicalAccount, verification, verificationBalances]);
+  }, [selectedCanonicalAccount, verification, verificationBalances, verificationCashVsEquivalent, verificationPocketSummaries]);
   const activePortfolioId = selectedPortfolioId || selectedCanonicalAccount?.portfolio_id || "";
   const verificationAsOf = useMemo(() => {
     if (typeof verificationNormalizedState?.as_of === "string" && verificationNormalizedState.as_of) {
@@ -1286,6 +1420,12 @@ export default function LiveCapitalPage() {
     }
   }, [allocationCapUsd, createPortfolioClientId, exchangeClientId, selectedCanonicalAccount, selectedPortfolioId, selectedSource, walletClientId]);
 
+  useEffect(() => {
+    setCredentialUpdateApiKey("");
+    setCredentialUpdateApiSecret("");
+    setCredentialUpdatePassphrase("");
+  }, [selectedExchangeConnectorAccount?.account_id, selectedExchangeConnectorAccount?.provider]);
+
   async function createPortfolio(): Promise<void> {
     setBusy(true);
     setError(null);
@@ -1326,7 +1466,32 @@ export default function LiveCapitalPage() {
     }
   }
 
+  async function syncCanonicalAccount(accountId: string): Promise<JsonMap> {
+    const response = await fetch(`/api/accounts/${encodeURIComponent(accountId)}/sync`, { method: "POST" });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(String((payload as JsonMap).detail || "Sync compte impossible"));
+    }
+    return payload as JsonMap;
+  }
+
   async function linkExchangeSource(): Promise<void> {
+    if (!exchangeAccountId.trim()) {
+      setError("Ajoute l'identifiant du compte ou du sous-compte sur l'exchange.");
+      return;
+    }
+    if (!exchangeApiKey.trim()) {
+      setError("Ajoute la clé API.");
+      return;
+    }
+    if (!exchangeApiSecret.trim()) {
+      setError("Ajoute le secret API.");
+      return;
+    }
+    if (exchangePassphraseRequired && !exchangePassphrase.trim()) {
+      setError(`Pour ${selectedExchangeProvider?.provider || "cet exchange"}, ajoute aussi la passphrase créée avec la clé API.`);
+      return;
+    }
     setBusy(true);
     setError(null);
     setResult(null);
@@ -1350,12 +1515,82 @@ export default function LiveCapitalPage() {
       if (!response.ok) {
         throw new Error(String((payload as JsonMap).detail || "Connexion exchange impossible"));
       }
+      const linkedAccount = Array.isArray((payload as JsonMap).accounts)
+        ? (((payload as JsonMap).accounts as JsonMap[])
+          .map((item) => normalizeConnectorAccount(item))
+          .find((item) => item.provider === exchangeProviderId && item.account_id === exchangeAccountId) || null)
+        : null;
+      const nextLinkedAccount = linkedAccount || {
+        provider: exchangeProviderId,
+        provider_type: "exchange",
+        account_id: exchangeAccountId,
+        label: exchangeLabel || exchangeAccountId,
+        mode: exchangeAccessMode,
+        auth_method: "api_key",
+        client_id: resolvedClientId,
+        owner_username: "",
+        has_credentials: true,
+        address: null,
+        linked_at: null,
+      } satisfies ConnectorAccountRow;
+      upsertConnectorAccount(nextLinkedAccount);
+      const bootstrapSource: CapitalSourceRow = {
+        key: `linked:${exchangeProviderId}:${exchangeAccountId}`,
+        account_id: exchangeAccountId,
+        client_id: nextLinkedAccount.client_id || resolvedClientId,
+        source_type: "exchange",
+        platform: nextLinkedAccount.provider || exchangeProviderId,
+        connector_type: nextLinkedAccount.provider || exchangeProviderId,
+        environment: environmentLabelForConnector("exchange"),
+        permission_label: exchangeAccessMode === "trade" ? "trade enabled" : exchangeAccessMode === "read" ? "read only" : exchangeAccessMode,
+        status: nextLinkedAccount.has_credentials ? "linked" : "credential-missing",
+        display_name: exchangeLabel || nextLinkedAccount.label || exchangeAccountId,
+        latest_equity_usd: null,
+        gross_exposure_usd: null,
+        net_exposure_usd: null,
+        canonical_account_id: null,
+        canonical: false,
+        address: nextLinkedAccount.address || null,
+        summary: "Source connecteur visible côté plateforme, à canoniser avant allocation portefeuille.",
+      };
       setExchangeApiKey("");
       setExchangeApiSecret("");
       setExchangePassphrase("");
-      setResult(payload as JsonMap);
-      await refreshDesk();
-      setSelectedSourceKey(`linked:${exchangeProviderId}:${exchangeAccountId}`);
+      let bootstrapError: string | null = null;
+      let nextResult: JsonMap = { ...(payload as JsonMap), operation: "exchange-link" };
+      try {
+        const canonicalAccountId = await ensureCanonicalAccount(bootstrapSource);
+        if (!canonicalAccountId) {
+          throw new Error("Impossible de déterminer le compte canonique après liaison");
+        }
+        const syncPayload = await syncCanonicalAccount(canonicalAccountId);
+        nextResult = {
+          ...(payload as JsonMap),
+          operation: "exchange-link",
+          detail: "Exchange lié, canonisé puis synchronisé automatiquement.",
+          bootstrap: {
+            status: "ok",
+            canonical_account_id: canonicalAccountId,
+            sync_status: String(syncPayload.status || "ok"),
+          },
+        };
+        await refreshDesk();
+        setSelectedSourceKey(`canonical:${canonicalAccountId}`);
+      } catch (bootstrapRequestError) {
+        bootstrapError = bootstrapRequestError instanceof Error ? bootstrapRequestError.message : "Bootstrap initial impossible";
+        nextResult = {
+          ...(payload as JsonMap),
+          operation: "exchange-link",
+          status: "partial",
+          detail: `Accès exchange lié, mais bootstrap initial impossible: ${bootstrapError}`,
+        };
+        await refreshDesk();
+        setSelectedSourceKey(`linked:${exchangeProviderId}:${exchangeAccountId}`);
+      }
+      setResult(nextResult);
+      if (bootstrapError) {
+        setError(bootstrapError);
+      }
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : "Connexion exchange impossible");
     } finally {
@@ -1392,11 +1627,91 @@ export default function LiveCapitalPage() {
       if (!response.ok) {
         throw new Error(String((payload as JsonMap).detail || "Connexion wallet impossible"));
       }
+      upsertConnectorAccount({
+        provider: walletProviderId,
+        provider_type: "wallet",
+        account_id: walletAccountId || walletAddress || walletPublicKey,
+        label: walletLabel || walletAddress || walletPublicKey,
+        mode: walletAccessMode,
+        auth_method: walletAuthMethod(String(selectedWalletProvider?.mode || ""), walletAccessMode, hasWalletReference),
+        client_id: resolvedClientId,
+        owner_username: "",
+        has_credentials: Boolean((payload as JsonMap).credential_id),
+        address: walletAddress || walletPublicKey,
+        linked_at: null,
+      });
       setResult(payload as JsonMap);
       await refreshDesk();
       setSelectedSourceKey(`linked:${walletProviderId}:${walletAccountId || walletAddress || walletPublicKey}`);
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : "Connexion wallet impossible");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function updateSelectedExchangeCredentials(): Promise<void> {
+    if (!selectedExchangeConnectorAccount) {
+      setError("Sélectionne d'abord une source exchange avec accès API déjà lié");
+      return;
+    }
+    if (!credentialUpdateApiKey || !credentialUpdateApiSecret) {
+      setError("Nouvelle api key et nouveau secret requis");
+      return;
+    }
+    if (credentialUpdatePassphraseRequired && !credentialUpdatePassphrase.trim()) {
+      setError(`Pour ${selectedExchangeConnectorAccount.provider}, ajoute aussi la passphrase créée avec la clé API.`);
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    setResult(null);
+    try {
+      const response = await fetch("/api/connectors/accounts/link-api-key", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          provider: selectedExchangeConnectorAccount.provider,
+          account_id: selectedExchangeConnectorAccount.account_id,
+          label: selectedExchangeConnectorAccount.label || selectedSource?.display_name || selectedExchangeConnectorAccount.account_id,
+          mode: selectedExchangeConnectorAccount.mode || "trade",
+          client_id: selectedExchangeConnectorAccount.client_id || selectedSource?.client_id || undefined,
+          api_key: credentialUpdateApiKey,
+          api_secret: credentialUpdateApiSecret,
+          passphrase: credentialUpdatePassphrase,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(String((payload as JsonMap).detail || "Mise à jour des accès API impossible"));
+      }
+      if (selectedSource?.canonical_account_id) {
+        try {
+          const syncPayload = await syncCanonicalAccount(selectedSource.canonical_account_id);
+          setResult({
+            ...(payload as JsonMap),
+            detail: "Accès API mis à jour puis synchronisation relancée.",
+            sync_status: String(syncPayload.status || "ok"),
+          });
+        } catch (syncError) {
+          setResult({
+            ...(payload as JsonMap),
+            status: "partial",
+            detail: `Accès API mis à jour, mais la synchronisation a échoué: ${syncError instanceof Error ? syncError.message : "erreur inconnue"}`,
+          });
+        }
+      } else {
+        setResult({
+          ...(payload as JsonMap),
+          detail: "Accès API mis à jour. Canonise la source pour relancer une synchronisation immédiate.",
+        });
+      }
+      setCredentialUpdateApiKey("");
+      setCredentialUpdateApiSecret("");
+      setCredentialUpdatePassphrase("");
+      await refreshDesk();
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Mise à jour des accès API impossible");
     } finally {
       setBusy(false);
     }
@@ -1462,6 +1777,38 @@ export default function LiveCapitalPage() {
     }
   }
 
+  async function deleteCanonicalAccount(accountId: string): Promise<void> {
+    if (!accountId) {
+      return;
+    }
+    if (typeof window !== "undefined") {
+      const confirmed = window.confirm(`Supprimer le compte canonique ${accountId} du registre capital ?`);
+      if (!confirmed) {
+        return;
+      }
+    }
+    setBusy(true);
+    setError(null);
+    setResult(null);
+    try {
+      const response = await fetch(`/api/accounts/${encodeURIComponent(accountId)}`, { method: "DELETE" });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(String((payload as JsonMap).detail || "Suppression du compte impossible"));
+      }
+      if (selectedSource?.canonical_account_id === accountId || selectedSource?.account_id === accountId) {
+        setSelectedSourceKey("");
+        setVerification(null);
+      }
+      setResult(payload as JsonMap);
+      await refreshDesk();
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Suppression du compte impossible");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function attachAccountAllocation(): Promise<void> {
     if (!selectedSource || !selectedPortfolioId) {
       setError("Choisis d'abord une source et un portefeuille");
@@ -1510,12 +1857,25 @@ export default function LiveCapitalPage() {
         throw new Error("Impossible de déterminer le compte à vérifier");
       }
 
+      if (selectedSource.source_type !== "wallet") {
+        const syncResponse = await fetch(`/api/accounts/${encodeURIComponent(verifiedAccountId)}/sync`, { method: "POST" });
+        const syncPayload = await syncResponse.json().catch(() => ({}));
+        if (!syncResponse.ok) {
+          throw new Error(String((syncPayload as JsonMap).detail || "Sync compte impossible"));
+        }
+      }
+
       const response = await fetch(`/api/internal/accounts/${encodeURIComponent(verifiedAccountId)}/verification`, { cache: "no-store" });
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) {
         throw new Error(String((payload as JsonMap).detail || "Verification compte impossible"));
       }
       setVerification(payload as JsonMap);
+      try {
+        await refreshDesk();
+      } catch {
+        // noop: la vérification a déjà réussi, le refresh global du desk reste secondaire.
+      }
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : "Verification source impossible");
     } finally {
@@ -1615,23 +1975,27 @@ export default function LiveCapitalPage() {
   }
 
   return (
-    <main className="shell txt-page-shell">
+    <main className="shell txt-page-shell" data-testid="mission-control-live-capital-page">
       <section className="hero txt-page-hero-grid" style={{ gridTemplateColumns: "1.35fr 0.9fr" }}>
         <div className="panel txt-page-hero">
-          <div className="eyebrow">Live Capital Desk <HelpHint text="Desk opérateur pour distinguer clairement paper/live/exchange/wallet, canoniser les sources allocables et piloter la promotion live d'une stratégie." examples={["Paper = compte de test, live = capital réel chez broker, exchange = venue centralisée, wallet = capital on-chain ou custody.", "Une source exchange ou wallet peut être connectée côté plateforme sans être encore canonisée pour un portefeuille."]} /></div>
+          <div className="eyebrow">Live Capital Desk</div>
           <h1 className="title" style={{ fontSize: 34 }}>Sources connectées → capital gouverné → agents live</h1>
-          <p className="subtle">
+          <p className="subtle txt-page-hero-copy">
             Le bloc Performance Desk du terminal doit distinguer les fonds issus d'un broker paper, d'un broker live, d'un exchange ou d'un wallet.
             Cette page sert de bureau de contrôle: elle montre les sources réelles, permet de les canoniser si besoin, vérifie les informations disponibles de la plateforme,
             puis attache un cap USD à un portefeuille avant toute promotion live.
           </p>
-          <TxtMiniGuide
+          <OperatorPanelGuide
             title="Guide Live Capital"
             what="Voir toutes les sources de capital, distinguer leur nature, vérifier ce qui est réellement contrôlable et allouer seulement les sources gouvernées."
             why="Un exchange ou un wallet connecté n'est pas automatiquement prêt pour allocation. Il faut rendre la source canonique, lisible et vérifiable."
             example="Sélectionne une source Bitget ou wallet, canonise-la si nécessaire, vérifie les informations plateforme/fonds disponibles, puis rattache-la à un portefeuille avec un cap USD."
             terms={["allocation", "portfolio", "paper", "live", "exchange", "wallet"]}
           />
+          <div className="txt-page-guide-note">
+            <strong>Avant d'allouer</strong>
+            1. Identifie la nature de la source. 2. Verifie si elle est canonique et vraiment pilotable. 3. Controle les informations plateforme disponibles. 4. Seulement ensuite, attache un cap USD au portefeuille.
+          </div>
           <p>
             <Link href="/terminal">Terminal</Link>
             {" | "}
@@ -1658,31 +2022,40 @@ export default function LiveCapitalPage() {
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1fr 1fr" }}>
         <div className="panel">
-          <div className="eyebrow">Sources canoniques allocables <HelpHint text="Une source canonique est déjà entrée dans le registre capital TXT. Elle peut donc être vérifiée, rattachée à un portefeuille et utilisée par les agents selon son mode." examples={["Un compte broker live canonique peut être alloué directement.", "Un exchange déjà canonisé peut afficher son total ou ses balances avant allocation."]} /></div>
+          <div className="eyebrow">Sources canoniques allocables <HelpHint text="Ces sources sont déjà prêtes dans le registre principal. Tu peux donc les vérifier, les rattacher à un portefeuille et les utiliser." examples={["Un compte réel déjà validé peut être alloué directement.", "Un exchange déjà préparé peut afficher ses montants avant allocation."]} /></div>
           {capitalSources.filter((row) => row.canonical).length === 0 ? <p className="subtle">Aucune source canonique visible.</p> : null}
-          {capitalSources.filter((row) => row.canonical).map((row) => (
-            <div key={row.key} className="row">
-              <span>{row.display_name} · {row.source_type} · {row.platform}</span>
-              <span className={toneForEnvironment(row.environment)}>{row.environment} · {row.status} · {formatUsd(row.latest_equity_usd)}</span>
-            </div>
-          ))}
+          <div className="txt-scroll-shell">
+            {capitalSources.filter((row) => row.canonical).map((row) => (
+              <div key={row.key} className="row">
+                <span>{row.display_name} · {row.source_type} · {row.platform}</span>
+                <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+                  <span className={toneForEnvironment(row.environment)}>{row.environment} · {row.status} · {formatUsd(row.latest_equity_usd)}</span>
+                  <button type="button" onClick={() => deleteCanonicalAccount(row.account_id)} disabled={busy}>
+                    Supprimer
+                  </button>
+                </span>
+              </div>
+            ))}
+          </div>
         </div>
 
         <div className="panel">
-          <div className="eyebrow">Sources plateforme non encore canonisées <HelpHint text="Ces sources sont déjà connectées côté API key ou wallet, mais pas encore transformées en compte allocable dans le registre portefeuille." examples={["Bitget lié via API key mais pas encore canonisé: visible ici.", "Wallet Phantom lié en read-only: visible mais pas encore utilisable pour allocation."]} /></div>
+          <div className="eyebrow">Sources plateforme non encore canonisées <HelpHint text="Ces sources sont déjà branchées, mais pas encore prêtes pour une allocation officielle." examples={["Un exchange relié par clé API peut apparaître ici sans être encore utilisable.", "Un wallet en lecture seule peut être visible mais rester hors allocation."]} /></div>
           {capitalSources.filter((row) => !row.canonical).length === 0 ? <p className="subtle">Tous les exchange/wallet visibles sont déjà canonisés ou aucune source connecteur additionnelle n'est présente.</p> : null}
-          {capitalSources.filter((row) => !row.canonical).map((row) => (
-            <div key={row.key} className="row">
-              <span>{row.display_name} · {row.source_type} · {row.platform}</span>
-              <span>{row.permission_label} · {row.summary}</span>
-            </div>
-          ))}
+          <div className="txt-scroll-shell">
+            {capitalSources.filter((row) => !row.canonical).map((row) => (
+              <div key={row.key} className="row">
+                <span>{row.display_name} · {row.source_type} · {row.platform}</span>
+                <span>{row.permission_label} · {row.summary}</span>
+              </div>
+            ))}
+          </div>
         </div>
       </section>
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1fr 1fr" }}>
         <div className="panel">
-          <div className="eyebrow">Desk Structuring <HelpHint text="Ce bloc traduit la logique allocateur hedge fund: type de véhicule, sleeve de capital, book d'exécution et politique de settlement." examples={["Managed account + core alpha + multi-venue + hybrid pour un desk opérateur classique.", "Treasury + custody + daily rebalance pour une poche réserve non directionnelle."]} /></div>
+          <div className="eyebrow">Desk Structuring <HelpHint text="Ce bloc sert à décrire comment tu veux utiliser la source: type de compte, rôle du capital, lieu d'exécution et rythme de remise à niveau." examples={["Un compte principal peut servir au cœur de l'activité avec plusieurs plateformes.", "Une réserve peut rester séparée avec un usage plus prudent."]} /></div>
           <div className="form-grid" style={{ marginTop: 12 }}>
             <div>
               <div className="subtle" style={{ marginBottom: 6 }}>Véhicule <HelpHint text={DESK_VEHICLE_HELP[deskVehicle].text} examples={DESK_VEHICLE_HELP[deskVehicle].examples} label={deskVehicle} /></div>
@@ -1750,7 +2123,7 @@ export default function LiveCapitalPage() {
         </div>
 
         <div className="panel">
-          <div className="eyebrow">Venue Pockets & Prime Logic <HelpHint text="Lecture desk des poches réellement portées par la source: spot, futures/perp, options, custody, on-chain." examples={["BingX ou Bitget peuvent théoriquement porter spot et futures, mais le backend ne les voit que si l'adaptateur synchronise ces sous-comptes.", "Un wallet treasury sera plutôt custody/on-chain qu'un book d'exécution dérivés."]} /></div>
+          <div className="eyebrow">Venue Pockets & Prime Logic <HelpHint text="Montre où l'argent est rangé sur la source: comptant, dérivés, options, garde ou on-chain." examples={["Une plateforme peut avoir plusieurs poches, mais elles n'apparaissent que si la synchronisation les remonte bien.", "Un wallet de réserve sera plutôt vu comme garde ou réserve que comme compte d'exécution rapide."]} /></div>
           <div className="row"><span>Source active</span><span>{selectedSource ? `${selectedSource.display_name} / ${selectedSource.platform}` : "-"}</span></div>
           <div className="row"><span>Coverage théorique</span><span>{selectedVenueSpec?.coverage || (selectedSource?.source_type === "broker" ? "broker margin / live or paper" : "-")}</span></div>
           <div className="row"><span>Poches desk</span><span>{venuePockets.join(", ")}</span></div>
@@ -1767,24 +2140,45 @@ export default function LiveCapitalPage() {
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1fr 1fr" }}>
         <div className="panel">
-          <div className="eyebrow">Connecter un exchange avant allocation <HelpHint text="Tu peux rattacher ici un compte CEX sans quitter Live Capital. Ensuite, tu le vérifies, tu le canonises si besoin, puis tu l'alloues." examples={["Bitget: account_id + API key + secret + passphrase si requise.", "Mode read pour supervision seule, trade si les agents doivent pouvoir exécuter."]} /></div>
+          <div className="eyebrow">Enregistrer un compte exchange avant allocation <HelpHint text="Renseigne ici les accès créés sur l'exchange. TXT vérifie maintenant la clé tout de suite pour éviter d'enregistrer un mauvais accès." examples={["Pour OKX, remplis la clé API, le secret API, la passphrase créée avec la clé et l'identifiant du compte ou du sous-compte.", "Choisis Lecture seule pour surveiller, ou Trading autorisé si la source doit vraiment exécuter."]} /></div>
           <div className="form-grid" style={{ marginTop: 12 }}>
             <select value={exchangeProviderId} onChange={(event) => setExchangeProviderId(event.target.value)}>
               {EXCHANGE_CONNECTION_CATALOG.filter((item) => item.mode === "api-key").map((item) => (
                 <option value={item.providerId} key={item.providerId}>{item.provider}</option>
               ))}
             </select>
-            <input value={exchangeAccountId} onChange={(event) => setExchangeAccountId(event.target.value)} placeholder="exchange account_id / subaccount" />
-            <input value={exchangeLabel} onChange={(event) => setExchangeLabel(event.target.value)} placeholder="label affichage" />
-            <input value={exchangeClientId} onChange={(event) => setExchangeClientId(event.target.value)} placeholder="client_id (optionnel)" />
-            <input value={exchangeApiKey} onChange={(event) => setExchangeApiKey(event.target.value)} placeholder="api key" />
-            <input type="password" value={exchangeApiSecret} onChange={(event) => setExchangeApiSecret(event.target.value)} placeholder="api secret" />
-            <input type="password" value={exchangePassphrase} onChange={(event) => setExchangePassphrase(event.target.value)} placeholder="passphrase (si requise)" />
+            <input value={exchangeAccountId} onChange={(event) => setExchangeAccountId(event.target.value)} placeholder="Identifiant du compte sur l'exchange ou sous-compte" />
+            <input value={exchangeLabel} onChange={(event) => setExchangeLabel(event.target.value)} placeholder="Nom affiché du compte (facultatif)" />
+            <input value={exchangeClientId} onChange={(event) => setExchangeClientId(event.target.value)} placeholder="Client interne (facultatif)" />
+            <input value={exchangeApiKey} onChange={(event) => setExchangeApiKey(event.target.value)} placeholder="Clé API" />
+            <input type="password" value={exchangeApiSecret} onChange={(event) => setExchangeApiSecret(event.target.value)} placeholder="Secret API" />
+            <input type="password" value={exchangePassphrase} onChange={(event) => setExchangePassphrase(event.target.value)} placeholder={exchangePassphraseRequired ? "Passphrase API (obligatoire)" : "Passphrase API (laisser vide si non demandée)"} />
             <select value={exchangeAccessMode} onChange={(event) => setExchangeAccessMode(event.target.value)}>
-              <option value="read">read</option>
-              <option value="trade">trade</option>
+              <option value="read">Lecture seule</option>
+              <option value="trade">Trading autorisé</option>
             </select>
-            <button type="button" onClick={() => linkExchangeSource()} disabled={busy || !exchangeAccountId || !exchangeApiKey || !exchangeApiSecret}>Lier l'exchange</button>
+            <button type="button" onClick={() => linkExchangeSource()} disabled={busy}>Enregistrer le compte</button>
+          </div>
+          <p className="subtle" style={{ marginTop: 10 }}>
+            {exchangePassphraseRequired
+              ? `Pour ${selectedExchangeProvider?.provider || "cet exchange"}, la passphrase est obligatoire et doit être exactement celle créée en même temps que la clé API.`
+              : "Colle ici exactement les accès visibles dans l'interface de l'exchange. TXT vérifie la clé avant de la garder."}
+          </p>
+          {error ? <p className="warn" style={{ marginTop: 10 }}>{error}</p> : null}
+          {result?.operation === "exchange-link" ? (
+            <p className={String(result.status || "ok") === "partial" ? "warn" : "good"} style={{ marginTop: 10 }}>
+              {String(result.detail || "Compte exchange enregistré.")}
+            </p>
+          ) : null}
+          <div className="panel" style={{ marginTop: 12, borderRadius: 12 }}>
+            <div className="eyebrow">Sources exchange actuellement visibles</div>
+            {exchangeSources.length === 0 ? <p className="subtle">Aucun compte exchange n'est enregistré pour l'instant. Tant qu'il n'est pas accepté ici, il n'apparaîtra pas dans Allouer une source connectée.</p> : null}
+            {exchangeSources.slice(0, 6).map((row) => (
+              <div className="row" key={row.key}>
+                <span>{row.display_name} · {row.platform}</span>
+                <span>{row.canonical ? "canonique" : "lié"} · {row.permission_label}</span>
+              </div>
+            ))}
           </div>
           {selectedExchangeProvider ? (
             <div className="panel" style={{ marginTop: 12, borderRadius: 12 }}>
@@ -1797,10 +2191,13 @@ export default function LiveCapitalPage() {
           <p className="subtle" style={{ marginTop: 10 }}>
             Les venues de type wallet-signing comme Hyperliquid, dYdX, Polymarket ou Pump.fun passent par le bloc wallet / custody ci-contre, pas par une API key CEX classique.
           </p>
+          <p className="subtle" style={{ marginTop: 10 }}>
+            Après liaison, TXT essaie maintenant de canoniser automatiquement la source et de lancer une première synchronisation pour la rendre appelable sans étape manuelle supplémentaire.
+          </p>
         </div>
 
         <div className="panel">
-          <div className="eyebrow">Connecter un wallet / custody <HelpHint text="Bloc pour les wallets EVM, BTC, Solana ou custody institutionnelle avant verification puis allocation. TXT ne doit jamais recevoir la cle privee du wallet." examples={["Phantom pour Solana/Jupiter via wallet adapter.", "Fireblocks ou Safe pour un signer externe institutionnel."]} /></div>
+          <div className="eyebrow">Connecter un wallet / custody <HelpHint text="Ce bloc sert à brancher un wallet ou une solution de garde avant vérification puis allocation." examples={["Une adresse publique suffit pour suivre un wallet.", "La signature doit rester hors TXT, via un système externe prévu pour ça."]} /></div>
           <div className="form-grid" style={{ marginTop: 12 }}>
             <select value={walletProviderId} onChange={(event) => setWalletProviderId(event.target.value)}>
               {WALLET_CONNECTION_CATALOG.map((item) => (
@@ -1839,9 +2236,41 @@ export default function LiveCapitalPage() {
         </div>
       </section>
 
+      <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1fr" }}>
+        <div className="panel">
+          <div className="eyebrow">Mettre à jour les accès API d'une plateforme <HelpHint text="Cette section sert à remplacer la clé API, le secret ou la passphrase d'un exchange déjà lié sans recréer toute la source." examples={["Sélectionne d'abord la source exchange active, puis remplace ses accès API.", "Après mise à jour, TXT relance automatiquement une sync si le compte est déjà canonique."]} /></div>
+          {selectedExchangeConnectorAccount ? (
+            <>
+              <div className="panel" style={{ marginTop: 12, borderRadius: 12 }}>
+                <div className="row"><span>Plateforme</span><span>{selectedExchangeConnectorAccount.provider}</span></div>
+                <div className="row"><span>Compte lié</span><span>{selectedExchangeConnectorAccount.account_id}</span></div>
+                <div className="row"><span>Label</span><span>{selectedExchangeConnectorAccount.label || selectedSource?.display_name || "-"}</span></div>
+                <div className="row"><span>Mode</span><span>{selectedExchangeConnectorAccount.mode || "trade"}</span></div>
+                <div className="row"><span>Client</span><span>{selectedExchangeConnectorAccount.client_id || selectedSource?.client_id || "-"}</span></div>
+              </div>
+              <div className="form-grid" style={{ marginTop: 12 }}>
+                <input value={credentialUpdateApiKey} onChange={(event) => setCredentialUpdateApiKey(event.target.value)} placeholder="Nouvelle clé API" />
+                <input type="password" value={credentialUpdateApiSecret} onChange={(event) => setCredentialUpdateApiSecret(event.target.value)} placeholder="Nouveau secret API" />
+                <input type="password" value={credentialUpdatePassphrase} onChange={(event) => setCredentialUpdatePassphrase(event.target.value)} placeholder={credentialUpdatePassphraseRequired ? "Nouvelle passphrase API (obligatoire)" : "Nouvelle passphrase API (laisser vide si non demandée)"} />
+                <button type="button" onClick={() => updateSelectedExchangeCredentials()} disabled={busy}>
+                  Mettre à jour les accès API
+                </button>
+              </div>
+              <p className="subtle" style={{ marginTop: 10 }}>
+                Cette action remplace les credentials du compte exchange sélectionné. La clé précédente n'est pas conservée dans le connecteur actif.
+              </p>
+            </>
+          ) : (
+            <p className="subtle" style={{ marginTop: 12 }}>
+              Sélectionne une source de type exchange pour afficher ici le remplacement de sa clé API, de son secret et de sa passphrase.
+            </p>
+          )}
+        </div>
+      </section>
+
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1fr 1fr" }}>
         <div className="panel">
-          <div className="eyebrow">Create Portfolio <HelpHint text="Le portefeuille est le conteneur de gouvernance: on y attache la source avec un poids et un cap USD." examples={["Crée un portefeuille client-live avant d'allouer Bitget.", "Un wallet trésorerie peut être attaché à un portefeuille treasury séparé."]} /></div>
+          <div className="eyebrow">Create Portfolio <HelpHint text="Le portefeuille sert à ranger la source dans le bon cadre, avec un poids et une limite en dollars." examples={["Crée d'abord le portefeuille du client, puis rattache la source.", "Une réserve peut vivre dans un portefeuille séparé du capital actif."]} /></div>
           <div className="form-grid" style={{ marginTop: 12 }}>
             <input value={createPortfolioId} onChange={(event) => setCreatePortfolioId(event.target.value)} placeholder="portfolio_id" />
             <input value={createPortfolioClientId} onChange={(event) => setCreatePortfolioClientId(event.target.value)} placeholder="client_id" />
@@ -1879,7 +2308,7 @@ export default function LiveCapitalPage() {
         </div>
 
         <div className="panel" data-testid="live-capital-allocation-desk">
-          <div className="eyebrow">Allouer une source connectée <HelpHint text="Ici tu fais le passage source connectée vers capital gouverné. Le desk doit déjà distinguer l'origine du capital et le montant réellement vérifié." examples={["Sélectionne Bitget, appelle le compte pour voir le total, puis pose un cap USD inférieur au total vérifié.", "Pour un wallet de réserve, utilise souvent read + cap prudent avant promotion d'agent."]} /></div>
+          <div className="eyebrow">Allouer une source connectée <HelpHint text="C'est ici que la source passe d'un simple branchement à un capital vraiment encadré." examples={["Vérifie d'abord le montant réel, puis fixe une limite inférieure ou égale à ce qui a été confirmé.", "Pour une réserve, commence avec une limite prudente."]} /></div>
           <div className="form-grid" style={{ marginTop: 12 }}>
             <select value={selectedSource?.key || ""} onChange={(event) => setSelectedSourceKey(event.target.value)}>
               <option value="">Choisir une source</option>
@@ -1905,6 +2334,11 @@ export default function LiveCapitalPage() {
                 Canoniser pour allocation
               </button>
             ) : null}
+            {selectedSource?.canonical_account_id ? (
+              <button type="button" onClick={() => deleteCanonicalAccount(selectedSource.canonical_account_id || selectedSource.account_id)} disabled={busy}>
+                Supprimer le compte canonique
+              </button>
+            ) : null}
           </div>
           <div className="panel" style={{ marginTop: 12, borderRadius: 12 }}>
             <div className="row"><span>Source</span><span>{selectedSource ? `${selectedSource.display_name} · ${selectedSource.source_type}` : "-"}</span></div>
@@ -1922,7 +2356,7 @@ export default function LiveCapitalPage() {
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1fr 1fr" }}>
         <div className="panel">
-          <div className="eyebrow">Verification plateforme et fonds <HelpHint text="Ce bloc sert à appeler le compte, remonter les balances/positions disponibles et afficher le total avant allocation." examples={["Sur un exchange lié, clique d'abord ici avant de poser un cap USD.", "Si aucun total ne remonte, le connecteur est lié mais l'adaptateur n'a pas encore synchronisé les balances."]} /></div>
+          <div className="eyebrow">Verification plateforme et fonds <HelpHint text="Ce bloc lit le compte pour afficher ce qui est vraiment visible: montants, positions et total confirmé." examples={["Avant d'allouer, commence toujours par cette vérification.", "Si aucun total ne remonte, la source est branchée mais pas encore bien lue par le système."]} /></div>
           <div className="form-grid" style={{ marginTop: 12 }}>
             <button type="button" onClick={() => verifySelectedSource()} disabled={verifying || !selectedSource}>
               {verifying ? "Verification..." : "Appeler et vérifier le compte"}
@@ -1954,6 +2388,18 @@ export default function LiveCapitalPage() {
               ))}
               <div className="row"><span>Balances</span><span>{Array.isArray(verification.balances) ? `${(verification.balances as unknown[]).length} ligne(s)` : String(verification.note || "-")}</span></div>
               <div className="row"><span>Positions</span><span>{verificationPositions.length > 0 ? `${verificationPositions.length} ligne(s)` : "-"}</span></div>
+              {verificationOpenOrders.length > 0 ? (
+                <div className="row" style={{ color: "#f5a623" }}>
+                  <span>Ordres en attente</span>
+                  <span>
+                    {verificationOpenOrders.map((o, i) => (
+                      <span key={i} style={{ display: "block", fontSize: 11 }}>
+                        {String(o.side || "")} {String(o.quantity || "")} {String(o.symbol || "")} @ {typeof o.price === "number" ? o.price.toLocaleString("fr-FR") : String(o.price || "")} USDT
+                      </span>
+                    ))}
+                  </span>
+                </div>
+              ) : null}
               <div className="row"><span>Portfolio links</span><span>{Array.isArray(verification.portfolio_links) ? `${(verification.portfolio_links as unknown[]).length}` : "-"}</span></div>
               <div className="row"><span>Lecture spot / futures</span><span>{spotFuturesReadMessage}</span></div>
               {Array.isArray(verification.latest_portfolio_snapshots) ? (
@@ -1982,7 +2428,7 @@ export default function LiveCapitalPage() {
         </div>
 
         <div className="panel">
-          <div className="eyebrow">Agent Strategy Readiness <HelpHint text="La stratégie ne doit être promue en live qu'après vérification de la source, cap USD posé et portefeuille cohérent." examples={["Un agent peut proposer la promotion, mais l'opérateur doit confronter la proposition au capital réellement vérifié.", "Si le total du compte est 10k USD, évite un cap d'allocation supérieur ou une promotion trop agressive."]} /></div>
+          <div className="eyebrow">Agent Strategy Readiness <HelpHint text="Une stratégie ne doit passer sur du vrai capital que si la source est claire, vérifiée et bien limitée." examples={["L'agent peut proposer, mais c'est à l'opérateur de valider le passage.", "Si le compte montre 10k USD, évite une limite plus haute que le montant confirmé."]} /></div>
           <div className="form-grid" style={{ marginTop: 12 }}>
             <input value={strategyId} onChange={(event) => setStrategyId(event.target.value)} placeholder="strategy_id" />
             <input value={strategyName} onChange={(event) => setStrategyName(event.target.value)} placeholder="strategy name" />
@@ -2019,7 +2465,7 @@ export default function LiveCapitalPage() {
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1fr 1fr" }}>
         <div className="panel">
-          <div className="eyebrow">Capital Verified <HelpHint text="Badge de coherence des poches: vert si la lecture est coherente, orange si revue operateur requise, rouge si l'API ou les poches divergent." examples={["Vert si Spot/Fund/Futures reconstituent correctement le total.", "Orange si l'API remonte un total partiel ou une note d'anomalie.", "Rouge si le total et les poches divergent materialement."]} /></div>
+          <div className="eyebrow">Capital Verified <HelpHint text="Ce badge dit si la lecture du capital est fiable ou si un humain doit relire la situation." examples={["Vert si les différentes poches retombent bien sur le total attendu.", "Orange si quelque chose semble incomplet.", "Rouge si les montants se contredisent vraiment."]} /></div>
           <div className={`live-capital-badge ${capitalBadge.tone}`}>{capitalBadge.label}</div>
           <div className="row" style={{ marginTop: 12 }}><span>Detail</span><span>{capitalBadge.detail}</span></div>
           <div className="row"><span>Valeur plateforme équivalente</span><span>{verificationCashVsEquivalent ? formatUsd(toNumber(verificationCashVsEquivalent.total_equivalent_usd, 0)) : verificationTotalUsd != null ? formatUsd(verificationTotalUsd) : "-"}</span></div>
@@ -2048,7 +2494,7 @@ export default function LiveCapitalPage() {
         </div>
 
         <div className="panel">
-          <div className="eyebrow">Breakdown par actif <HelpHint text="Detail par poche avec valorisation, mark et variation 24h si la venue la remonte. La heatmap utilise la taille pour le poids et la couleur pour la variation." examples={["Spot: BTC, NVDAX, USDC, USDT.", "Futures: collatéral, mark et PnL si des positions existent."]} /></div>
+          <div className="eyebrow">Breakdown par actif <HelpHint text="Montre le détail de chaque poche avec les actifs, leur valeur et leur poids dans le total." examples={["Tu peux voir rapidement quels actifs dominent la source.", "La couleur aide à repérer ce qui monte ou baisse sur la période affichée."]} /></div>
           {verificationPocketSummaries.length === 0 ? <p className="subtle">Aucune poche détaillée tant que la source n'a pas encore été vérifiée.</p> : null}
           {verificationPocketSummaries.map((pocket) => (
             <div key={`asset-pocket-${pocket.key}`} className="panel" style={{ marginTop: 12, borderRadius: 12 }}>
@@ -2111,7 +2557,7 @@ export default function LiveCapitalPage() {
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1fr 1fr" }}>
         <div className="panel">
-          <div className="eyebrow">Risk Overlay Capital <HelpHint text="Overlay risque calculé sur la source: levier global, exposition par poche, concentration, distance au drawdown max, budget de risque et stress tests rapides." examples={["Un compte spot sans positions garde un levier proche de 1x.", "Une poche futures avec notionnel important fait monter le risk budget utilisé."]} /></div>
+          <div className="eyebrow">Risk Overlay Capital <HelpHint text="Ce bloc résume le niveau de risque pris par la source: taille globale, concentration et marge de sécurité restante." examples={["Un compte simple reste souvent peu levierisé.", "Si une poche grossit trop, elle fait monter le risque total."]} /></div>
           <div className="live-capital-kpi-grid">
             <div className="live-capital-kpi"><span>Leverage global</span><strong>{leverageGlobal > 0 ? `${leverageGlobal.toFixed(2)}x` : "0.00x"}</strong></div>
             <div className="live-capital-kpi"><span>Gross exposure</span><strong>{formatUsd(grossExposureUsd)}</strong></div>
@@ -2145,7 +2591,7 @@ export default function LiveCapitalPage() {
         </div>
 
         <div className="panel">
-          <div className="eyebrow">Capital Flow Engine <HelpHint text="Ledger persistant des flux observés au sync: cash in/out, transferts internes entre poches, funding fees, realized PnL et delta de réconciliation." examples={["Un transfert spot -> futures apparaît comme mouvement interne historisé, pas comme simple texte statique.", "Le funding et le realized PnL sont dérivés à partir des deltas cumulés remontés par la venue."]} /></div>
+          <div className="eyebrow">Capital Flow Engine <HelpHint text="Ici, tu vois les mouvements d'argent observés sur la source: entrées, sorties, transferts et résultat encaissé." examples={["Un déplacement entre deux poches apparaît comme un vrai mouvement suivi dans le temps.", "Les frais et le résultat réalisé sont regroupés ici pour raconter l'histoire du compte."]} /></div>
           <div className="row"><span>Entrées / sorties nettes</span><span>{verificationCapitalLedgerRows.length > 0 ? formatSignedUsd(verificationCapitalLedgerSummary.net_external_cashflow_usd) : netCapitalDeltaUsd != null ? formatSignedUsd(netCapitalDeltaUsd) : "ledger vide"}</span></div>
           <div className="row"><span>Transferts internes</span><span>{verificationCapitalLedgerRows.length > 0 ? formatUsd(verificationCapitalLedgerSummary.internal_transfer_usd) : "aucun transfert historisé"}</span></div>
           <div className="row"><span>Funding fees</span><span>{verificationCapitalLedgerRows.length > 0 ? formatSignedUsd(verificationCapitalLedgerSummary.funding_fee_usd) : fundingFeesAvailable ? formatSignedUsd(fundingFeesUsd) : "non remontées"}</span></div>
@@ -2185,7 +2631,7 @@ export default function LiveCapitalPage() {
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1fr" }}>
         <div className="panel">
-          <div className="eyebrow">Portfolio Attribution <HelpHint text="Attribution PnL/risk dérivée des lignes d'attribution existantes. Venue sert d'attribution par source, symbol par actif et strategy_id par stratégie." examples={["Venue = BingX, Bitget, broker ou autre source exécutrice.", "Le sleeve courant reste affiché, mais une vraie attribution sleeve demandera un taggage métier supplémentaire." ]} /></div>
+          <div className="eyebrow">Portfolio Attribution <HelpHint text="Ce bloc aide à comprendre d'où vient le résultat: quelle source, quelle stratégie ou quel actif a le plus compté." examples={["Tu peux voir si le résultat vient surtout d'une plateforme précise.", "Tu peux aussi repérer quelle stratégie ou quel actif pèse le plus dans le bilan."]} /></div>
           <div className="row"><span>Sleeve courant</span><span>{capitalSleeve}</span></div>
           <div className="row"><span>Portefeuille</span><span>{activePortfolioId || "non sélectionné"}</span></div>
           {portfolioAttribution.length === 0 ? <p className="subtle" style={{ marginTop: 10 }}>Aucune ligne d'attribution disponible pour ce portefeuille sur la période courante.</p> : null}
@@ -2225,7 +2671,7 @@ export default function LiveCapitalPage() {
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1fr 1fr" }}>
         <div className="panel">
-          <div className="eyebrow">Live Runbook <HelpHint text="Résumé opératoire minimal avant qu'un agent utilise du capital réel." examples={["Connexion -> vérification -> canonisation -> allocation -> promotion live.", "Si une étape manque, considère la source comme non prête pour les agents."]} /></div>
+          <div className="eyebrow">Live Runbook <HelpHint text="C'est la checklist simple avant d'autoriser un agent à toucher du vrai capital." examples={["Branchement, vérification, préparation, allocation, puis seulement après passage en live.", "S'il manque une étape, considère la source comme non prête."]} /></div>
           <div className="row"><span>1. Nature de la source</span><span>{selectedSource ? `${selectedSource.source_type} / ${selectedSource.environment}` : "Choisir une source"}</span></div>
           <div className="row"><span>2. Statut plateforme</span><span>{selectedSource?.status || "-"}</span></div>
           <div className="row"><span>3. Canonisation</span><span>{selectedSource?.canonical ? "faite" : "requise avant allocation"}</span></div>
@@ -2239,7 +2685,7 @@ export default function LiveCapitalPage() {
         </div>
 
         <div className="panel">
-          <div className="eyebrow">Allocator Readiness Matrix <HelpHint text="Matrice allocateur: ce qui manque encore avant de considérer la source comme digne d'un vrai desk hedge fund live." examples={["Un score 6/6 signifie que la source est techniquement et opérationnellement bien cadrée.", "Si le cap dépasse le capital vérifié, le score doit rester incomplet même si le compte est bien lié."]} /></div>
+          <div className="eyebrow">Allocator Readiness Matrix <HelpHint text="Cette matrice résume ce qu'il manque encore avant d'utiliser la source dans de bonnes conditions." examples={["Un score complet veut dire que la source est claire et prête.", "Si la limite dépasse l'argent confirmé, la préparation n'est pas terminée."]} /></div>
           <div className="row"><span>Score desk</span><span className={hedgeFundReadinessScore >= 5 ? "good" : hedgeFundReadinessScore >= 3 ? "warn" : "metric"}>{hedgeFundReadinessScore}/6</span></div>
           {hedgeFundChecks.map((item) => (
             <div key={item.label} className="row">
@@ -2250,7 +2696,7 @@ export default function LiveCapitalPage() {
         </div>
 
         <div className="panel">
-          <div className="eyebrow">Strategies <HelpHint text="Rappel du niveau courant des stratégies pour éviter de promouvoir un setup qui n'est pas encore prêt pour le capital réel." examples={["Une stratégie encore en shadow doit être relue avant tout vrai capital.", "Regarde toujours le niveau et le setup_type en face de la source sélectionnée."]} /></div>
+          <div className="eyebrow">Strategies <HelpHint text="Rappel du niveau des stratégies pour éviter d'envoyer trop vite du vrai capital sur un setup encore fragile." examples={["Une stratégie encore en observation mérite une relecture avant tout passage réel.", "Regarde toujours son niveau actuel avant de la promouvoir."]} /></div>
           {strategies.length === 0 ? <p className="subtle">Aucune stratégie disponible.</p> : null}
           {strategies.slice(0, 8).map((row) => (
             <div key={row.strategy_id} className="row">

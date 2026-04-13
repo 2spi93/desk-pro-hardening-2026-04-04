@@ -2,7 +2,7 @@ import { expect, test } from "@playwright/test";
 import { analyzeChartScreenshot } from "./helpers/chart";
 import { loginIfRequired } from "./helpers/terminal";
 
-const FAST_TIMEFRAMES = ["1s", "10s", "30s", "1m"] as const;
+const FAST_TIMEFRAMES = ["1s", "5s", "10s", "30s", "1m"] as const;
 
 async function captureSettledChartStats(
   page: Parameters<typeof analyzeChartScreenshot>[0],
@@ -23,7 +23,7 @@ async function captureSettledChartStats(
 }
 
 test("@chart terminal fast timeframes keep the chart visible and alive", async ({ page }, testInfo) => {
-  test.setTimeout(180_000);
+  test.setTimeout(300_000);
 
   const pageErrors: string[] = [];
   page.on("pageerror", (error) => {
@@ -55,6 +55,7 @@ test("@chart terminal fast timeframes keep the chart visible and alive", async (
     expect(stats.nonBackgroundPixels).toBeGreaterThan(1000);
     expect(stats.accentPixels).toBeGreaterThan(120);
     expect(stats.colorBuckets).toBeGreaterThan(4);
+    expect(stats.bullishPixels + stats.bearishPixels).toBeGreaterThan(120);
   }
 
   expect(pageErrors).toEqual([]);

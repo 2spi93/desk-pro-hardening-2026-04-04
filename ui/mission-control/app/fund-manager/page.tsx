@@ -4,7 +4,7 @@ import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 
 import HelpHint from "../../components/HelpHint";
-import TxtMiniGuide from "../../components/ui/TxtMiniGuide";
+import OperatorPanelGuide from "../../components/ui/OperatorPanelGuide";
 import {
   BROKER_CONNECTION_CATALOG,
   EXCHANGE_CONNECTION_CATALOG,
@@ -1061,16 +1061,19 @@ export default function FundManagerPage() {
     <main className="shell txt-page-shell">
       <section className="hero txt-page-hero-grid" style={{ gridTemplateColumns: "1.3fr 1fr" }}>
         <div className="panel txt-page-hero">
-          <div className="eyebrow">Fund Manager Desk <HelpHint text="Desk hedge fund pour piloter mandat, sleeves, IC notes, risk overlay et allocator reporting au meme endroit." examples={["Commence ici avec le mandat et la discipline, puis passe sur Sleeves pour couper ou renforcer les poches de risque.", "Avant un allocator call: ouvre Allocator pour verifier perf, drawdown, attribution et scenario analysis."]} /></div>
-          <h1 className="title" style={{ fontSize: 34 }}>Hedge Fund Manager Workspace</h1>
-          <p className="subtle">Un cockpit buy-side structure pour ecrire le mandat, cadrer le regime, piloter les sleeves, garder la memoire IC et sortir un reporting allocator credible sans quitter le desk.</p>
-          <TxtMiniGuide
+          <div className="eyebrow">Fund Manager Desk</div>
+          <h1 className="title" style={{ fontSize: 34 }}>Desk de pilotage du fonds</h1>
+          <p className="subtle txt-page-hero-copy">Un seul cockpit pour cadrer le mandat, repartir le capital, conserver les decisions importantes et lire le resultat global sans changer d'ecran.</p>
+          <OperatorPanelGuide
             title="Guide Fund Manager"
-            what="Une surface institutionnelle pour mandat, risk framework, sleeves, IC notes, allocator pack et connexions venues."
-            why="Eviter de disperser le travail entre terminal, connecteurs, incidents et reporting quand on pilote un book multi-strategie."
-            example="Le matin: valide le mandat, stress-teste le scenario geopolitique, ajuste les sleeves, puis envoie l'execution sur le hub broker/exchange/wallet adapte."
-            terms={["brokers", "allocation"]}
+            what="Un espace unique pour écrire le cadre du fonds, répartir le capital, noter les décisions et suivre le résultat."
+            why="Éviter d'ouvrir plusieurs écrans quand tu dois piloter le fonds et expliquer clairement ce qui se passe."
+            example="Le matin, relis le cadre du fonds, ajuste les grandes poches, puis vérifie si le risque et le capital réel restent cohérents."
           />
+          <div className="txt-page-guide-note">
+            <strong>Routine utile</strong>
+            1. Relis le mandat. 2. Verifie le capital reel et le drift des poches. 3. Controle drawdown, levier et concentration. 4. Seulement apres, ajuste le risque ou les allocations.
+          </div>
           <div style={{ marginTop: 12, display: "flex", flexWrap: "wrap", gap: 10 }}>
             <span className="pill">Mandate: {notes.mandateObjective.split(".")[0]}</span>
             <span className="pill">AUM {formatMoney(equityUsd)}</span>
@@ -1117,28 +1120,30 @@ export default function FundManagerPage() {
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1.15fr 0.85fr" }}>
         <div className="panel">
-          <div className="eyebrow">Capital Integration <HelpHint text="Pont entre Fund Manager et Live Capital: capital réel par sleeve, drift vs cible, cashflows, realised vs latent et mapping poches -> sleeves." examples={["Une sleeve peut être bien notée côté modèle mais sous-capitalisée côté capital réel.", "Le cash brut et la valeur plateforme équivalente doivent rester séparés pour éviter toute ambiguïté allocator."]} /></div>
+          <div className="eyebrow">Capital Integration <HelpHint text="Montre combien d'argent réel est placé dans chaque poche et si on s'éloigne du plan prévu." examples={["Une poche peut sembler bonne sur le papier mais manquer de capital réel.", "Sépare toujours l'argent disponible et la valeur totale du compte pour éviter les malentendus."]} /></div>
           {capitalIntegrationSleeves.length === 0 ? <p className="subtle" style={{ marginTop: 10 }}>Aucune intégration Live Capital active sur ce portefeuille. Attache des comptes canonisés avec `capital_sleeve` pour voir le capital réel par sleeve.</p> : null}
-          {capitalIntegrationSleeves.slice(0, 5).map((row) => (
-            <div key={String(row.sleeve || "unassigned")} className="panel" style={{ marginTop: 12, borderRadius: 14 }}>
-              <div className="row"><span>{String(row.sleeve || "unassigned")}</span><span>{formatMoney(toNumber(row.actual_equivalent_usd, 0))} eq / {formatMoney(toNumber(row.actual_raw_cash_usd, 0))} cash</span></div>
-              <div className="row"><span>Allocation réelle vs cible</span><span>{formatPct(toNumber(row.actual_allocation_pct, 0), 1)} / {formatPct(toNumber(row.target_allocation_pct, 0), 1)}</span></div>
-              <div className="row"><span>Drift</span><span>{formatPct(toNumber(row.drift_pct, 0), 1)}</span></div>
-              <div className="row"><span>PnL réalisé / latent</span><span>{formatMoney(toNumber(row.realized_pnl_usd, 0))} / {formatMoney(toNumber(row.unrealized_pnl_usd, 0))}</span></div>
-              <div className="row"><span>Cashflow net / funding</span><span>{formatMoney(toNumber(row.net_external_cashflow_usd, 0))} / {formatMoney(toNumber(row.funding_fee_usd, 0))}</span></div>
-              <div className="row"><span>Venues</span><span>{Array.isArray(row.venues) && row.venues.length > 0 ? row.venues.join(", ") : "n/a"}</span></div>
-              {Array.isArray(row.pocket_breakdown) && row.pocket_breakdown.length > 0 ? (
-                <div style={{ marginTop: 10 }}>
-                  {row.pocket_breakdown.map((pocket, index) => (
-                    <div key={`${String(row.sleeve || "sleeve")}-${String((pocket as JsonMap).pocket || index)}`} className="row">
-                      <span>{String((pocket as JsonMap).pocket || "other")}</span>
-                      <span>{formatMoney(toNumber((pocket as JsonMap).equivalent_usd, 0))} eq / {formatMoney(toNumber((pocket as JsonMap).raw_cash_usd, 0))} cash</span>
-                    </div>
-                  ))}
-                </div>
-              ) : null}
-            </div>
-          ))}
+          <div className="txt-scroll-shell">
+            {capitalIntegrationSleeves.slice(0, 5).map((row) => (
+              <div key={String(row.sleeve || "unassigned")} className="panel" style={{ borderRadius: 14 }}>
+                <div className="row"><span>{String(row.sleeve || "unassigned")}</span><span>{formatMoney(toNumber(row.actual_equivalent_usd, 0))} eq / {formatMoney(toNumber(row.actual_raw_cash_usd, 0))} cash</span></div>
+                <div className="row"><span>Allocation réelle vs cible</span><span>{formatPct(toNumber(row.actual_allocation_pct, 0), 1)} / {formatPct(toNumber(row.target_allocation_pct, 0), 1)}</span></div>
+                <div className="row"><span>Drift</span><span>{formatPct(toNumber(row.drift_pct, 0), 1)}</span></div>
+                <div className="row"><span>PnL réalisé / latent</span><span>{formatMoney(toNumber(row.realized_pnl_usd, 0))} / {formatMoney(toNumber(row.unrealized_pnl_usd, 0))}</span></div>
+                <div className="row"><span>Cashflow net / funding</span><span>{formatMoney(toNumber(row.net_external_cashflow_usd, 0))} / {formatMoney(toNumber(row.funding_fee_usd, 0))}</span></div>
+                <div className="row"><span>Venues</span><span>{Array.isArray(row.venues) && row.venues.length > 0 ? row.venues.join(", ") : "n/a"}</span></div>
+                {Array.isArray(row.pocket_breakdown) && row.pocket_breakdown.length > 0 ? (
+                  <div style={{ marginTop: 10 }}>
+                    {row.pocket_breakdown.map((pocket, index) => (
+                      <div key={`${String(row.sleeve || "sleeve")}-${String((pocket as JsonMap).pocket || index)}`} className="row">
+                        <span>{String((pocket as JsonMap).pocket || "other")}</span>
+                        <span>{formatMoney(toNumber((pocket as JsonMap).equivalent_usd, 0))} eq / {formatMoney(toNumber((pocket as JsonMap).raw_cash_usd, 0))} cash</span>
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+            ))}
+          </div>
         </div>
 
         <div className="panel">
@@ -1165,7 +1170,7 @@ export default function FundManagerPage() {
         <>
           <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1.15fr 0.85fr" }}>
             <div className="panel">
-              <div className="eyebrow">Fund Mandate & Discipline <HelpHint text="C'est la base du reporting allocator et du controle du desk." examples={["Un allocator lit d'abord l'objectif, les contraintes et le risk framework avant toute courbe de performance.", "Si le mandat est flou, le desk peut gagner de l'argent sans etre institutionnellement investissable."]} /></div>
+              <div className="eyebrow">Fund Mandate & Discipline <HelpHint text="C'est ici que tu poses les règles du fonds: but, limites et façon de prendre le risque." examples={["Si l'objectif ou les limites ne sont pas clairs, le reste de la page devient difficile à lire.", "Avant de monter le risque, vérifie que la décision reste dans le cadre prévu."]} /></div>
               <div className="grid" style={{ marginTop: 12, gridTemplateColumns: "1fr 1fr", gap: 12 }}>
                 <div>
                   <div className="subtle" style={{ marginBottom: 6 }}>Objectif du fonds</div>
@@ -1214,7 +1219,7 @@ export default function FundManagerPage() {
 
           <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1fr 1fr" }}>
             <div className="panel">
-              <div className="eyebrow">Regime Policy by Horizon <HelpHint text="Cadre clair pour separer scalping, intraday, swing, weekly et event-driven." examples={["Scalping: only when market bus, spread and venue health are clean.", "Swing and weekly: tie sizing to macro invalidation and geopolitical resilience, not microstructure alone."]} /></div>
+              <div className="eyebrow">Regime Policy by Horizon <HelpHint text="Ce bloc aide à décider quel style de prise de position convient au contexte du moment." examples={["Quand le marché devient instable, réduis les prises rapides et garde des tailles plus modestes.", "Quand le contexte est plus lisible, tu peux laisser respirer des positions plus longues."]} /></div>
               <div className="form-grid" style={{ marginTop: 12 }}>
                 <input type="number" step="0.01" value={trendScore} onChange={(event) => setTrendScore(Number(event.target.value || 0))} placeholder="trend_score" />
                 <input type="number" step="0.001" value={realizedVolatility} onChange={(event) => setRealizedVolatility(Number(event.target.value || 0))} placeholder="realized_volatility" />
@@ -1255,7 +1260,7 @@ export default function FundManagerPage() {
 
       {showSleeves ? (
         <section className="panel" style={{ marginTop: 16 }}>
-          <div className="eyebrow">Sleeves Architecture <HelpHint text="Tu peux isoler les strategies gagnantes, couper les mauvaises et allouer dynamiquement." examples={["Directional gagne mais consomme trop de mandate usage: hedge ou baisse l'allocation.", "AI sleeve gagne avec faible risk contribution: augmente-la si le risk budget le permet."]} /></div>
+          <div className="eyebrow">Sleeves Architecture <HelpHint text="Les poches servent à séparer les approches, renforcer celles qui tiennent et réduire celles qui pèsent trop." examples={["Si une poche gagne mais prend trop de risque, baisse sa taille plutôt que de l'ignorer.", "Si une autre reste stable et utile, tu peux lui donner un peu plus de place."]} /></div>
           <div className="grid" style={{ marginTop: 12, gridTemplateColumns: "repeat(2, minmax(0, 1fr))" }}>
             {sleeveIntelligence.map((sleeve) => (
               <div className="panel" key={sleeve.name} style={{ borderRadius: 16 }}>
@@ -1315,7 +1320,7 @@ export default function FundManagerPage() {
 
       {showIcNotes ? (
         <section className="panel" style={{ marginTop: 16 }}>
-          <div className="eyebrow">IC Notes / Investment Committee <HelpHint text="Memoire du fonds: hypotheses, decisions, rationale et changements de mandat." examples={["Chaque revue hebdo doit expliquer ce qui a marche, ce qui a casse et quelle decision d'allocation en decoule.", "Si le mandat change ou si le levier max baisse, ecris-le ici avant execution."]} /></div>
+          <div className="eyebrow">IC Notes / Investment Committee <HelpHint text="Cette zone garde la mémoire des décisions: ce qu'on pensait, ce qu'on a vu et ce qu'on change." examples={["Après la revue de semaine, note ce qui a aidé, ce qui a échoué et l'action retenue.", "Si une limite change, écris-la ici avant de toucher aux tailles ou au capital."]} /></div>
           <div className="grid" style={{ marginTop: 12, gridTemplateColumns: "repeat(2, minmax(0, 1fr))" }}>
             <div>
               <div className="subtle" style={{ marginBottom: 6 }}>Structured notes</div>
@@ -1378,7 +1383,7 @@ export default function FundManagerPage() {
 
       {showAllocator ? (
         <section className="panel" style={{ marginTop: 16 }}>
-          <div className="eyebrow">Allocator Reporting Blocks <HelpHint text="C'est le niveau institutionnel: performance, drawdown, volatility, exposure, liquidity et attribution lisibles en un coup d'oeil." examples={["Avant un call investisseur: verifie YTD/MTD/WTD, max DD, rolling Sharpe, liquidite et stress test.", "Si l'attribution montre une sleeve dominante, explique clairement pourquoi et quel risque residuel reste ouvert."]} /></div>
+          <div className="eyebrow">Allocator Reporting Blocks <HelpHint text="Ce bloc résume le fonds de façon lisible: résultat, baisse, exposition et origine principale de la performance." examples={["Avant un échange avec un investisseur, vérifie d'abord le résultat récent, la pire baisse et l'exposition actuelle.", "Si une seule poche explique presque tout, il faut pouvoir le dire simplement."]} /></div>
           <div className="grid" style={{ marginTop: 12, gridTemplateColumns: "repeat(4, minmax(0, 1fr))" }}>
             {allocatorReturnCards.map((metric) => (
               <div className="panel" key={metric.label} style={{ borderRadius: 14, minHeight: 110 }}>
@@ -1472,7 +1477,7 @@ export default function FundManagerPage() {
 
       {showRisk ? (
         <section className="panel" style={{ marginTop: 16 }}>
-          <div className="eyebrow">Live Risk Overlay <HelpHint text="Le fund manager doit voir en deux secondes si le fonds est en danger ou en controle." examples={["Si mandate usage explose et que la concentration grimpe, coupe vite les sleeves avant que le drawdown n'atteigne le plafond.", "Si la correlation remonte partout en meme temps, la diversification est une illusion: hedge ou baisse le risque."]} /></div>
+          <div className="eyebrow">Live Risk Overlay <HelpHint text="Ici, tu dois voir tout de suite si le fonds reste sous contrôle ou s'il faut calmer le jeu." examples={["Si une poche prend trop de place et que la baisse s'aggrave, réduis-la vite.", "Si tout se met à bouger dans le même sens, considère que la diversification protège moins qu'avant."]} /></div>
           <div className="grid" style={{ marginTop: 12, gridTemplateColumns: "repeat(3, minmax(0, 1fr))" }}>
             {liveRiskCards.map((card) => (
               <div className="panel" key={card.label} style={{ borderRadius: 14, minHeight: 112 }}>

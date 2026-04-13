@@ -160,6 +160,90 @@ export type PendingExecutionAdaptationShape = {
   };
 };
 
+export type InstitutionalHealingShape = {
+  mode: string;
+  action: string;
+  drift: string;
+  riskMultiplier: number;
+  executionEnabled: boolean;
+  dominantFailureSource: string;
+  adaptSpeedPct: number;
+  causalMemoryLabel: string;
+  reasons: string[];
+};
+
+export type InstitutionalSnapshotShape = {
+  selectedAgent: string;
+  healthScorePct: number;
+  healthState: string;
+  executionStyle: string;
+  sizeMultiplier: number;
+  memoryGraphLabel: string;
+  capitalAllocationPills: string[];
+  reasonPills: string[];
+};
+
+export type ExecutionWarfareShape = {
+  mode: string;
+  venue: string;
+  slices: number;
+  delayMs: number;
+  sliceNotionalUsd: number;
+  executionScorePct: number;
+  guardAction: string;
+  latencyEdgeMs: number;
+  hiddenLiquidityPct: number;
+  spoofProbabilityPct: number;
+  sweepRiskPct: number;
+  trapState: string;
+  adversarialState: string;
+  reasons: string[];
+};
+
+export type BrokerAwareSchedulerShape = {
+  mode: string;
+  action: string;
+  venue: string;
+  provider: string;
+  childCount: number;
+  activeChildState: string;
+  averageFillRatioPct: number;
+  partialFillRatioPct: number;
+  replaceBudget: number;
+  supportsModify: boolean;
+  supportsCancelReplace: boolean;
+  replaceStrategy: string;
+  resliceCount: number;
+  scheduleScorePct: number;
+  reasons: string[];
+};
+
+export type StabilityEngineShape = {
+  mode: string;
+  monitorScorePct: number;
+  driftWatchdog: string;
+  shadowFallbackRatePct: number;
+  timeoutRatePct: number;
+  dnsTransientRatePct: number;
+  degradedUsageRatioPct: number;
+  externalKillSwitchActive: boolean;
+  comparatorLabel: string;
+  shouldBlockExecution: boolean;
+  reasons: string[];
+  alerts: string[];
+};
+
+export type StrategyEvolutionShape = {
+  evolutionMode: string;
+  capitalMode: string;
+  selectedStrategy: string;
+  allocationShiftPct: number;
+  learningBiasPct: number;
+  preservePipeline: boolean;
+  allocationPills: string[];
+  reasons: string[];
+};
+
 export type ChartOrderTicketShape = {
   side: "buy" | "sell";
   preset: ChartOrderPreset;
@@ -268,6 +352,12 @@ export type ChartHudSignalDecisionPanelProps = {
   brainAttributionHeadline: string;
   brainAttributionPills: string[];
   brainLearningRatePills: string[];
+  institutionalHealing: InstitutionalHealingShape;
+  institutionalSnapshot: InstitutionalSnapshotShape;
+  executionWarfare: ExecutionWarfareShape;
+  brokerAwareScheduler: BrokerAwareSchedulerShape;
+  stabilityEngine: StabilityEngineShape;
+  strategyEvolution: StrategyEvolutionShape;
   executionAdaptMode: ExecutionAdaptMode;
   onSetExecutionAdaptMode: (mode: ExecutionAdaptMode) => void;
   pendingExecutionAdaptation: PendingExecutionAdaptationShape | null;
@@ -311,4 +401,42 @@ export type ChartHudOrderRiskPanelProps = {
   onSubmitChartOrder: () => void;
   mergedChartSendHistory: ChartSendHistoryEntryShape[];
   formatClock: (value: string) => string;
+};
+
+export type SmartDecisionHudTone = "good" | "subtle" | "warn";
+export type SmartDecisionHudConfidenceBand = "LOW" | "MEDIUM" | "HIGH";
+
+export type SmartDecisionHudStabilityShape = {
+  currentStateLabel: string;
+  lastStableStateLabel: string;
+  stabilityScorePct: number;
+  persistenceMs: number;
+  persistenceLabel: string;
+  flipCount: number;
+  isStable: boolean;
+  confidenceBand: SmartDecisionHudConfidenceBand;
+  statusLabel: string;
+};
+
+export type SmartDecisionHudShape = {
+  state: "NO_TRADE" | "WAIT_CONFIRMATION" | "FAKE_BREAKOUT_RISK" | "ENTRY_VALID";
+  stateLabel: string;
+  displayStateLabel: string;
+  tone: SmartDecisionHudTone;
+  confidencePct: number;
+  confidenceBand: SmartDecisionHudConfidenceBand;
+  headline: string;
+  reason: string;
+  regimeLabel: string;
+  structureLabel: string;
+  liquidityLabel: string;
+  qualityGate: "pass" | "warn" | "fail";
+  qualityGateLabel: string;
+  triggerSide: "long" | "short" | "neutral";
+  triggerLabel: string;
+  invalidationLabel: string;
+  latencyLabel: string;
+  compactLabel: string;
+  assistantSummary: string;
+  stability: SmartDecisionHudStabilityShape;
 };

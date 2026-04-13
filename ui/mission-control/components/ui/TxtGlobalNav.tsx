@@ -11,6 +11,7 @@ const INTERNAL_NAV_ITEMS = [
   { href: "/", label: "Dashboard" },
   { href: "/fund-manager", label: "Fund Manager" },
   { href: "/live-capital", label: "Live Capital" },
+  { href: "/live-ops", label: "Live Ops" },
   { href: "/terminal", label: "Terminal" },
   { href: "/live-readiness", label: "Readiness" },
   { href: "/advanced/reality-gap", label: "Reality Gap" },
@@ -30,6 +31,13 @@ const CLIENT_NAV_ITEMS = [
   { href: "/learn", label: "Learn" },
 ];
 
+function navTargetIdFromHref(href: string): string {
+  if (href === "/") {
+    return "txt-global-nav-link-home";
+  }
+  return `txt-global-nav-link-${href.replace(/^\//, "").replace(/\//g, "-")}`;
+}
+
 export default function TxtGlobalNav({ roleGroup = "unknown" }: { roleGroup?: RoleGroup }) {
   const pathname = usePathname();
   const [uiMode, setUiMode] = useUiMode();
@@ -44,7 +52,7 @@ export default function TxtGlobalNav({ roleGroup = "unknown" }: { roleGroup?: Ro
   const navItems = roleGroup === "client" ? CLIENT_NAV_ITEMS : INTERNAL_NAV_ITEMS;
 
   return (
-    <header className="txt-global-nav" role="banner">
+    <header id="txt-global-nav" className="txt-global-nav" role="banner">
       <div className="txt-global-brand-wrap">
         <div className="txt-global-brand">TXT</div>
         <div className="txt-global-subbrand">Trader eXelle Terminal</div>
@@ -53,11 +61,20 @@ export default function TxtGlobalNav({ roleGroup = "unknown" }: { roleGroup?: Ro
         {navItems.map((item) => {
           const active = pathname === item.href;
           return (
-            <Link key={item.href} href={item.href} className={`txt-global-link${active ? " active" : ""}`}>
+            <Link key={item.href} id={navTargetIdFromHref(item.href)} href={item.href} className={`txt-global-link${active ? " active" : ""}`}>
               {item.label}
             </Link>
           );
         })}
+        <button
+          type="button"
+          className="txt-global-link txt-global-link-button"
+          onClick={() => {
+            window.dispatchEvent(new Event("txt-global-walkthrough-start"));
+          }}
+        >
+          Walkthrough
+        </button>
       </nav>
       <div className="txt-global-mode" role="tablist" aria-label="Global display mode">
         <button type="button" className={`txt-global-mode-btn${uiMode === "novice" ? " active" : ""}`} onClick={() => setUiMode("novice")}>

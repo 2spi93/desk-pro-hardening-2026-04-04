@@ -4,13 +4,14 @@ import Link from "next/link";
 import { useEffect, useState } from "react";
 
 import HelpHint from "../../components/HelpHint";
-import TxtMiniGuide from "../../components/ui/TxtMiniGuide";
+import OperatorPanelGuide from "../../components/ui/OperatorPanelGuide";
 import {
   BROKER_CONNECTION_CATALOG,
   EXCHANGE_CONNECTION_CATALOG,
   WALLET_CONNECTION_CATALOG,
   type ConnectionProviderType,
 } from "../../lib/connectionCatalog";
+import { getConnectorHealthView } from "../../lib/connectorHealth";
 
 type JsonMap = Record<string, unknown>;
 
@@ -50,6 +51,11 @@ function formatBps(value: unknown): string {
 function formatMaybeInt(value: unknown, suffix = ""): string {
   const amount = Number(value);
   return Number.isFinite(amount) ? `${Math.round(amount)}${suffix}` : "n/a";
+}
+
+function formatCapabilityLabel(value: unknown): string {
+  const label = String(value || "").trim();
+  return label ? label.replace(/_/g, " ").toUpperCase() : "N/A";
 }
 
 function toneClass(value: string): string {
@@ -473,8 +479,54 @@ export default function ConnectorsPage() {
     return Number(capitalSummary.account_count || 0) > 0 || Number(incidentSummary.active_count || 0) > 0 || Boolean(item.healthy);
   });
   const connectorCapitalRows = connectorDeskRows.filter((item) => Number(asMap(item.capital_summary).account_count || 0) > 0);
-  const connectorIncidentRows = connectorDeskRows.filter((item) => Number(asMap(item.incident_summary).active_count || 0) > 0 || String(asMap(item.degradation_engine).state || "") !== "ok");
+  const connectorIncidentRows = connectorDeskRows.filter((item) => Number(asMap(item.incident_summary).active_count || 0) > 0 || getConnectorHealthView(item).action !== "ok");
   const canonicalByAccount = new Map(canonicalAccounts.map((item) => [String(item.account_id || ""), item]));
+  const brokerCapabilityRows = linkedConnectorAccounts.map((account) => {
+    const permissionsView = asMap(account.permissions_view);
+    const permissionFlags = asMap(permissionsView.permissions);
+    const brokerCapabilities = asMap(account.broker_capabilities);
+    const accountKey = String(account.account_id || account.reference || "n/a");
+    const canonical = canonicalByAccount.get(accountKey);
+    return {
+      accountId: accountKey,
+      provider: String(account.provider || brokerCapabilities.provider || "unknown"),
+      preferredVenue: String(brokerCapabilities.preferred_venue || account.provider || "n/a"),
+      replaceStrategy: String(brokerCapabilities.replace_strategy || "reslice_only"),
+      supportsModify: Boolean(brokerCapabilities.supports_modify),
+      supportsCancelReplace: Boolean(brokerCapabilities.supports_cancel_replace),
+      supportsLiveCancel: Boolean(brokerCapabilities.supports_live_cancel),
+      capabilitySource: String(brokerCapabilities.capability_source || "unknown"),
+      canTrade: Boolean(permissionFlags.trade),
+      authMethod: String(account.auth_method || "manual"),
+      clientId: String(canonical?.client_id || account.client_id || "-"),
+      portfolioId: String(canonical?.portfolio_id || account.portfolio_id || "-"),
+      mode: String(canonical?.mode || account.mode || "n/a"),
+    };
+  }).sort((left, right) => {
+    if (left.supportsCancelReplace !== right.supportsCancelReplace) {
+      return Number(right.supportsCancelReplace) - Number(left.supportsCancelReplace);
+    }
+    if (left.supportsModify !== right.supportsModify) {
+      return Number(right.supportsModify) - Number(left.supportsModify);
+    }
+    return `${left.provider}:${left.accountId}`.localeCompare(`${right.provider}:${right.accountId}`);
+  });
+  const brokerCapabilitySummary = brokerCapabilityRows.reduce((summary, item) => {
+    summary.totalAccounts += 1;
+    summary.tradableAccounts += Number(item.canTrade);
+    summary.cancelReplaceAccounts += Number(item.supportsCancelReplace);
+    summary.modifyAccounts += Number(item.supportsModify);
+    summary.liveCancelAccounts += Number(item.supportsLiveCancel);
+    summary.resliceOnlyAccounts += Number(item.replaceStrategy === "reslice_only");
+    return summary;
+  }, {
+    totalAccounts: 0,
+    tradableAccounts: 0,
+    cancelReplaceAccounts: 0,
+    modifyAccounts: 0,
+    liveCancelAccounts: 0,
+    resliceOnlyAccounts: 0,
+  });
   const clientPortfolioSummaries = Array.from(
     canonicalAccounts.reduce((map, item) => {
       const clientKey = String(item.client_id || "unknown-client");
@@ -500,21 +552,25 @@ export default function ConnectorsPage() {
   ).sort((left, right) => right[1].equity_usd - left[1].equity_usd).map((entry) => entry[1]);
 
   return (
-    <main className="shell txt-page-shell">
+    <main className="shell txt-page-shell" data-testid="mission-control-connectors-page">
       <section className="hero txt-page-hero-grid" style={{ gridTemplateColumns: "1.4fr 1fr" }}>
-        <div className="panel txt-page-hero">
-          <div className="eyebrow">Horizon Quantique <HelpHint text="Supervision des connecteurs execution/recherche avec flux temps reel." examples={["Exemple simple: connecte un compte MT5, envoie un ordre filtre, puis surveille les alertes en dessous.", "Si tu veux agir vite, ouvre aussi le Trading Terminal pour une vue plus centralisee."]} /></div>
-          <h1 className="title" style={{ fontSize: 34 }}>Connecteurs Trading Augmentes</h1>
-          <p className="subtle">
-            MWC pilote les regimes, filtre les ordres et orchestre crypto, MT5 et prediction markets.
+        <div id="global-guide-connectors-hero" className="panel txt-page-hero">
+          <div className="eyebrow">Horizon Quantique</div>
+          <h1 className="title" style={{ fontSize: 34 }}>Connecteurs trading augmentes</h1>
+          <p className="subtle txt-page-hero-copy">
+            Cette page dit si l'infrastructure d'execution tient vraiment: connecteurs sains, comptes visibles, capacites d'ordre et plans de secours par venue.
           </p>
-          <TxtMiniGuide
+          <OperatorPanelGuide
             title="Guide Connecteurs"
             what="Etat temps reel des ponts broker, execution et flux de marche."
             why="Eviter d'envoyer des ordres quand l'infrastructure est degradee."
             example="Si MT5 status n'est pas healthy et qu'une alerte critique apparait, stoppe les executions live."
             terms={["spread", "slippage", "latency"]}
           />
+          <div className="txt-page-guide-note">
+            <strong>Lecture rapide</strong>
+            1. Verifie que le bridge et les connecteurs sont sains. 2. Controle les comptes et les droits. 3. Confirme le chemin de modification d'ordre. 4. Seulement ensuite, laisse le desk executer.
+          </div>
           <p>
             <Link href="/">Retour dashboard</Link> | <Link href="/ai">Ecran IA</Link>
             {" | "}
@@ -555,28 +611,70 @@ export default function ConnectorsPage() {
       <section className="grid" style={{ gridTemplateColumns: "1fr 1fr" }}>
         <div className="panel">
           <div className="eyebrow">Connecteurs Live <HelpHint text="Disponibilite instantanee des integrations critiques." examples={["Chaque ligne doit etre healthy=true avant une vraie session de trading.", "Si un connecteur devient false, considere l'environnement comme degrade jusqu'a verification."]} /></div>
-          {connectors.map((item) => (
-            <div className="row" key={String(item.name)}>
-              <span>{String(item.name)} ({String(item.transport)}) | REST {formatMs(item.rest_latency_ms)} | WS {formatMs(item.websocket_latency_ms)}</span>
-              <span className={item.healthy ? "good" : "warn"}>{String(asMap(item.degradation_engine).state || item.healthy)}</span>
-            </div>
-          ))}
+          <div className="txt-scroll-shell">
+            {connectors.map((item) => {
+              const badge = getConnectorHealthView(item);
+              return (
+                <div className="row" key={String(item.name)}>
+                  <span>{String(item.name)} ({String(item.transport)}) | REST {formatMs(item.rest_latency_ms)} | WS {formatMs(item.websocket_latency_ms)}</span>
+                  <span className="connector-health-stack">
+                    <span className={badge.badgeClassName}>{badge.label}</span>
+                    <span className={badge.noteClassName}>{badge.message}</span>
+                  </span>
+                </div>
+              );
+            })}
+          </div>
         </div>
 
         <div className="panel">
           <div className="eyebrow">Comptes MT5 <HelpHint text="Inventaire des comptes raccordes et leur mode paper/live." examples={["Cherche ici ton compte demo pour verifier qu'il est bien en paper avant un test.", "Ne bascule pas en live sans voir clairement le mode et le status attendus."]} /></div>
           {mt5Accounts.length === 0 ? <p className="subtle">Aucun compte connecte.</p> : null}
-          {mt5Accounts.map((item) => (
-            <div className="row" key={String(item.account_id)}>
-              <span>
-                {String(item.account_id)} | {String(item.server)}
-                {canonicalByAccount.get(String(item.account_id))
-                  ? ` | client ${String(canonicalByAccount.get(String(item.account_id))?.client_id || "-")} | equity ${Number(canonicalByAccount.get(String(item.account_id))?.latest_equity_usd || 0).toFixed(0)} USD | pos ${Number(canonicalByAccount.get(String(item.account_id))?.open_positions || 0)}`
-                  : " | sync pending"}
-              </span>
-              <span>{String(item.mode)} / {String(item.status)}</span>
-            </div>
-          ))}
+          <div className="txt-scroll-shell">
+            {mt5Accounts.map((item) => (
+              <div className="row" key={String(item.account_id)}>
+                <span>
+                  {String(item.account_id)} | {String(item.server)}
+                  {canonicalByAccount.get(String(item.account_id))
+                    ? ` | client ${String(canonicalByAccount.get(String(item.account_id))?.client_id || "-")} | equity ${Number(canonicalByAccount.get(String(item.account_id))?.latest_equity_usd || 0).toFixed(0)} USD | pos ${Number(canonicalByAccount.get(String(item.account_id))?.open_positions || 0)}`
+                    : " | sync pending"}
+                </span>
+                <span>{String(item.mode)} / {String(item.status)}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      </section>
+
+      <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "0.85fr 1.15fr" }}>
+        <div className="panel">
+          <div className="eyebrow">Capacites d'execution par compte <HelpHint text="Vue operateur dediee pour voir quel compte peut vraiment executer un cancel/replace natif et quel compte reste en reslice." examples={["Si un compte affiche CANCEL REPLACE=true et MODIFY=false, le scheduler doit rester sur cancel_replace et non sur amend natif.", "Si un compte est trade=false, traite ses capacites comme purement informatives tant qu'il n'est pas habilite execution."]} /></div>
+          <div className="row"><span>Comptes lies</span><span>{String(brokerCapabilitySummary.totalAccounts)}</span></div>
+          <div className="row"><span>Comptes trade enabled</span><span>{String(brokerCapabilitySummary.tradableAccounts)}</span></div>
+          <div className="row"><span>Cancel/replace natif</span><span className={brokerCapabilitySummary.cancelReplaceAccounts > 0 ? "good" : "subtle"}>{String(brokerCapabilitySummary.cancelReplaceAccounts)}</span></div>
+          <div className="row"><span>Modify natif</span><span className={brokerCapabilitySummary.modifyAccounts > 0 ? "good" : "subtle"}>{String(brokerCapabilitySummary.modifyAccounts)}</span></div>
+          <div className="row"><span>Live cancel disponible</span><span>{String(brokerCapabilitySummary.liveCancelAccounts)}</span></div>
+          <div className="row"><span>Fallback reslice only</span><span>{String(brokerCapabilitySummary.resliceOnlyAccounts)}</span></div>
+          <p className="subtle" style={{ marginTop: 10 }}>
+            Aucun amend broker natif n'est confirme dans la stack actuelle. La strategie MODIFY reste volontairement inactive tant qu'une vraie route backend broker n'existe pas.
+          </p>
+        </div>
+
+        <div className="panel">
+          <div className="eyebrow">Chemin de modification par compte <HelpHint text="Lecture directe du chemin de remplacement expose par le control-plane pour chaque compte lie." examples={["Un compte BingX doit aujourd'hui montrer replace strategy = CANCEL REPLACE et modify = false.", "Si un futur broker confirme amend natif, cette matrice devra montrer MODIFY avant tout basculement du scheduler."]} /></div>
+          {brokerCapabilityRows.length === 0 ? <p className="subtle">Aucun compte lie avec broker_capabilities.</p> : null}
+          <div className="txt-scroll-shell">
+            {brokerCapabilityRows.map((item) => (
+              <div className="panel" key={`broker-capability-${item.provider}-${item.accountId}`} style={{ borderRadius: 12 }}>
+                <div className="row"><span>{item.provider} | {item.accountId}</span><span>{item.canTrade ? "trade enabled" : "read only"}</span></div>
+                <div className="row"><span>Replace strategy</span><span>{formatCapabilityLabel(item.replaceStrategy)}</span></div>
+                <div className="row"><span>Capabilities</span><span><span className={item.supportsCancelReplace ? "good" : "subtle"}>cancel_replace={String(item.supportsCancelReplace)}</span> | <span className={item.supportsModify ? "good" : "subtle"}>modify={String(item.supportsModify)}</span> | <span className={item.supportsLiveCancel ? "good" : "subtle"}>live_cancel={String(item.supportsLiveCancel)}</span></span></div>
+                <div className="row"><span>Venue / auth</span><span>{item.preferredVenue} | {item.authMethod}</span></div>
+                <div className="row"><span>Client / portfolio</span><span>{item.clientId} | {item.portfolioId}</span></div>
+                <div className="row"><span>Mode / source</span><span>{item.mode} | {item.capabilitySource}</span></div>
+              </div>
+            ))}
+          </div>
         </div>
       </section>
 
@@ -585,10 +683,17 @@ export default function ConnectorsPage() {
           const feedQuality = asMap(item.feed_quality);
           const incidentSummary = asMap(item.incident_summary);
           const degradation = asMap(item.degradation_engine);
+          const badge = getConnectorHealthView(item);
           return (
             <div className="panel" key={`quality-${String(item.name)}`}>
               <div className="eyebrow">Health & Latency | {String(item.name)}</div>
+              <div style={{ marginBottom: 12 }}>
+                <span className={badge.badgeClassName}>{badge.label}</span>
+                <div className={badge.noteClassName} style={{ marginTop: 8 }}>{badge.message}</div>
+              </div>
               <div className="row"><span>Etat engine</span><span className={toneClass(String(degradation.state || "watch"))}>{String(degradation.state || "watch")}</span></div>
+              <div className="row"><span>Health score</span><span>{badge.scoreText}</span></div>
+              <div className="row"><span>Action</span><span>{String(degradation.health_action || badge.action)}</span></div>
               <div className="row"><span>Latence REST</span><span>{formatMs(item.rest_latency_ms)}</span></div>
               <div className="row"><span>Latence WebSocket</span><span>{formatMs(item.websocket_latency_ms)}</span></div>
               <div className="row"><span>Taux d'erreur 24h</span><span>{formatPct(item.error_rate_pct, 2)}</span></div>
@@ -610,44 +715,52 @@ export default function ConnectorsPage() {
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1.1fr 1fr" }}>
         <div className="panel">
-          <div className="eyebrow">Permissions & Scopes par connecteur <HelpHint text="Granularite des droits, scopes et contraintes de signature par compte lie." examples={["Vrifie qu'un compte exchange n'a pas withdraw=true si son role est uniquement execution.", "Pour les wallets, la policy doit montrer hardware, MPC ou signer externe, jamais une cle privee en clair."]} /></div>
+          <div className="eyebrow">Droits par connecteur <HelpHint text="Granularite des droits, scopes et contraintes de signature par compte lie." examples={["Vrifie qu'un compte exchange n'a pas withdraw=true si son role est uniquement execution.", "Pour les wallets, la policy doit montrer hardware, MPC ou signer externe, jamais une cle privee en clair."]} /></div>
           {linkedConnectorAccounts.length === 0 ? <p className="subtle">Aucun compte lie.</p> : null}
-          {linkedConnectorAccounts.map((account) => {
-            const permissionsView = asMap(account.permissions_view);
-            const permissionFlags = asMap(permissionsView.permissions);
-            const rateLimits = asMap(permissionsView.rate_limits);
-            return (
-              <div className="panel" key={`perm-${String(account.provider)}-${String(account.account_id)}`} style={{ marginTop: 12, borderRadius: 12 }}>
-                <div className="row"><span>{String(account.provider)} | {String(account.account_id)}</span><span>{String(account.auth_method || "manual")}</span></div>
-                <div className="row"><span>Permissions</span><span>read={String(Boolean(permissionFlags.read))} | trade={String(Boolean(permissionFlags.trade))} | withdraw={String(Boolean(permissionFlags.withdraw))} | sign={String(Boolean(permissionFlags.sign))}</span></div>
-                <div className="row"><span>Scopes actifs</span><span>{String((permissionsView.scopes as string[] | undefined)?.join(", ") || "n/a")}</span></div>
-                <div className="row"><span>Rate-limit</span><span>{Object.entries(rateLimits).map(([key, value]) => `${key}:${String(value)}`).join(" | ") || "n/a"}</span></div>
-                <div className="row"><span>Sub-comptes</span><span>{((permissionsView.subaccount_restrictions as string[] | undefined) || []).join(", ") || "n/a"}</span></div>
-                <div className="row"><span>Whitelists</span><span>{((permissionsView.withdraw_whitelist as string[] | undefined) || []).join(", ") || "n/a"}</span></div>
-                <div className="row"><span>Signature policy</span><span>{String(permissionsView.signature_policy || "unknown")}</span></div>
-              </div>
-            );
-          })}
+          <div className="txt-scroll-shell">
+            {linkedConnectorAccounts.map((account) => {
+              const permissionsView = asMap(account.permissions_view);
+              const permissionFlags = asMap(permissionsView.permissions);
+              const rateLimits = asMap(permissionsView.rate_limits);
+              return (
+                <div className="panel" key={`perm-${String(account.provider)}-${String(account.account_id)}`} style={{ borderRadius: 12 }}>
+                  <div className="row"><span>{String(account.provider)} | {String(account.account_id)}</span><span>{String(account.auth_method || "manual")}</span></div>
+                  <div className="row"><span>Permissions</span><span>read={String(Boolean(permissionFlags.read))} | trade={String(Boolean(permissionFlags.trade))} | withdraw={String(Boolean(permissionFlags.withdraw))} | sign={String(Boolean(permissionFlags.sign))}</span></div>
+                  <div className="row"><span>Scopes actifs</span><span>{String((permissionsView.scopes as string[] | undefined)?.join(", ") || "n/a")}</span></div>
+                  <div className="row"><span>Rate-limit</span><span>{Object.entries(rateLimits).map(([key, value]) => `${key}:${String(value)}`).join(" | ") || "n/a"}</span></div>
+                  <div className="row"><span>Sub-comptes</span><span>{((permissionsView.subaccount_restrictions as string[] | undefined) || []).join(", ") || "n/a"}</span></div>
+                  <div className="row"><span>Whitelists</span><span>{((permissionsView.withdraw_whitelist as string[] | undefined) || []).join(", ") || "n/a"}</span></div>
+                  <div className="row"><span>Signature policy</span><span>{String(permissionsView.signature_policy || "unknown")}</span></div>
+                </div>
+              );
+            })}
+          </div>
         </div>
 
         <div className="panel">
-          <div className="eyebrow">Connector Degradation Engine <HelpHint text="Diagnostic et plan d'auto-downgrade par venue." examples={["Si WS drop ou feed degraded, la chaine doit montrer WS -> REST -> stale cache.", "Si l'etat devient critical, le live doit passer read-only et proposer un reroute venue."]} /></div>
+          <div className="eyebrow">Plan de secours par connecteur <HelpHint text="Diagnostic et plan d'auto-downgrade par venue." examples={["Si WS drop ou feed degraded, la chaine doit montrer WS -> REST -> stale cache.", "Si l'etat devient critical, le live doit passer read-only et proposer un reroute venue."]} /></div>
           {connectorIncidentRows.length === 0 ? <p className="subtle">Aucune degradation active.</p> : null}
-          {connectorIncidentRows.map((item) => {
-            const incidentSummary = asMap(item.incident_summary);
-            const degradation = asMap(item.degradation_engine);
-            return (
-              <div className="panel" key={`degrade-${String(item.name)}`} style={{ marginTop: 12, borderRadius: 12 }}>
-                <div className="row"><span>{String(item.name)}</span><span className={toneClass(String(degradation.state || "watch"))}>{String(degradation.state || "watch")}</span></div>
-                <div className="row"><span>Diagnostic</span><span>{String(degradation.diagnostic || incidentSummary.top_diagnostic || "nominal")}</span></div>
-                <div className="row"><span>Path</span><span>{((degradation.auto_downgrade_path as string[] | undefined) || []).join(" -> ") || "n/a"}</span></div>
-                <div className="row"><span>Auto-disable</span><span>{String(Boolean(degradation.auto_disable_live))}</span></div>
-                <div className="row"><span>Auto-reroute</span><span>{String(degradation.auto_reroute_target || "n/a")}</span></div>
-                <div className="row"><span>Incidents</span><span>actifs {formatMaybeInt(incidentSummary.active_count)} | critiques {formatMaybeInt(incidentSummary.critical_count)} | throttling {formatMaybeInt(incidentSummary.throttling_count)}</span></div>
-                <div className="row"><span>Historique</span><span>{asList(incidentSummary.history).map((entry) => `${String(entry.severity)}:${String(entry.title)}`).join(" | ") || "n/a"}</span></div>
-              </div>
-            );
-          })}
+          <div className="txt-scroll-shell">
+            {connectorIncidentRows.map((item) => {
+              const incidentSummary = asMap(item.incident_summary);
+              const degradation = asMap(item.degradation_engine);
+              const badge = getConnectorHealthView(item);
+              return (
+                <div className="panel" key={`degrade-${String(item.name)}`} style={{ borderRadius: 12 }}>
+                  <div className="row"><span>{String(item.name)}</span><span className={badge.badgeClassName}>{badge.label}</span></div>
+                  <div className={badge.noteClassName} style={{ marginBottom: 10 }}>{badge.message}</div>
+                  <div className="row"><span>Diagnostic</span><span>{String(degradation.diagnostic || incidentSummary.top_diagnostic || "nominal")}</span></div>
+                  <div className="row"><span>Health score</span><span>{badge.scoreText}</span></div>
+                  <div className="row"><span>Action</span><span>{String(degradation.health_action || badge.action)}</span></div>
+                  <div className="row"><span>Path</span><span>{((degradation.auto_downgrade_path as string[] | undefined) || []).join(" -> ") || "n/a"}</span></div>
+                  <div className="row"><span>Auto-disable</span><span>{String(Boolean(degradation.auto_disable_live))}</span></div>
+                  <div className="row"><span>Auto-reroute</span><span>{String(degradation.auto_reroute_target || "n/a")}</span></div>
+                  <div className="row"><span>Incidents</span><span>actifs {formatMaybeInt(incidentSummary.active_count)} | critiques {formatMaybeInt(incidentSummary.critical_count)} | throttling {formatMaybeInt(incidentSummary.throttling_count)}</span></div>
+                  <div className="row"><span>Historique</span><span>{asList(incidentSummary.history).map((entry) => `${String(entry.severity)}:${String(entry.title)}`).join(" | ") || "n/a"}</span></div>
+                </div>
+              );
+            })}
+          </div>
         </div>
       </section>
 

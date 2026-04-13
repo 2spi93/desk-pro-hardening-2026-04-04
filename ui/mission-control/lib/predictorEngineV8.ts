@@ -1,5 +1,13 @@
 type JsonMap = Record<string, unknown>;
 
+import {
+  buildMlFeatureVector,
+  predictML as predictMlProbability,
+  retrainModel as retrainMlModel,
+  type MlTrainingSample,
+} from "./mlDatasetBuilder";
+import type { SelfLearningV5Frame } from "./selfLearningV5Store";
+
 export type PredictorKernelTelemetry = {
   tickLatencyMs: number;
   bufferBacklog: number;
@@ -43,6 +51,8 @@ export type PredictorEngineV8TrainingStats = {
   trainedSamples: number;
   updatedAt: string | null;
   weightShift: number;
+  accuracy: number;
+  retrainCount: number;
 };
 
 type TrainingSample = {
@@ -119,14 +129,17 @@ export class PredictorEngineV8 {
   private trainedSamples = 0;
   private seenTelemetryIds = new Set<string>();
   private updatedAt: string | null = null;
+  private lastAccuracy = 0.5;
+  private retrainCount = 0;
 
   assess(input: PredictorFeatureInput, threshold = DEFAULT_THRESHOLD): PredictorAssessment {
     const featureVector = this.buildFeatureVector(input);
     const logit = featureVector.reduce((sum, value, index) => sum + value * this.weights[index], 0);
-    const probability = sigmoid(logit);
+    const safeLogit = Number.isFinite(logit) ? logit : 0;
+    const probability = sigmoid(safeLogit);
     const contributions = FEATURE_KEYS.map((label, index) => ({
       label,
-      value: featureVector[index] * this.weights[index],
+      value: Number.isFinite(featureVector[index] * this.weights[index]) ? featureVector[index] * this.weights[index] : 0,
     })).sort((left, right) => Math.abs(right.value) - Math.abs(left.value)).slice(0, 5);
     return {
       probability,
@@ -179,6 +192,8 @@ export class PredictorEngineV8 {
     this.weights = nextWeights;
     this.trainedSamples = Math.max(0, Math.round(toNumber(candidate.trainedSamples, 0)));
     this.updatedAt = typeof candidate.updatedAt === "string" && candidate.updatedAt ? candidate.updatedAt : null;
+    this.lastAccuracy = clamp(toNumber((candidate as PredictorEngineV8State & { lastAccuracy?: number }).lastAccuracy, 0.5), 0, 1);
+    this.retrainCount = Math.max(0, Math.round(toNumber((candidate as PredictorEngineV8State & { retrainCount?: number }).retrainCount, 0)));
     return true;
   }
 
@@ -188,7 +203,44 @@ export class PredictorEngineV8 {
       trainedSamples: this.trainedSamples,
       updatedAt: this.updatedAt,
       weightShift,
+      accuracy: this.lastAccuracy,
+      retrainCount: this.retrainCount,
     };
+  }
+
+  predictML(features: number[]): number {
+    return predictMlProbability(features, this.weights);
+  }
+
+  predictReplayFrame(frame: SelfLearningV5Frame): number {
+    return this.predictML(buildMlFeatureVector(frame));
+  }
+
+  measureAccuracy(dataset: MlTrainingSample[]): number {
+    if (dataset.length === 0) {
+      return this.lastAccuracy;
+    }
+    const correct = dataset.reduce((count, sample) => {
+      const prediction = this.predictML(sample.features);
+      return count + (((prediction >= 0.5 ? 1 : 0) === sample.label) ? 1 : 0);
+    }, 0);
+    return correct / dataset.length;
+  }
+
+  retrainModel(dataset: MlTrainingSample[], epochs = 8): PredictorEngineV8TrainingStats {
+    if (dataset.length === 0) {
+      return this.getTrainingStats();
+    }
+    const result = retrainMlModel(dataset, this.weights, {
+      epochs,
+      learningRate: this.learningRate * 0.85,
+    });
+    this.weights = result.weights.map((value, index) => clamp(value, -4, 4));
+    this.trainedSamples += dataset.length;
+    this.lastAccuracy = result.accuracy;
+    this.retrainCount += 1;
+    this.updatedAt = new Date().toISOString();
+    return this.getTrainingStats();
   }
 
   private trainSample(sample: TrainingSample): void {
@@ -198,6 +250,8 @@ export class PredictorEngineV8 {
       weight + this.learningRate * error * sample.features[index]
     ));
     this.trainedSamples += 1;
+    this.lastAccuracy = (this.lastAccuracy * Math.min(64, Math.max(1, this.trainedSamples - 1)) + (((prediction >= 0.5 ? 1 : 0) === sample.label) ? 1 : 0))
+      / Math.min(65, Math.max(2, this.trainedSamples));
     this.updatedAt = new Date().toISOString();
   }
 
@@ -262,11 +316,7 @@ export class PredictorEngineV8 {
     const candidates = Array.isArray(input.routingScore?.candidates)
       ? input.routingScore?.candidates as JsonMap[]
       : [];
-    const spreadEdgeBps = Math.max(
-      0,
-      toNumber(arbitrage.net_spread, NaN),
-      toNumber(input.marketMicro?.arbitrage_net_spread, 0),
-    );
+    const spreadEdgeBps = Math.max(0, toNumber(arbitrage.net_spread, toNumber(input.marketMicro?.arbitrage_net_spread, 0)));
     const spreadVelocity = toNumber(input.marketMicro?.fusion_deviation_bps, 0) / 10;
     const depthImbalance = clamp(toNumber(input.marketMicro?.depth_imbalance, 0), -1, 1);
     const bestBid = toNumber(input.marketMicro?.best_bid ?? input.marketMicro?.fusion_best_bid, 0);

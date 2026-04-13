@@ -2,24 +2,24 @@
   "name": "txt-signature",
   "label": "TXT Signature",
   "palette": {
-    "up": "#00C46A",
-    "down": "#FF4D4D",
-    "wick": "#222222",
-    "background": "#0D0F12",
-    "backgroundAccent": "#0B0C0E",
-    "text": "#EAF2FF",
-    "crosshair": "#8FE1FF",
-    "labelBackground": "#101A24"
+    "up": "#00FF88",
+    "down": "#FF3B3B",
+    "wick": "#94A3B8",
+    "background": "#101722",
+    "backgroundAccent": "#16202C",
+    "text": "#F3F8FF",
+    "crosshair": "#B6E7FF",
+    "labelBackground": "#162333"
   },
   "rendering": {
-    "bodyOpacity": 0.96,
+    "bodyOpacity": 0.98,
     "verticalGradientPct": 0.14,
-    "wickWidthPx": 1.4,
-    "borderWidthPx": 0.45,
+    "wickWidthPx": 1.6,
+    "borderWidthPx": 0.55,
     "bodyRadiusPx": 2,
     "antiAliasing": "msaa-8x",
     "floatingPositioning": true,
-    "extremeWickGlow": 0.16
+    "extremeWickGlow": 0.2
   },
   "motion": {
     "transitionMs": 80,
@@ -35,7 +35,7 @@
     "comfortZonePct": 0.56,
     "strictBucketAlignment": true,
     "domWickSmoothing": true,
-    "lastCandleGlow": 0.12,
+    "lastCandleGlow": 0.16,
     "wickDomShiftPct": 0.03
   },
   "frame": {

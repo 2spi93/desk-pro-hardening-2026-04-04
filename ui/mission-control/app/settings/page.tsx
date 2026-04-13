@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 
-import TxtMiniGuide from "../../components/ui/TxtMiniGuide";
+import OperatorPanelGuide from "../../components/ui/OperatorPanelGuide";
 import {
   applyLocalUserUiPreferences,
   fetchBackendUserUiPreferences,
@@ -232,7 +232,7 @@ export default function SettingsPage() {
 
   return (
     <main className="shell txt-page-shell">
-      <section className="panel txt-page-hero">
+      <section id="global-guide-settings-hero" className="panel txt-page-hero">
         <div className="eyebrow">TXT Settings</div>
         <h1 className="title" style={{ fontSize: 34 }}>Parametres globaux</h1>
         <p className="subtle">Personnalise l'experience TXT: densite, mode novice/expert et preferences d'interface.</p>
@@ -251,7 +251,7 @@ export default function SettingsPage() {
             reason: {compactSyncReasonLabel(prefsSyncReason)}
           </span>
         </div>
-        <TxtMiniGuide
+        <OperatorPanelGuide
           title="Guide Settings"
           what="Controle du mode d'affichage et des preferences de layout TXT."
           why="Adapter l'interface a ton niveau sans perdre la profondeur du terminal."

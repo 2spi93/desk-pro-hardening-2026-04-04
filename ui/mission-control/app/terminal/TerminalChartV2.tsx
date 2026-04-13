@@ -3,8 +3,21 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import GpuChartV4Surface from "./GpuChartV4Surface";
+import type { SmartDecisionHudShape } from "./chartHudTypes";
+import { applyDecisionStability, createDecisionStabilityEngine } from "./decisionStabilityEngine";
+import { resolveSmartDecision } from "./decisionEngine";
 import InstitutionalChart from "./InstitutionalChart";
+import { buildLiquidityOverlayZones, detectLiquidity } from "./liquidityEngine";
+import { buildRegimeSnapshot } from "./regimeEngine";
+import SmartDecisionSummary from "./SmartDecisionSummary";
+import { buildSmartDecisionHud } from "./smartDecisionHud";
+import { buildStructureOverlayZones, detectStructure } from "./structureEngine";
+import type { ChartPerceptualTelemetry, GpuPerceptualTelemetry } from "./chartPerceptual";
+import type { PerceptualExecutionSignal } from "./chartPerceptualEngine";
+import type { MarketSimulation } from "./marketSimulationEngine";
+import type { PriceSignalBand } from "../../lib/engine/gpu-chart/PriceSignalLayer";
 import { DEFAULT_MIN_RENDERABLE_BARS } from "../../lib/ohlcvIntegrity";
+import { timeframeToMs } from "../../lib/ohlcvDataEngine";
 import { computePredictionV5, type PredictionV5 } from "../../lib/predictionEngineV5";
 
 const TERMINAL_V2_TIMEFRAME_SELECTOR_PRIMARY = ["1s", "5s", "10s", "30s", "1m", "5m", "15m"] as const;
@@ -12,6 +25,9 @@ const TERMINAL_V2_TIMEFRAME_SELECTOR_SECONDARY = ["30m", "1h", "4h", "8h", "1d",
 
 type CandlePoint = { label: string; open: number; high: number; low: number; close: number; volume: number };
 type DomLevel = { side: "bid" | "ask"; price: number; size: number; intensity: number };
+type FootprintRow = { low: number; high: number; buyVolume: number; sellVolume: number; delta: number; timeLabel?: string; timeKey?: string };
+type DomHistoryFrame = { time: number; levels: Array<{ side: "bid" | "ask"; price: number; size: number; intensity: number }>; spoofingRisk?: number };
+type TradeBubbleVisual = { time: number; price: number; volume: number; side: "buy" | "sell"; intensity?: number; kind?: "trade" | "spoof" };
 type QuoteHistoryMap = Record<string, Array<{ label: string; value: number }>>;
 type IndicatorSeries = { indicatorId: string; outputKey: string; label: string; color: string; type: string; pane: "main" | "sub"; lineWidth: number; data: Array<{ time: number; value: number }> };
 
@@ -32,6 +48,14 @@ type RiskJournalEntry = {
   strategy: string;
   action: string;
   detail: string;
+};
+
+type FlowInsight = {
+  label: string;
+  dominantSide: "buy" | "sell" | "neutral";
+  score: number;
+  liquidityBias: number;
+  eventKind: string | null;
 };
 
 const MIN_RENDER_CANDLES = DEFAULT_MIN_RENDERABLE_BARS;
@@ -82,6 +106,8 @@ type Props = {
   onZoomOut: () => void;
   liveFeedKey?: string;
   candles: CandlePoint[];
+  analyticsCandles?: CandlePoint[];
+  isPreviewMode?: boolean;
   fallbackPrice: number;
   loading: boolean;
   uiMode: UiMode;
@@ -92,8 +118,20 @@ type Props = {
   routeVenue: string;
   routeScorePct: number | null;
   depthState: "offline" | "connecting" | "live";
+  renderMode?: "line" | "candles" | "footprint";
+  deskModeLabel: string;
+  deskModeLocked: boolean;
+  effectiveBarMode: "time" | "delta" | "event";
+  lowFlowEdgeBlocked: boolean;
+  flowConfidenceLabel: string;
   domLevels: DomLevel[];
   heatmapLevels: DomLevel[];
+  domHistory?: DomHistoryFrame[];
+  tradeBubbles?: TradeBubbleVisual[];
+  priceSignalBands?: PriceSignalBand[];
+  footprintRows?: FootprintRow[];
+  executionSignals?: PerceptualExecutionSignal[];
+  marketSimulation?: MarketSimulation | null;
   riskMissRatioPct: number;
   riskHardAlert: boolean;
   riskGuardEnabled: boolean;
@@ -124,10 +162,14 @@ type Props = {
   aiScenario: string;
   aiConfidencePct: number;
   aiExplanation: string;
+  flowInsight?: FlowInsight | null;
   indicatorSeries?: IndicatorSeries[];
   chartEngineMode?: ChartEngineMode;
   gpuViewportGrid?: GpuViewportGrid;
   chartSmoothingMs?: ChartSmoothingMs;
+  onChartPerceptualTelemetry?: (payload: ChartPerceptualTelemetry) => void;
+  onGpuPerceptualTelemetry?: (payload: GpuPerceptualTelemetry) => void;
+  onSmartDecisionHudChange?: (payload: SmartDecisionHudShape) => void;
 };
 
 function ensureVisibleCandles(candles: CandlePoint[], _fallbackPrice: number): CandlePoint[] {
@@ -174,6 +216,31 @@ function buildSparklinePath(values: number[], width: number, height: number): st
     .join(" ");
 }
 
+function parseHistoryLabelMs(label: string): number | null {
+  const parsed = Date.parse(label);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function timeframeMs(timeframe: string): number {
+  const match = String(timeframe || "").trim().match(/^(\d+)([smhdwM])$/);
+  if (!match) {
+    return 60_000;
+  }
+  const value = Number(match[1]);
+  if (!Number.isFinite(value) || value <= 0) {
+    return 60_000;
+  }
+  switch (match[2]) {
+    case "s": return value * 1_000;
+    case "m": return value * 60_000;
+    case "h": return value * 3_600_000;
+    case "d": return value * 86_400_000;
+    case "w": return value * 604_800_000;
+    case "M": return value * 2_592_000_000;
+    default: return 60_000;
+  }
+}
+
 export default function TerminalChartV2(props: Props) {
   const {
     enabled,
@@ -196,8 +263,20 @@ export default function TerminalChartV2(props: Props) {
     routeVenue,
     routeScorePct,
     depthState,
+    renderMode = "candles",
+    deskModeLabel,
+    deskModeLocked,
+    effectiveBarMode,
+    lowFlowEdgeBlocked,
+    flowConfidenceLabel,
     domLevels,
     heatmapLevels,
+    domHistory,
+    tradeBubbles,
+    priceSignalBands,
+    footprintRows,
+    executionSignals,
+    marketSimulation,
     riskMissRatioPct,
     riskHardAlert,
     riskGuardEnabled,
@@ -228,11 +307,22 @@ export default function TerminalChartV2(props: Props) {
     aiScenario,
     aiConfidencePct,
     aiExplanation,
+    flowInsight,
     indicatorSeries: indicatorSeriesProp = [],
     chartEngineMode = "v3",
     gpuViewportGrid = "auto",
     chartSmoothingMs = 140,
+    onChartPerceptualTelemetry,
+    onGpuPerceptualTelemetry,
+    onSmartDecisionHudChange,
   } = props;
+
+  const analyticsCandlesInput = props.analyticsCandles ?? props.candles;
+  const isPreviewMode = Boolean(props.isPreviewMode);
+  const effectiveChartSmoothingMs: ChartSmoothingMs = useMemo(
+    () => (timeframeToMs(timeframe) <= 5_000 ? 0 : chartSmoothingMs),
+    [chartSmoothingMs, timeframe],
+  );
 
   const [intent, setIntent] = useState<V2Intent>("observe");
   const [crosshairText, setCrosshairText] = useState("--");
@@ -243,7 +333,10 @@ export default function TerminalChartV2(props: Props) {
   const [assistantAnchor, setAssistantAnchor] = useState<{ type: AnchorType; label: string; detail: string } | null>(null);
   const [assistantInput, setAssistantInput] = useState("");
   const [assistantMessages, setAssistantMessages] = useState<Array<{ role: "user" | "assistant"; text: string }>>([]);
-  const lastStableCandlesRef = useRef<CandlePoint[]>([]);
+  const [decisionClockMs, setDecisionClockMs] = useState(() => Date.now());
+  const lastStableRenderCandlesRef = useRef<CandlePoint[]>([]);
+  const lastStableAnalyticsCandlesRef = useRef<CandlePoint[]>([]);
+  const decisionStabilityEngineRef = useRef(createDecisionStabilityEngine());
 
   const handleCrosshairMove = useCallback((payload: { price: number; timeLabel: string; timeKey: string } | null) => {
     if (!payload) {
@@ -272,27 +365,93 @@ export default function TerminalChartV2(props: Props) {
   }, []);
 
   useEffect(() => {
+    const timer = window.setInterval(() => {
+      setDecisionClockMs(Date.now());
+    }, 350);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
     const stable = ensureVisibleCandles(candles, fallbackPrice);
-    const previous = lastStableCandlesRef.current;
+    const previous = lastStableRenderCandlesRef.current;
     const previousLen = previous.length;
     const nextLen = stable.length;
     if (nextLen >= MIN_RENDER_CANDLES || nextLen > previousLen) {
-      lastStableCandlesRef.current = stable;
+      lastStableRenderCandlesRef.current = stable;
     }
   }, [candles, fallbackPrice]);
 
-  const safeCandles = useMemo(() => {
+  useEffect(() => {
+    const stable = ensureVisibleCandles(analyticsCandlesInput, fallbackPrice);
+    const previous = lastStableAnalyticsCandlesRef.current;
+    const previousLen = previous.length;
+    const nextLen = stable.length;
+    if (nextLen >= MIN_RENDER_CANDLES || nextLen > previousLen) {
+      lastStableAnalyticsCandlesRef.current = stable;
+    }
+  }, [analyticsCandlesInput, fallbackPrice]);
+
+  const safeRenderCandles = useMemo(() => {
     const stable = ensureVisibleCandles(candles, fallbackPrice);
     if (stable.length >= MIN_RENDER_CANDLES) {
       return stable;
     }
-    const previous = lastStableCandlesRef.current;
+    const previous = lastStableRenderCandlesRef.current;
     if (previous.length > stable.length) {
       return previous;
     }
     return stable;
   }, [candles, fallbackPrice]);
+  const safeAnalyticsCandles = useMemo(() => {
+    const stable = ensureVisibleCandles(analyticsCandlesInput, fallbackPrice);
+    if (stable.length >= MIN_RENDER_CANDLES) {
+      return stable;
+    }
+    const previous = lastStableAnalyticsCandlesRef.current;
+    if (!isPreviewMode && previous.length > stable.length) {
+      return previous;
+    }
+    return stable;
+  }, [analyticsCandlesInput, fallbackPrice, isPreviewMode]);
+  const analyticsEligibleCandles = isPreviewMode ? [] : safeAnalyticsCandles;
+  const analyticsReady = analyticsEligibleCandles.length >= MIN_RENDER_CANDLES;
+  const structureSourceCandles = useMemo(
+    () => (analyticsReady ? analyticsEligibleCandles : isPreviewMode ? [] : safeRenderCandles),
+    [analyticsEligibleCandles, analyticsReady, isPreviewMode, safeRenderCandles],
+  );
+  const structureSnapshot = useMemo(
+    () => detectStructure(structureSourceCandles),
+    [structureSourceCandles],
+  );
+  const liquiditySnapshot = useMemo(
+    () => detectLiquidity(structureSourceCandles, structureSnapshot),
+    [structureSnapshot, structureSourceCandles],
+  );
+  const structureOverlayZones = useMemo(
+    () => buildStructureOverlayZones(structureSnapshot),
+    [structureSnapshot],
+  );
+  const liquidityOverlayZones = useMemo(
+    () => buildLiquidityOverlayZones(liquiditySnapshot),
+    [liquiditySnapshot],
+  );
+  const regimeSnapshot = useMemo(
+    () => buildRegimeSnapshot(structureSourceCandles),
+    [structureSourceCandles],
+  );
   const effectiveRouteScore = deriveRouteScorePct(routeScorePct, depthState);
+  const simulationTone = useMemo(() => {
+    if (!marketSimulation) {
+      return "neutral";
+    }
+    if (marketSimulation.stateLabel === "chaos") {
+      return "warn";
+    }
+    if (marketSimulation.decision.shouldExecute) {
+      return "good";
+    }
+    return "neutral";
+  }, [marketSimulation]);
 
   const rankedRoutes = useMemo(() => {
     return [...routingCandidates]
@@ -316,22 +475,39 @@ export default function TerminalChartV2(props: Props) {
     return { bids, asks, imbalance, spoofCount, icebergCount };
   }, [domLevels]);
 
+  const dominantDomLevelKeys = useMemo(() => {
+    return new Set(
+      [...domLevels]
+        .sort((left, right) => (right.size * Math.max(0.2, right.intensity)) - (left.size * Math.max(0.2, left.intensity)))
+        .slice(0, 3)
+        .map((level) => `${level.side}:${level.price.toFixed(4)}`),
+    );
+  }, [domLevels]);
+
   const heatmapTop = useMemo(() => {
     return [...heatmapLevels]
-      .sort((left, right) => right.intensity - left.intensity)
+      .sort((left, right) => (right.intensity * 0.58 + Math.log1p(Math.max(0, right.size)) * 0.42) - (left.intensity * 0.58 + Math.log1p(Math.max(0, left.size)) * 0.42))
       .slice(0, 8);
   }, [heatmapLevels]);
+
+  const dominantHeatmapKeys = useMemo(() => {
+    return new Set(
+      heatmapTop
+        .slice(0, 3)
+        .map((level) => `${level.side}:${level.price.toFixed(4)}`),
+    );
+  }, [heatmapTop]);
 
   // ── Prediction Engine V5 ────────────────────────────────────────────────────
   const predictionV5 = useMemo((): PredictionV5 => {
     return computePredictionV5(
-      safeCandles,
+      analyticsEligibleCandles,
       domLevels,
       heatmapLevels,
       aiConfidencePct,
       prevAiConfRef.current,
     );
-  }, [safeCandles, domLevels, heatmapLevels, aiConfidencePct]);
+  }, [analyticsEligibleCandles, domLevels, heatmapLevels, aiConfidencePct]);
 
   useEffect(() => {
     prevAiConfRef.current = aiConfidencePct;
@@ -375,23 +551,57 @@ export default function TerminalChartV2(props: Props) {
       symbol: row.symbol,
       candles: buildCandlesFromHistory(quoteHistory[row.symbol] || [], row.price),
     }));
-  }, [multiChartRows, quoteHistory]);
+  }, [multiChartRows, quoteHistory, timeframe]);
 
   const recentCandleAnchors = useMemo(() => {
-    return safeCandles.slice(-6).map((candle) => ({
+    return analyticsEligibleCandles.slice(-6).map((candle) => ({
       type: "candle" as const,
       label: candle.label.slice(11, 16),
       detail: `O:${candle.open.toFixed(2)} H:${candle.high.toFixed(2)} L:${candle.low.toFixed(2)} C:${candle.close.toFixed(2)}`,
     }));
-  }, [safeCandles]);
+  }, [analyticsEligibleCandles]);
+
+  const decisionLatencyMs = useMemo(() => {
+    const lastLabel = structureSourceCandles[structureSourceCandles.length - 1]?.label;
+    const lastTimestamp = lastLabel ? parseHistoryLabelMs(lastLabel) : null;
+    if (!lastTimestamp) {
+      return null;
+    }
+    return Math.max(0, Date.now() - lastTimestamp);
+  }, [structureSourceCandles]);
+  const smartDecision = useMemo(() => resolveSmartDecision({
+    regime: regimeSnapshot,
+    structure: structureSnapshot,
+    liquidity: liquiditySnapshot,
+    predictionDirection: predictionV5.direction,
+    predictionProbability: predictionV5.probability,
+    predictionTrigger: predictionV5.trigger,
+    predictionInvalidation: predictionV5.invalidation,
+    lowFlowEdgeBlocked,
+    routeScorePct: effectiveRouteScore,
+    domImbalance: domStats.imbalance,
+    decisionLatencyMs,
+    suspended: isPreviewMode || !analyticsReady,
+  }), [analyticsReady, decisionLatencyMs, domStats.imbalance, effectiveRouteScore, isPreviewMode, liquiditySnapshot, lowFlowEdgeBlocked, predictionV5.direction, predictionV5.invalidation, predictionV5.probability, predictionV5.trigger, regimeSnapshot, structureSnapshot]);
+  const stableSmartDecision = useMemo(
+    () => applyDecisionStability(smartDecision, decisionStabilityEngineRef.current.update(smartDecision.state, decisionClockMs)),
+    [decisionClockMs, smartDecision],
+  );
+  const smartDecisionHud = useMemo(() => buildSmartDecisionHud(stableSmartDecision), [stableSmartDecision]);
+
+  useEffect(() => {
+    if (onSmartDecisionHudChange) {
+      onSmartDecisionHudChange(smartDecisionHud);
+    }
+  }, [onSmartDecisionHudChange, smartDecisionHud]);
 
   const assistantContext = useMemo(() => {
-    const base = `${aiExplanation} | DOM imbalance ${(domStats.imbalance * 100).toFixed(1)}%, route ${routeVenue || "--"}, confidence ${aiConfidencePct.toFixed(0)}%.`;
+    const base = `${smartDecisionHud.assistantSummary} ${aiExplanation} | DOM imbalance ${(domStats.imbalance * 100).toFixed(1)}%, route ${routeVenue || "--"}, confidence ${aiConfidencePct.toFixed(0)}%.`;
     if (!assistantAnchor) {
       return base;
     }
     return `${base} Anchor ${assistantAnchor.type}: ${assistantAnchor.label} (${assistantAnchor.detail}).`;
-  }, [aiConfidencePct, aiExplanation, assistantAnchor, domStats.imbalance, routeVenue]);
+  }, [aiConfidencePct, aiExplanation, assistantAnchor, domStats.imbalance, routeVenue, smartDecisionHud.assistantSummary]);
 
   // ── Auto Trader V5 — machine d'état ────────────────────────────────────────
   const updateAT = useCallback((updater: (s: AutoTraderV5State) => AutoTraderV5State) => {
@@ -412,13 +622,19 @@ export default function TerminalChartV2(props: Props) {
 
     const at = autoTraderRef.current;
     if (!at.enabled || at.mode === "paused") return;
+    if (!analyticsReady) {
+      if (at.mode !== "standby") {
+        updateAT((state) => ({ ...state, mode: "standby", lastAction: "Preview / feed degrade — execution logic paused" }));
+      }
+      return;
+    }
 
-    const lastCandle = safeCandles[safeCandles.length - 1];
+    const lastCandle = analyticsEligibleCandles[analyticsEligibleCandles.length - 1];
     if (!lastCandle) return;
     const price = lastCandle.close;
     const pred  = predictionV5;
-    const atr   = safeCandles.slice(-20).reduce((s, c) => s + (c.high - c.low), 0)
-                  / Math.max(1, Math.min(20, safeCandles.length));
+    const atr   = analyticsEligibleCandles.slice(-20).reduce((s, c) => s + (c.high - c.low), 0)
+                  / Math.max(1, Math.min(20, analyticsEligibleCandles.length));
 
     // standby → watching
     if (at.mode === "standby") {
@@ -519,7 +735,7 @@ export default function TerminalChartV2(props: Props) {
         }));
       }
     }
-  }, [safeCandles, predictionV5, maxLossUsd, updateAT]);
+  }, [analyticsEligibleCandles, analyticsReady, predictionV5, maxLossUsd, updateAT]);
 
   useEffect(() => {
     let cancelled = false;
@@ -613,6 +829,10 @@ export default function TerminalChartV2(props: Props) {
 
         <button type="button" className="chart-chip" onClick={onZoomIn}>Zoom +</button>
         <button type="button" className="chart-chip" onClick={onZoomOut}>Zoom &minus;</button>
+        <span className="chart-chip active">{deskModeLabel}</span>
+        <span className="chart-chip active">Bars {effectiveBarMode.toUpperCase()}</span>
+        {deskModeLocked ? <span className="chart-chip active">AUTO LOCK</span> : null}
+        {lowFlowEdgeBlocked ? <span className="chart-chip chart-chip-warn">LOW FLOW EDGE</span> : null}
 
         {intent === "execute" ? (
           <>
@@ -624,25 +844,32 @@ export default function TerminalChartV2(props: Props) {
         ) : null}
 
         <span className="terminal-v2-sep" />
-        <span className="terminal-v2-intent-label">{intent === "observe" ? "perception layer" : intent === "analyze" ? "structure analysis" : "execution mode"}</span>
+        <span className="terminal-v2-intent-label">{lowFlowEdgeBlocked ? `${flowConfidenceLabel} · execution blocked` : intent === "observe" ? "perception layer" : intent === "analyze" ? "structure analysis" : "execution mode"}</span>
       </div>
 
       {/* ─── ROW 2: CHART CORE + AI HUD ─── */}
       <div className="terminal-v2-core">
-        <div className={`terminal-v2-chart-col${aiConfidencePct >= 70 ? " chart-focus-mode" : ""}`}>
+        <div className={`terminal-v2-chart-col${aiConfidencePct >= 70 ? " chart-focus-mode" : ""}${lowFlowEdgeBlocked ? " is-flow-confidence-low" : ""}`}>
           {loading ? <div className="chart-loader">Switching symbol…</div> : null}
           {chartEngineMode === "v4" ? (
             <GpuChartV4Surface
               className="chart-stage-premium terminal-v2-chart"
               symbol={symbol}
               timeframe={timeframe}
-              mode="candles"
+              mode={renderMode}
               chartMotionPreset="balanced"
               visualMode="clean"
               liveFeedKey={liveFeedKey}
-              candles={safeCandles}
-              overlayZones={[]}
-              liquidityZones={[]}
+              candles={safeRenderCandles}
+              overlayZones={structureOverlayZones}
+              liquidityZones={liquidityOverlayZones}
+              domLevels={domLevels}
+              heatmapLevels={heatmapLevels}
+              domHistory={domHistory}
+              tradeBubbles={tradeBubbles}
+              priceSignalBands={priceSignalBands}
+              footprintRows={footprintRows}
+              executionSignals={analyticsReady ? executionSignals : undefined}
               dayVwap={0}
               weekVwap={0}
               monthVwap={0}
@@ -651,22 +878,31 @@ export default function TerminalChartV2(props: Props) {
               candleTransform="none"
               engineMode="v4"
               viewportGrid={gpuViewportGrid}
-              smoothingMs={chartSmoothingMs}
+              smoothingMs={effectiveChartSmoothingMs}
               multiSymbolFeeds={gpuViewportFeeds}
               onCrosshairMove={handleCrosshairMove}
+              onPerceptualTelemetry={analyticsReady ? onGpuPerceptualTelemetry : undefined}
             />
           ) : (
             <InstitutionalChart
               className="chart-stage-premium terminal-v2-chart"
               symbol={symbol}
               timeframe={timeframe}
-              mode="candles"
+              mode={renderMode}
               chartMotionPreset="balanced"
               visualMode="clean"
               liveFeedKey={liveFeedKey}
-              candles={safeCandles}
-              overlayZones={[]}
-              liquidityZones={[]}
+              candles={safeRenderCandles}
+              overlayZones={structureOverlayZones}
+              liquidityZones={liquidityOverlayZones}
+              domLevels={domLevels}
+              heatmapLevels={heatmapLevels}
+              domHistory={domHistory}
+              tradeBubbles={tradeBubbles}
+              priceSignalBands={priceSignalBands}
+              footprintRows={footprintRows}
+              executionSignals={analyticsReady ? executionSignals : undefined}
+              marketSimulation={analyticsReady ? marketSimulation : null}
               dayVwap={0}
               weekVwap={0}
               monthVwap={0}
@@ -674,16 +910,27 @@ export default function TerminalChartV2(props: Props) {
               showSessions={false}
               candleTransform="none"
               onCrosshairMove={handleCrosshairMove}
+              onPerceptualTelemetry={analyticsReady ? onChartPerceptualTelemetry : undefined}
             />
           )}
         </div>
 
         <aside className="terminal-v2-ai-hud" aria-label="AI perception HUD">
+          <div className="terminal-v2-card terminal-v2-card-decision" data-testid="terminal-v2-decision-state">
+            <span className="terminal-v2-card-kicker">Decision Engine V2</span>
+            <SmartDecisionSummary decision={smartDecisionHud} variant="hero" />
+          </div>
+
           {/* ── PERCEPTION ENGINE V5 — prédictif ── */}
           <div className={`terminal-v2-card terminal-v2-card-perception${
             predictionV5.probability >= 70 ? " perception-focus" : ""
           }`}>
             <span className="terminal-v2-card-kicker">Perception V5</span>
+            {isPreviewMode || !analyticsReady ? (
+              <div className="terminal-v2-meta" style={{ marginBottom: 8 }}>
+                Preview / feed degrade: perception and execution logic suspended.
+              </div>
+            ) : null}
 
             {/* direction + probabilité + drift */}
             <div className="perception-direction">
@@ -739,10 +986,37 @@ export default function TerminalChartV2(props: Props) {
             )}
           </div>
           <div className="terminal-v2-card terminal-v2-card-ai">
+            <span className="terminal-v2-card-kicker">Simulation V6</span>
+            <strong className={simulationTone}>{marketSimulation ? marketSimulation.stateLabel.replace(/_/g, " ") : "standby"}</strong>
+            <span className="terminal-v2-meta">
+              {marketSimulation
+                ? `${marketSimulation.decision.shouldExecute ? "execute" : "hold"} · conf ${(marketSimulation.confidence * 100).toFixed(0)}%`
+                : "awaiting market state"}
+            </span>
+            <span className="terminal-v2-meta">
+              {marketSimulation
+                ? `fill ${(marketSimulation.execution.fillProb * 100).toFixed(0)}% · slip ${marketSimulation.execution.slippage.toFixed(1)}bps · lat ${marketSimulation.execution.latency.toFixed(0)}ms`
+                : "no execution preview"}
+            </span>
+            {flowInsight ? (
+              <div className={`terminal-v2-flow-chip ${flowInsight.dominantSide}`}>
+                <strong>Flow</strong>
+                <span>{flowInsight.label}</span>
+                <span>{(flowInsight.score * 100).toFixed(0)}% · bias {(Math.abs(flowInsight.liquidityBias) * 100).toFixed(0)}%</span>
+              </div>
+            ) : null}
+            {lowFlowEdgeBlocked ? <div className="terminal-v2-alert">LOW FLOW EDGE · execution blocked</div> : null}
+            <p className="terminal-v2-ai-copy">
+              {marketSimulation
+                ? `100ms ${marketSimulation.t100ms.price.toFixed(2)} · 250ms ${marketSimulation.t250ms.price.toFixed(2)} · 500ms ${marketSimulation.t500ms.price.toFixed(2)} · cone ${marketSimulation.cone.best.toFixed(2)} / ${marketSimulation.cone.expected.toFixed(2)} / ${marketSimulation.cone.worst.toFixed(2)}`
+                : "Le moteur V6 projette le flow observé sur 100/250/500ms avant décision exécutable."}
+            </p>
+          </div>
+          <div className="terminal-v2-card terminal-v2-card-ai">
             <span className="terminal-v2-card-kicker">IA contextuelle</span>
             <strong>{aiHeadline}</strong>
-            <span className="terminal-v2-meta">{aiScenario}</span>
-            <span className="terminal-v2-meta">confidence {aiConfidencePct.toFixed(0)}%</span>
+            <span className="terminal-v2-meta">{smartDecisionHud.displayStateLabel} · {smartDecisionHud.confidenceBand} · {aiScenario}</span>
+            <span className="terminal-v2-meta">confidence {aiConfidencePct.toFixed(0)}% · regime {regimeSnapshot.state}</span>
             <p className="terminal-v2-ai-copy">{assistantContext}</p>
             <div className="terminal-v2-chat-row">
               <input
@@ -822,9 +1096,10 @@ export default function TerminalChartV2(props: Props) {
             <label className="terminal-v2-input-chip">Target<input type="number" value={targetGainUsd} onChange={(event) => onSetTargetGainUsd(Math.max(10, Number(event.target.value || 0)))} /></label>
           </div>
           <div className="terminal-v2-inline-actions">
-            <button type="button" className="chart-chip" onClick={() => { onAutoReduce(); void appendRiskAction("auto-reduce", "Reduced by guardrail", { ratioMiss: riskMissRatioPct }); }}>Reduce</button>
-            <button type="button" className="chart-chip chart-sell-btn" onClick={() => { onAutoClose(); void appendRiskAction("auto-close", "Closed and armed kill-switch", { ratioMiss: riskMissRatioPct }); }}>Close</button>
+            <button type="button" className="chart-chip" disabled={lowFlowEdgeBlocked} onClick={() => { onAutoReduce(); void appendRiskAction("auto-reduce", "Reduced by guardrail", { ratioMiss: riskMissRatioPct }); }}>Reduce</button>
+            <button type="button" className="chart-chip chart-sell-btn" disabled={lowFlowEdgeBlocked} onClick={() => { onAutoClose(); void appendRiskAction("auto-close", "Closed and armed kill-switch", { ratioMiss: riskMissRatioPct }); }}>Close</button>
           </div>
+          {lowFlowEdgeBlocked ? <span className="terminal-v2-alert">LOW FLOW EDGE</span> : null}
           {riskLossExceeded ? <span className="terminal-v2-alert">Loss exceeded</span> : null}
           {riskTargetMiss ? <span className="terminal-v2-alert">Target miss</span> : null}
         </div>
@@ -839,27 +1114,31 @@ export default function TerminalChartV2(props: Props) {
           <div className="terminal-v2-ladder">
             {[...domStats.asks.slice(0, 4), ...domStats.bids.slice(0, 4)]
               .sort((left, right) => right.price - left.price)
-              .map((level, index) => (
-                <div key={`${level.side}-${level.price}-${index}`} className={`terminal-v2-ladder-row ${level.side}`}>
+              .map((level, index) => {
+                const key = `${level.side}:${level.price.toFixed(4)}`;
+                return (
+                <div key={`${level.side}-${level.price}-${index}`} className={`terminal-v2-ladder-row ${level.side} ${dominantDomLevelKeys.has(key) ? "dominant" : ""}`}>
                   <span>{level.price.toFixed(2)}</span>
                   <span>{level.size.toFixed(0)}</span>
                   <span>{(level.intensity * 100).toFixed(0)}%</span>
                   <button type="button" className="chart-chip" onClick={() => onDomEntryFromLevel(level.price, level.side)}>E</button>
                   <button type="button" className="chart-chip" onClick={() => onDomExitFromLevel(level.price, level.side)}>X</button>
                 </div>
-              ))}
+              );})}
           </div>
         </div>
 
         <div className="terminal-v2-exec-card terminal-v2-exec-card-heatmap">
           <span className="terminal-v2-card-kicker">Heatmap</span>
           <div className="terminal-v2-heatmap">
-            {heatmapTop.slice(0, 6).map((level, index) => (
-              <div key={`${level.side}-${level.price}-${index}`} className="terminal-v2-heatmap-row">
+            {heatmapTop.slice(0, 6).map((level, index) => {
+              const key = `${level.side}:${level.price.toFixed(4)}`;
+              return (
+              <div key={`${level.side}-${level.price}-${index}`} className={`terminal-v2-heatmap-row ${dominantHeatmapKeys.has(key) ? "dominant" : ""}`}>
                 <span>{level.price.toFixed(1)}</span>
                 <div className="terminal-v2-meter"><div className="terminal-v2-meter-fill" style={{ width: `${Math.max(4, level.intensity * 100)}%` }} /></div>
               </div>
-            ))}
+            );})}
           </div>
         </div>
       </div>
@@ -882,8 +1161,8 @@ export default function TerminalChartV2(props: Props) {
         </div>
         <div className={`terminal-v2-multi-grid terminal-v2-multi-grid-${multiSlots}`}>
           {multiRows.map((row) => {
-            const history = quoteHistory[row.symbol] || [];
-            const values = history.slice(-48).map((point) => point.value);
+            const miniCandles = buildCandlesFromHistory(quoteHistory[row.symbol] || [], row.price);
+            const values = miniCandles.slice(-24).map((point) => point.close);
             const path = buildSparklinePath(values, 96, 24);
             return (
               <button
@@ -920,6 +1199,8 @@ export default function TerminalChartV2(props: Props) {
             <button
               type="button"
               className={`chart-chip ${autoTraderV5.enabled ? "active" : ""}`}
+              disabled={!analyticsReady}
+              title={analyticsReady ? "Toggle auto trader" : "Canonical feed required"}
               onClick={() => updateAT(s => ({
                 ...s,
                 enabled: !s.enabled,
@@ -999,15 +1280,19 @@ function buildCandlesFromHistory(
     const prev = history[index - 1] || point;
     const open = Number(prev.value);
     const close = Number(point.value);
-    const high = Math.max(open, close) * 1.0006;
-    const low = Math.min(open, close) * 0.9994;
+    const localWindow = history
+      .slice(Math.max(0, index - 3), index + 1)
+      .map((item) => Number(item.value))
+      .filter((value) => Number.isFinite(value) && value > 0);
+    const high = Math.max(open, close, ...(localWindow.length > 0 ? localWindow : [open, close]));
+    const low = Math.min(open, close, ...(localWindow.length > 0 ? localWindow : [open, close]));
     candles.push({
       label: point.label,
       open,
       high,
       low,
       close,
-      volume: Math.abs(close - open) * 1000 + 1,
+      volume: Math.max(1, Math.abs(close - open) * 1000),
     });
   }
   return candles;

@@ -1,5 +1,5 @@
 import { redirect } from "next/navigation";
-import TxtMiniGuide from "../../components/ui/TxtMiniGuide";
+import OperatorPanelGuide from "../../components/ui/OperatorPanelGuide";
 import Link from "next/link";
 import { getServerRoleGroup } from "../../lib/serverAuth";
 import RustExecutionAdminDesk from "../../components/internal/RustExecutionAdminDesk";
@@ -23,7 +23,7 @@ export default async function AdvancedPage() {
         <div className="eyebrow">TXT Advanced</div>
         <h1 className="title" style={{ fontSize: 34 }}>Outils de trading avance</h1>
         <p className="subtle">Espace expert pour construire, tester et monitorer des approches plus sophistiquees.</p>
-        <TxtMiniGuide
+        <OperatorPanelGuide
           title="Guide Advanced"
           what="Modules de performance, strategie et journaling pour traders confirmes."
           why="Donner de la profondeur analytique sans degrader la vitesse de decision."

@@ -37,8 +37,15 @@ rust-execution-engine/target/
 ui/mission-control/test-results/
 ui/mission-control/playwright-report/
 
-# Diagnostic scripts (one-off, not production code)
-ui/mission-control/scripts/
+# Mission Control scripts: ignore by default, but keep versioned test/qa tooling
+ui/mission-control/scripts/*
+!ui/mission-control/scripts/check-next-version.sh
+!ui/mission-control/scripts/mock-control-plane-cancel-replace.js
+!ui/mission-control/scripts/qa-*.sh
+!ui/mission-control/scripts/risk-workspace.integration.js
+!ui/mission-control/scripts/run_terminal_*.sh
+!ui/mission-control/scripts/test-*.js
+!ui/mission-control/scripts/test-*.sh
 
 # Smoke scripts at root
 ui/mission-control/final_smoke.js

@@ -24,8 +24,11 @@ type ChatResponse = {
   };
 };
 
+type CopilotMode = "commandant" | "assistant";
+
 const PAGE_SHORTCUTS = [
   { href: "/terminal", label: "Terminal" },
+  { href: "/live-ops", label: "Live Ops" },
   { href: "/ai", label: "AI Desk" },
   { href: "/live-capital", label: "Live Capital" },
   { href: "/connectors", label: "Connectors" },
@@ -33,20 +36,29 @@ const PAGE_SHORTCUTS = [
 ] as const;
 
 const PROMPT_SHORTCUTS = [
+  "Resume-moi le desk du jour: verite PnL, no-trade, risque, V6 et priorites.",
+  "Rappelle-moi le plan journalier a respecter avec hard stops et calibration gate.",
   "Explique-moi la différence entre fonds paper, live, exchange et wallet.",
   "Vérifie ce qu'il est possible de contrôler sur la plateforme et les fonds disponibles.",
   "Propose si la stratégie doit être promue vers un usage live et pourquoi.",
   "Résume-moi les pages utiles pour piloter le capital et les connecteurs.",
 ] as const;
 
+const COMMANDANT_SHORTCUTS = [
+  "Que faire maintenant sur le desk ?",
+  "Dois-je trader maintenant ou attendre ?",
+  "Si je passe outre, quel risque exact j'assume ?",
+] as const;
+
 export default function OpsChatbot() {
   const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [input, setInput] = useState("");
+  const [copilotMode, setCopilotMode] = useState<CopilotMode>("commandant");
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
       role: "assistant",
-      text: "Ops Copilot actif. Je peux expliquer paper/live/exchange/wallet, vérifier les workflows capital/plateforme, guider la promotion live d'une stratégie et t'orienter vers les bons desks.",
+      text: "Ops Copilot actif en mode commandant. Je peux donner une decision soft, le niveau de risque, la raison principale et rappeler qu'un override doit rester visible.",
     },
   ]);
   const [pendingAction, setPendingAction] = useState("run_runbook");
@@ -86,11 +98,15 @@ export default function OpsChatbot() {
     setInput("");
     setLoading(true);
 
+    const requestMessage = copilotMode === "commandant"
+      ? `Mode commandant. Reponds de facon directive et concise avec: DECISION, RISQUE, RAISON, OVERRIDE. ${message}`
+      : message;
+
     try {
       const response = await fetch("/api/chat/ops", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message }),
+        body: JSON.stringify({ message: requestMessage }),
       });
       const payload = (await response.json()) as ChatResponse;
       const text = String(payload.reply || "Aucune reponse");
@@ -104,6 +120,15 @@ export default function OpsChatbot() {
       }
       if ((payload.actions || []).includes("open_live_capital")) {
         setMessages((prev) => [...prev, { role: "assistant", text: "Ouvre /live-capital pour distinguer paper/live/exchange/wallet, vérifier les comptes source et poser les caps d'allocation." }]);
+      }
+      if ((payload.actions || []).includes("open_live_ops")) {
+        setMessages((prev) => [...prev, { role: "assistant", text: "Ouvre /live-ops pour lire le truth line, le plan journalier et la calibration gate du desk." }]);
+      }
+      if ((payload.actions || []).includes("open_terminal_truth")) {
+        setMessages((prev) => [...prev, { role: "assistant", text: "Ouvre /terminal et regarde le panneau Execution PnL Truth pour comparer regime, venue, execution mode et flags haute confiance." }]);
+      }
+      if ((payload.actions || []).includes("open_live_readiness")) {
+        setMessages((prev) => [...prev, { role: "assistant", text: "Ouvre /live-readiness pour voir les strategies suspendues, le drift et les garde-fous readiness." }]);
       }
       if ((payload.actions || []).includes("open_connectors_hub")) {
         setMessages((prev) => [...prev, { role: "assistant", text: "Ouvre /connectors ou /connections pour contrôler la plateforme, les credentials, les statuts d'intégration et les venues branchés." }]);
@@ -208,12 +233,36 @@ export default function OpsChatbot() {
         <div className="ops-chatbot-panel">
           <div className="ops-chatbot-head">Agent Ops</div>
             <div className="ops-chatbot-guided" style={{ paddingTop: 0 }}>
+              <div className="ops-chatbot-mode-row">
+                <label className="subtle mini" htmlFor="ops-copilot-mode">Mode</label>
+                <select id="ops-copilot-mode" value={copilotMode} onChange={(event) => setCopilotMode(event.target.value as CopilotMode)}>
+                  <option value="commandant">Commandant</option>
+                  <option value="assistant">Assistant</option>
+                </select>
+              </div>
+              <div className="subtle mini">
+                {copilotMode === "commandant"
+                  ? "Autorite soft: decision, risque, raison, override visible."
+                  : "Mode explicatif: plus narratif, moins directif."}
+              </div>
               <div className="subtle mini">Raccourcis pages</div>
               <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
                 {PAGE_SHORTCUTS.map((shortcut) => (
                   <a key={shortcut.href} href={shortcut.href} className="subtle mini">{shortcut.label}</a>
                 ))}
               </div>
+              {copilotMode === "commandant" ? (
+                <>
+                  <div className="subtle mini" style={{ marginTop: 6 }}>Commandes rapides</div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                    {COMMANDANT_SHORTCUTS.map((shortcut) => (
+                      <button key={shortcut} type="button" disabled={loading} onClick={() => void sendMessage(shortcut)}>
+                        {shortcut}
+                      </button>
+                    ))}
+                  </div>
+                </>
+              ) : null}
               <div className="subtle mini" style={{ marginTop: 6 }}>Prompts rapides</div>
               <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
                 {PROMPT_SHORTCUTS.map((shortcut) => (

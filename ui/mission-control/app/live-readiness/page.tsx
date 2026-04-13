@@ -4,7 +4,7 @@ import Link from "next/link";
 import { useEffect, useState } from "react";
 
 import HelpHint from "../../components/HelpHint";
-import TxtMiniGuide from "../../components/ui/TxtMiniGuide";
+import OperatorPanelGuide from "../../components/ui/OperatorPanelGuide";
 
 type JsonMap = Record<string, unknown>;
 
@@ -165,17 +165,20 @@ export default function LiveReadinessPage() {
   return (
     <main className="shell txt-page-shell">
       <section className="hero txt-page-hero-grid" style={{ gridTemplateColumns: "1.4fr 1fr" }}>
-        <div className="panel txt-page-hero">
-          <div className="eyebrow">Live Readiness Center <HelpHint text="Vue operationnelle: KPI memoire, derive strategie, auto-suspension et A/B live." examples={["Avant toute activation live, regarde d'abord Strategies suspendues, Drift detecte et A/B memory.", "Si un bloc est rouge ou instable, traite le probleme avant d'augmenter l'exposition."]} /></div>
-          <h1 className="title" style={{ fontSize: 34 }}>Readiness, Drift, Memory A/B</h1>
-          <p className="subtle">Calibration V3 en boucle fermee: mesure, derive, suspension auto, comparaison memory ON/OFF.</p>
-          <TxtMiniGuide
+        <div id="global-guide-readiness-hero" className="panel txt-page-hero">
+          <div className="eyebrow">Live Readiness Center</div>
+          <h1 className="title" style={{ fontSize: 34 }}>Pret pour le live, derive et test memoire</h1>
+          <p className="subtle txt-page-hero-copy">Cette page dit si les strategies restent assez propres pour continuer le live ou s'il faut freiner, suspendre et revalider.</p>
+          <OperatorPanelGuide
             title="Guide Readiness"
-            what="Indicateurs de derive, calibration et suspension automatique des strategies."
-            why="Savoir si le systeme est vraiment pret avant d'augmenter le risque en live."
-            example="Si plusieurs strategies sont suspendues et le drift grimpe, reduis l'exposition et investigate."
-            terms={["brier", "metaRisk", "allocation"]}
+            what="Les signaux qui montrent si les stratégies tiennent encore la route ou commencent à s'écarter."
+            why="Éviter d'augmenter le risque alors que la qualité se dégrade déjà."
+            example="Si plusieurs stratégies sont stoppées en même temps, réduis l'exposition et cherche ce qui a changé."
           />
+          <div className="txt-page-guide-note">
+            <strong>Regle d'usage</strong>
+            Si plusieurs blocs passent au warn en meme temps, ne cherche pas a optimiser. Coupe le rythme, garde le risque bas et traite d'abord la cause de derive.
+          </div>
           <p>
             <Link href="/">Dashboard</Link>
             {" | "}
@@ -190,7 +193,7 @@ export default function LiveReadinessPage() {
           {error ? <p className="warn">{error}</p> : null}
         </div>
         <div className="panel">
-          <div className="eyebrow">Etat Global <HelpHint text="Signaux critiques pour autoriser/retarder le passage live." examples={["Si Strategies suspendues > 0, n'ouvre pas plus de risque tant que ce n'est pas compris.", "Si Retrieval avg impact est faible ou negatif, la memoire apporte peu de valeur actuellement."]} /></div>
+          <div className="eyebrow">Etat Global <HelpHint text="Résumé rapide des signaux qui disent si le passage en live peut continuer ou doit attendre." examples={["Si des stratégies sont stoppées, n'ajoute pas plus de risque sans comprendre pourquoi.", "Si l'aide mémoire n'apporte plus grand-chose, garde-le en tête avant d'accélérer."]} /></div>
           <div className="row"><span>Strategies suspendues</span><span className={suspended.length > 0 ? "warn" : "good"}>{String(suspended.length)}</span></div>
           <div className="row"><span>Drift detecte (lignes)</span><span>{String(driftItems.filter((x) => Boolean(x.drift_detected)).length)}</span></div>
           <div className="row"><span>Retrieval avg final sim</span><span>{String(memorySummary.avg_final_similarity || "-")}</span></div>
@@ -202,7 +205,7 @@ export default function LiveReadinessPage() {
 
       <section className="grid" style={{ gridTemplateColumns: "1fr", marginBottom: 16 }}>
         <div className="panel">
-          <div className="eyebrow">Market Data Bus <HelpHint text="Observabilite homogene du bus marche partage par chart, AI et execution." examples={["Si bars ou depth passent en hard-fail, considere le terminal comme degrade et reduis l'exposition.", "SEQ GAP signifie un probleme de continuite OHLCV meme si le flux n'est pas totalement coupe."]} /></div>
+          <div className="eyebrow">Market Data Bus <HelpHint text="Ce bloc dit si le flux marché reste propre pour les graphiques, l'IA et l'exécution." examples={["Si les bougies ou la profondeur ne tiennent plus, considère l'écran comme dégradé.", "Un trou dans la suite des données mérite une vérification même si le flux n'est pas totalement coupé."]} /></div>
           <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 10, marginBottom: 10 }}>
             <span className={`chart-flow-pill tone-${pillTone(String(marketBusHealth.status || "hard-fail") === "ok" ? "ok" : "degraded")}`}>BUS {String(marketBusHealth.status || "offline").toUpperCase()}</span>
             <span className={`chart-flow-pill tone-${pillTone(ohlcvState)}`}>BARS {ohlcvState.toUpperCase()} {formatFreshness(marketBusOhlcv.freshness_ms)}</span>
@@ -228,7 +231,7 @@ export default function LiveReadinessPage() {
 
       <section className="grid" style={{ gridTemplateColumns: "1fr 1fr", marginBottom: 16 }}>
         <div className="panel">
-          <div className="eyebrow">Healthwatch Chart Capture <HelpHint text="Etat de la sonde offline et raisons advisory/critical qui pilotent la capture forensique." examples={["Si state=pending, une panne critique a ete vue mais le seuil de repetition n'est pas encore atteint.", "Advisory reasons servent de contexte mais ne doivent pas provoquer une capture si le signal public reste sain."]} /></div>
+          <div className="eyebrow">Healthwatch Chart Capture <HelpHint text="Montre si la sonde a vu un vrai problème d'écran et si une capture doit être gardée pour analyse." examples={["Un état pending veut dire qu'un souci a été vu mais pas encore confirmé assez souvent.", "Les raisons secondaires donnent du contexte, mais ne suffisent pas toujours à déclencher une capture."]} /></div>
           <div className="row"><span>Healthwatch</span><span className={String(healthwatchState.state || "healthy") === "healthy" ? "good" : "warn"}>{String(healthwatchState.state || "-")}</span></div>
           <div className="row"><span>Capture state</span><span className={String(chartOfflineCapture.state || "healthy") === "captured" ? "warn" : String(chartOfflineCapture.state || "healthy") === "pending" ? "warn" : "good"}>{String(chartOfflineCapture.state || "-")}</span></div>
           <div className="row"><span>Critical runs</span><span>{String(chartOfflineCapture.consecutive_critical_runs || 0)} / {String(chartOfflineCapture.active_threshold || chartOfflineCapture.threshold || 0)}</span></div>
@@ -241,7 +244,7 @@ export default function LiveReadinessPage() {
         </div>
 
         <div className="panel">
-          <div className="eyebrow">Public Chart Watchdog <HelpHint text="Synthese du diagnostic public 5s/15s pour verifier que le chart tient apres stabilisation." examples={["Si Early BUS OK et Settled BUS OK mais les candle pixels chutent fortement, il faut re-investiguer le rendu ou les snapshots vides transitoires.", "MD OK + SEQ OK + candle pixels stables indiquent que le chart public reste exploitable." ]} /></div>
+          <div className="eyebrow">Public Chart Watchdog <HelpHint text="Résumé du contrôle du graphique public pour vérifier qu'il reste bien visible après stabilisation." examples={["Si les signaux sont bons mais que l'image se vide, il faut relancer l'enquête côté rendu.", "Si les données tiennent et que l'affichage reste stable, le graphique reste utilisable."]} /></div>
           <div className="row"><span>State</span><span className={String(publicChartVisibility.state || "healthy") === "healthy" ? "good" : "warn"}>{String(publicChartVisibility.state || "-")}</span></div>
           <div className="row"><span>Auth status</span><span>{String(publicChartVisibility.auth_status || "-")}</span></div>
           <div className="row"><span>Early BUS / MD</span><span>{String(Boolean(publicChartEarly.busOk))} / {String(Boolean(publicChartEarly.mdOk))}</span></div>
@@ -253,7 +256,7 @@ export default function LiveReadinessPage() {
 
       <section className="grid" style={{ gridTemplateColumns: "1fr 1fr", marginBottom: 16 }}>
         <div className="panel">
-          <div className="eyebrow">KPI Memoire <HelpHint text="Qualite retrieval: similarite moyenne, impact sur score et winrate top cases." examples={["Si avg_final_similarity monte, la memoire retrouve des cas plus proches.", "Si avg_win_rate_top baisse, les souvenirs ramenes ne sont peut-etre plus utiles au regime courant."]} /></div>
+          <div className="eyebrow">KPI Memoire <HelpHint text="Ces chiffres disent si la mémoire retrouve encore des cas utiles ou si elle aide moins qu'avant." examples={["Si la proximité moyenne monte, la mémoire retombe sur des situations plus proches.", "Si le taux de réussite des cas retrouvés baisse, l'aide mémoire perd en intérêt."]} /></div>
           <div className="row"><span>Samples</span><span>{String(memorySummary.samples || 0)}</span></div>
           <div className="row"><span>Avg vector similarity</span><span>{String(memorySummary.avg_vector_similarity || "-")}</span></div>
           <div className="row"><span>Avg final similarity</span><span>{String(memorySummary.avg_final_similarity || "-")}</span></div>
@@ -261,23 +264,25 @@ export default function LiveReadinessPage() {
         </div>
 
         <div className="panel">
-          <div className="eyebrow">A/B Live Memory <HelpHint text="Comparaison winrate et outcome entre bras memory_on et memory_off." examples={["Si memory_on gagne mieux que memory_off, continue l'experimentation avec plus de volume.", "Si p-value est grande, considere le resultat comme indicatif mais pas encore prouve."]} /></div>
+          <div className="eyebrow">A/B Live Memory <HelpHint text="Compare simplement les résultats avec mémoire activée et mémoire coupée." examples={["Si la version avec mémoire fait mieux, continue à observer avec plus de volume.", "Si l'écart reste fragile, ne prends pas ce résultat pour une vérité définitive."]} /></div>
           <div className="row"><span>Winrate delta (on-off)</span><span>{String(withVsWithout.winrate_delta ?? "-")}</span></div>
           <div className="row"><span>p-value (2-sided)</span><span>{String(withVsWithout.p_value_two_sided ?? "-")}</span></div>
           <div className="row"><span>Significant @95%</span><span>{String(withVsWithout.significant_95 ?? false)}</span></div>
           {abArms.length === 0 ? <p className="subtle">Pas assez d'echantillons A/B.</p> : null}
-          {abArms.map((arm) => (
-            <div className="row" key={String(arm.arm)}>
-              <span>{String(arm.arm)}</span>
-              <span>winrate={String(arm.win_rate || "-")} | avg={String(arm.avg_outcome || "-")}</span>
-            </div>
-          ))}
+          <div className="txt-scroll-shell compact">
+            {abArms.map((arm) => (
+              <div className="row" key={String(arm.arm)}>
+                <span>{String(arm.arm)}</span>
+                <span>winrate={String(arm.win_rate || "-")} | avg={String(arm.avg_outcome || "-")}</span>
+              </div>
+            ))}
+          </div>
         </div>
       </section>
 
       <section className="grid" style={{ gridTemplateColumns: "1fr 1fr", marginBottom: 16 }}>
         <div className="panel">
-          <div className="eyebrow">Seuils Derive par Regime <HelpHint text="Seuils de blocage auto: min samples, min winrate, drawdown max, perte moyenne max." examples={["Exemple: pour trend, impose au moins 25 trades et 52% de winrate avant de faire confiance au regime.", "Si une strategie casse max_drawdown_usd, elle doit etre suspendue plus vite."]} /></div>
+          <div className="eyebrow">Seuils Derive par Regime <HelpHint text="Ici, tu règles à partir de quand le système doit freiner ou stopper une stratégie." examples={["Tu peux demander un minimum d'historique avant de faire confiance à une stratégie.", "Si la perte devient trop forte, la stratégie doit être stoppée plus tôt."]} /></div>
           <div className="form-grid" style={{ marginTop: 10 }}>
             <input value={regime} onChange={(e) => setRegime(e.target.value)} placeholder="regime" />
             <input type="number" value={minSamples} onChange={(e) => setMinSamples(Number(e.target.value || 0))} placeholder="min_samples" />
@@ -297,31 +302,35 @@ export default function LiveReadinessPage() {
         </div>
 
         <div className="panel">
-          <div className="eyebrow">Auto-Suspension <HelpHint text="Strategies bloquees automatiquement si derive detectee selon les seuils du regime." examples={["Quand une strategie apparait ici, le systeme l'a deja stoppee pour te proteger.", "Clique Resume seulement si la cause de derive est comprise et traitee."]} /></div>
+          <div className="eyebrow">Auto-Suspension <HelpHint text="La liste montre les stratégies déjà stoppées automatiquement pour éviter d'aggraver la situation." examples={["Si une stratégie apparaît ici, considère-la comme protégée par défaut.", "Ne la relance que si la cause du problème est comprise et traitée."]} /></div>
           {suspended.length === 0 ? <p className="subtle">Aucune strategie suspendue.</p> : null}
-          {suspended.map((row) => (
-            <div className="row" key={String(row.strategy_id)}>
-              <span>{String(row.strategy_id)} | {String(row.market)}</span>
-              <form method="post" action={`/api/strategies/${String(row.strategy_id)}/resume`}>
-                <button type="submit">Resume</button>
-              </form>
-            </div>
-          ))}
+          <div className="txt-scroll-shell compact">
+            {suspended.map((row) => (
+              <div className="row" key={String(row.strategy_id)}>
+                <span>{String(row.strategy_id)} | {String(row.market)}</span>
+                <form method="post" action={`/api/strategies/${String(row.strategy_id)}/resume`}>
+                  <button type="submit">Resume</button>
+                </form>
+              </div>
+            ))}
+          </div>
         </div>
       </section>
 
       <section className="grid" style={{ gridTemplateColumns: "1fr" }}>
         <div className="panel">
-          <div className="eyebrow">Drift Details <HelpHint text="Detail regime/strategie avec raisons de derive pour investigation et recalibration." examples={["Lis la colonne reason pour savoir si le souci vient du winrate, du drawdown ou du sample count.", "Utilise ce detail pour ajuster les seuils plutot que relancer a l'aveugle."]} /></div>
+          <div className="eyebrow">Drift Details <HelpHint text="Détail des écarts détectés pour comprendre d'où vient le problème avant de relancer." examples={["Lis la raison affichée pour voir si le souci vient du taux de réussite, de la perte ou du manque d'historique.", "Sers-toi de ce détail pour corriger le cadre plutôt que de relancer au hasard."]} /></div>
           {driftItems.length === 0 ? <p className="subtle">Aucune ligne de drift pour le moment.</p> : null}
-          {driftItems.slice(0, 80).map((row, idx) => (
-            <div className="row" key={`${String(row.strategy_id)}-${String(row.regime)}-${idx}`}>
-              <span>{String(row.strategy_id)} | {String(row.regime)} | sample={String(row.sample_count)}</span>
-              <span className={Boolean(row.drift_detected) ? "warn" : "good"}>
-                drift={String(row.drift_detected)} | win={String(row.win_rate || "-")} | dd={String(row.drawdown_usd || "-")} | {String(row.reason || "")}
-              </span>
-            </div>
-          ))}
+          <div className="txt-scroll-shell">
+            {driftItems.slice(0, 80).map((row, idx) => (
+              <div className="row" key={`${String(row.strategy_id)}-${String(row.regime)}-${idx}`}>
+                <span>{String(row.strategy_id)} | {String(row.regime)} | sample={String(row.sample_count)}</span>
+                <span className={Boolean(row.drift_detected) ? "warn" : "good"}>
+                  drift={String(row.drift_detected)} | win={String(row.win_rate || "-")} | dd={String(row.drawdown_usd || "-")} | {String(row.reason || "")}
+                </span>
+              </div>
+            ))}
+          </div>
         </div>
       </section>
     </main>

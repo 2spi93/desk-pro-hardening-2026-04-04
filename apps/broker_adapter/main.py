@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from decimal import Decimal, InvalidOperation
 from datetime import datetime, timezone
 import hashlib
 import hmac
+import json
 import math
 import os
 import time
@@ -21,6 +23,7 @@ REAL_BROKER_PROVIDER = os.getenv("REAL_BROKER_PROVIDER", "binance")
 REAL_BROKER_API_KEY = os.getenv("REAL_BROKER_API_KEY", "")
 REAL_BROKER_API_SECRET = os.getenv("REAL_BROKER_API_SECRET", "")
 BINGX_API_BASE_URL = os.getenv("BINGX_API_BASE_URL", "https://open-api.bingx.com").rstrip("/")
+BYBIT_API_BASE_URL = os.getenv("BYBIT_API_BASE_URL", "https://api.bybit.com").rstrip("/")
 
 
 def _now_iso() -> str:
@@ -41,6 +44,27 @@ def _format_decimal(value: float, digits: int = 8) -> str:
 
 def _json_number(value: float, digits: int = 8) -> float:
     return float(_format_decimal(value, digits))
+
+
+def _precision_digits(value: object) -> int:
+    raw = str(value or "").strip()
+    if not raw:
+        return 0
+    try:
+        exponent = Decimal(raw).normalize().as_tuple().exponent
+        return max(0, -exponent)
+    except (InvalidOperation, ValueError):
+        rendered = f"{_to_float(value, 0.0):.16f}".rstrip("0")
+        if "." in rendered:
+            return len(rendered.split(".", 1)[1])
+        return 0
+
+
+def _bybit_timestamp_to_iso(value: object) -> str:
+    timestamp_ms = _to_float(value, 0.0)
+    if timestamp_ms <= 0:
+        return _now_iso()
+    return datetime.fromtimestamp(timestamp_ms / 1000.0, tz=timezone.utc).isoformat()
 
 
 def _default_bingx_position_side(side: str, reduce_only: bool) -> str:
@@ -70,6 +94,29 @@ def _normalize_bingx_symbol(symbol: str) -> str:
 
 def _canonical_instrument(symbol: str) -> str:
     return str(symbol or "").replace("/", "").replace("-", "").upper()
+
+
+def _normalize_bybit_symbol(symbol: str) -> str:
+    raw = str(symbol or "").strip().upper().replace("/", "").replace("-", "")
+    for suffix in ("PERP", "SWAP"):
+        if raw.endswith(suffix):
+            raw = raw[: -len(suffix)]
+            break
+    return raw
+
+
+def _bybit_category(symbol: str) -> str:
+    normalized = _normalize_bybit_symbol(symbol)
+    return "linear" if normalized.endswith(("USDT", "USDC")) else "spot"
+
+
+def _default_bybit_position_idx(position_side: str, reduce_only: bool) -> int:
+    normalized = str(position_side or "").strip().upper()
+    if normalized == "LONG":
+        return 1
+    if normalized == "SHORT":
+        return 2
+    return 0 if not reduce_only else 0
 
 
 def _unwrap_bingx_response(path: str, body: object) -> object:
@@ -140,6 +187,456 @@ async def _bingx_signed_request(secret_payload: dict, method: str, path: str, pa
     except ValueError as exc:
         raise RuntimeError(f"BingX {path} returned invalid JSON") from exc
     return _unwrap_bingx_response(path, body)
+
+
+def _unwrap_bybit_response(path: str, body: object) -> object:
+    if not isinstance(body, dict):
+        raise RuntimeError(f"Bybit {path} returned an invalid payload")
+    ret_code = body.get("retCode")
+    if ret_code not in {None, 0, "0"}:
+        detail = str(body.get("retMsg") or body.get("retExtInfo") or "unknown error")
+        raise RuntimeError(f"Bybit {path} rejected the request: {detail}")
+    result = body.get("result")
+    if isinstance(result, (dict, list)):
+        return result
+    return body
+
+
+async def _bybit_public_get(path: str, params: dict | None = None) -> object:
+    query = {
+        str(key): str(value)
+        for key, value in (params or {}).items()
+        if value is not None and str(value).strip()
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(f"{BYBIT_API_BASE_URL}{path}", params=query)
+    except httpx.HTTPError as exc:
+        raise RuntimeError(f"Bybit {path} public request failed: {str(exc)[:300]}") from exc
+    if response.status_code >= 400:
+        raise RuntimeError(f"Bybit {path} public request failed with status {response.status_code}: {response.text[:300]}")
+    try:
+        body = response.json()
+    except ValueError as exc:
+        raise RuntimeError(f"Bybit {path} returned invalid JSON") from exc
+    return _unwrap_bybit_response(path, body)
+
+
+async def _bybit_signed_request(secret_payload: dict, method: str, path: str, params: dict | None = None, body: dict | None = None) -> object:
+    api_key = str(secret_payload.get("api_key") or "").strip()
+    api_secret = str(secret_payload.get("api_secret") or "").strip()
+    if not api_key or not api_secret:
+        raise ValueError("Bybit live trading requires an API key and secret")
+    recv_window = str(secret_payload.get("recv_window") or "5000")
+    timestamp = str(int(time.time() * 1000))
+    query = {
+        str(key): str(value)
+        for key, value in (params or {}).items()
+        if value is not None and str(value).strip()
+    }
+    body_payload = {
+        str(key): value
+        for key, value in (body or {}).items()
+        if value is not None and (not isinstance(value, str) or value.strip())
+    }
+    query_string = urlencode(sorted(query.items()))
+    body_string = json.dumps(body_payload, separators=(",", ":"), ensure_ascii=True)
+    payload_to_sign = f"{timestamp}{api_key}{recv_window}{query_string if method.upper() == 'GET' else body_string}"
+    signature = hmac.new(api_secret.encode("utf-8"), payload_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+    headers = {
+        "X-BAPI-API-KEY": api_key,
+        "X-BAPI-TIMESTAMP": timestamp,
+        "X-BAPI-RECV-WINDOW": recv_window,
+        "X-BAPI-SIGN": signature,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.request(
+                method.upper(),
+                f"{BYBIT_API_BASE_URL}{path}",
+                params=query if method.upper() == "GET" else None,
+                json=body_payload if method.upper() != "GET" else None,
+                headers=headers,
+            )
+    except httpx.HTTPError as exc:
+        raise RuntimeError(f"Bybit {path} request failed: {str(exc)[:300]}") from exc
+    if response.status_code >= 400:
+        raise RuntimeError(f"Bybit {path} failed with status {response.status_code}: {response.text[:300]}")
+    try:
+        body_result = response.json()
+    except ValueError as exc:
+        raise RuntimeError(f"Bybit {path} returned invalid JSON") from exc
+    return _unwrap_bybit_response(path, body_result)
+
+
+async def _bybit_instrument_spec(symbol: str) -> dict[str, float | int | str]:
+    normalized = _normalize_bybit_symbol(symbol)
+    category = _bybit_category(symbol)
+    payload = await _bybit_public_get("/v5/market/instruments-info", {"category": category, "symbol": normalized})
+    rows = payload.get("list") if isinstance(payload, dict) else None
+    item = rows[0] if isinstance(rows, list) and rows else None
+    if not isinstance(item, dict):
+        return {}
+    lot_filter = item.get("lotSizeFilter") if isinstance(item.get("lotSizeFilter"), dict) else {}
+    price_filter = item.get("priceFilter") if isinstance(item.get("priceFilter"), dict) else {}
+    base_precision = max(
+        _precision_digits(lot_filter.get("qtyStep")),
+        _precision_digits(item.get("basePrecision")),
+        0,
+    )
+    qty_step = _to_float(lot_filter.get("qtyStep") or lot_filter.get("basePrecision"), 0.0)
+    min_qty = _to_float(lot_filter.get("minOrderQty"), 0.0)
+    max_qty = _to_float(lot_filter.get("maxOrderQty"), 0.0)
+    max_market_qty = _to_float(lot_filter.get("maxMktOrderQty") or lot_filter.get("maxOrderQty"), 0.0)
+    min_notional = _to_float(lot_filter.get("minNotionalValue"), 0.0)
+    tick_size = _to_float(price_filter.get("tickSize"), 0.0)
+    min_price = _to_float(price_filter.get("minPrice"), 0.0)
+    max_price = _to_float(price_filter.get("maxPrice"), 0.0)
+    price_precision = max(_precision_digits(price_filter.get("tickSize")), int(_to_float(item.get("priceScale"), 0.0)), 0)
+    return {
+        "symbol": normalized,
+        "category": category,
+        "qty_step": qty_step,
+        "min_qty": min_qty,
+        "max_qty": max_qty,
+        "max_market_qty": max_market_qty,
+        "min_notional": min_notional,
+        "price_precision": price_precision,
+        "base_precision": base_precision,
+        "tick_size": tick_size,
+        "min_price": min_price,
+        "max_price": max_price,
+    }
+
+
+def _bybit_normalize_price(price: float, instrument_spec: dict[str, float | int | str]) -> float:
+    if price <= 0:
+        return 0.0
+    tick_size = _to_float(instrument_spec.get("tick_size"), 0.0)
+    price_precision = int(instrument_spec.get("price_precision") or 0)
+    min_price = _to_float(instrument_spec.get("min_price"), 0.0)
+    max_price = _to_float(instrument_spec.get("max_price"), 0.0)
+    if min_price > 0:
+        price = max(price, min_price)
+    if max_price > 0:
+        price = min(price, max_price)
+    if tick_size > 0:
+        return _round_to_precision(_step_floor(price, tick_size), price_precision)
+    return _round_to_precision(price, price_precision)
+
+
+def _bybit_normalize_quantity(quantity: float, instrument_spec: dict[str, float | int | str], reference_price: float, requested_notional_usd: float) -> float:
+    if quantity <= 0:
+        return 0.0
+    qty_step = _to_float(instrument_spec.get("qty_step"), 0.0)
+    min_qty = max(_to_float(instrument_spec.get("min_qty"), 0.0), qty_step)
+    max_qty = _to_float(instrument_spec.get("max_market_qty"), 0.0)
+    if max_qty <= 0:
+        max_qty = _to_float(instrument_spec.get("max_qty"), 0.0)
+    min_notional = _to_float(instrument_spec.get("min_notional"), 0.0)
+    min_notional_qty = min_notional / max(reference_price, 1e-9) if reference_price > 0 and min_notional > 0 else 0.0
+    minimum_quantity = max(min_qty, min_notional_qty)
+    base_precision = int(instrument_spec.get("base_precision") or 0)
+    if qty_step > 0:
+        quantity = _step_floor(quantity, qty_step)
+        if quantity < minimum_quantity:
+            quantity = _step_ceil(max(minimum_quantity, requested_notional_usd / max(reference_price, 1e-9) if reference_price > 0 else minimum_quantity), qty_step)
+    else:
+        quantity = max(quantity, minimum_quantity)
+    if max_qty > 0:
+        quantity = min(quantity, _step_floor(max_qty, qty_step) if qty_step > 0 else max_qty)
+    return _round_to_precision(quantity, base_precision)
+
+
+def _bybit_status(raw_status: object) -> str:
+    status = str(raw_status or "").strip().upper()
+    if status in {"FILLED", "FULLYFILLED", "PARTIALLYFILLED"}:
+        return "filled" if status == "FILLED" or status == "FULLYFILLED" else "partially_filled"
+    if status in {"CANCELLED", "CANCELED", "DEACTIVATED", "REJECTED", "FAILED"}:
+        return "cancelled" if "CANCEL" in status or status == "DEACTIVATED" else "rejected"
+    if status in {"NEW", "CREATED", "UNTRIGGERED", "PARTIALLYFILLEDCANCELED"}:
+        return "open"
+    return "unknown"
+
+
+def _bybit_fill_from_execution(execution: dict, *, symbol: str, fallback_fill_id: str) -> dict | None:
+    exec_price = _to_float(execution.get("execPrice") or execution.get("price"), 0.0)
+    exec_qty = _to_float(execution.get("execQty") or execution.get("qty"), 0.0)
+    if exec_price <= 0 or exec_qty <= 0:
+        return None
+    exec_value = _to_float(execution.get("execValue"), exec_price * exec_qty)
+    return {
+        "fill_id": str(execution.get("execId") or fallback_fill_id),
+        "venue": "bybit",
+        "instrument": _canonical_instrument(symbol),
+        "price": exec_price,
+        "size_base": exec_qty,
+        "notional_usd": exec_value,
+        "fill_type": "live-broker",
+        "fill_latency_ms": 0,
+        "filled_at": _bybit_timestamp_to_iso(execution.get("execTime") or execution.get("updatedTime") or execution.get("createdTime")),
+    }
+
+
+def _bybit_order_snapshot(payload: dict, *, symbol: str, side: str, requested_notional_usd: float, executions: list[dict] | None = None) -> dict:
+    avg_fill_price = _to_float(payload.get("avgPrice") or payload.get("price"), 0.0)
+    requested_qty = _to_float(payload.get("qty"), 0.0)
+    executed_qty = _to_float(payload.get("cumExecQty"), 0.0)
+    if executed_qty <= 0:
+        executed_qty = requested_qty if _bybit_status(payload.get("orderStatus") or payload.get("status")) == "filled" else 0.0
+    filled_notional_usd = _to_float(payload.get("cumExecValue"), 0.0)
+    if filled_notional_usd <= 0 and executed_qty > 0 and avg_fill_price > 0:
+        filled_notional_usd = executed_qty * avg_fill_price
+    order_id = str(payload.get("orderId") or "").strip()
+    client_order_id = str(payload.get("orderLinkId") or "").strip()
+    raw_status = str(payload.get("orderStatus") or payload.get("status") or "").strip()
+    normalized_status = _bybit_status(raw_status)
+    fills: list[dict] = []
+    if isinstance(executions, list):
+        for index, execution in enumerate(executions):
+            if not isinstance(execution, dict):
+                continue
+            fill = _bybit_fill_from_execution(execution, symbol=symbol, fallback_fill_id=f"{order_id or client_order_id or 'fill'}-{index}")
+            if fill:
+                fills.append(fill)
+    if not fills and executed_qty > 0 and avg_fill_price > 0:
+        fills.append(
+            {
+                "fill_id": order_id or client_order_id or f"fill-{int(time.time() * 1000)}",
+                "venue": "bybit",
+                "instrument": _canonical_instrument(symbol),
+                "price": avg_fill_price,
+                "size_base": executed_qty,
+                "notional_usd": filled_notional_usd,
+                "fill_type": "live-broker",
+                "fill_latency_ms": 0,
+                "filled_at": _bybit_timestamp_to_iso(payload.get("updatedTime") or payload.get("createdTime")),
+            }
+        )
+    if fills:
+        executed_qty = sum(_to_float(fill.get("size_base"), 0.0) for fill in fills)
+        filled_notional_usd = sum(_to_float(fill.get("notional_usd"), 0.0) for fill in fills)
+        if avg_fill_price <= 0 and executed_qty > 0:
+            avg_fill_price = filled_notional_usd / max(executed_qty, 1e-9)
+    return {
+        "provider": "bybit",
+        "venue": "bybit",
+        "order_id": order_id,
+        "client_order_id": client_order_id,
+        "status": normalized_status,
+        "raw_status": raw_status,
+        "instrument": _canonical_instrument(symbol),
+        "side": side,
+        "order_type": str(payload.get("orderType") or "").strip().lower(),
+        "requested_notional_usd": requested_notional_usd,
+        "requested_quantity": requested_qty,
+        "filled_quantity": executed_qty,
+        "filled_notional_usd": filled_notional_usd,
+        "avg_fill_price": avg_fill_price,
+        "limit_price": _to_float(payload.get("price"), 0.0),
+        "created_at": _bybit_timestamp_to_iso(payload.get("createdTime")),
+        "updated_at": _bybit_timestamp_to_iso(payload.get("updatedTime") or payload.get("createdTime")),
+        "fills": fills,
+        "raw_order": payload,
+    }
+
+
+async def _bybit_query_order(secret_payload: dict, symbol: str, order_id: str | None, client_order_id: str | None, requested_notional_usd: float, side: str) -> dict | None:
+    if not order_id and not client_order_id:
+        return None
+    params = {"category": _bybit_category(symbol), "symbol": _normalize_bybit_symbol(symbol)}
+    if order_id:
+        params["orderId"] = order_id
+    if client_order_id:
+        params["orderLinkId"] = client_order_id
+    item: dict | None = None
+    try:
+        payload = await _bybit_signed_request(secret_payload, "GET", "/v5/order/realtime", params=params)
+    except Exception:
+        payload = None
+    rows = payload.get("list") if isinstance(payload, dict) else None
+    item = rows[0] if isinstance(rows, list) and rows else None
+    if not isinstance(item, dict):
+        try:
+            payload = await _bybit_signed_request(secret_payload, "GET", "/v5/order/history", params=params)
+        except Exception:
+            payload = None
+        rows = payload.get("list") if isinstance(payload, dict) else None
+        item = rows[0] if isinstance(rows, list) and rows else None
+    if not isinstance(item, dict):
+        return None
+    executions: list[dict] = []
+    execution_params = {"category": _bybit_category(symbol), "symbol": _normalize_bybit_symbol(symbol), "limit": 50}
+    if order_id:
+        execution_params["orderId"] = order_id
+    if client_order_id:
+        execution_params["orderLinkId"] = client_order_id
+    try:
+        execution_payload = await _bybit_signed_request(secret_payload, "GET", "/v5/execution/list", params=execution_params)
+    except Exception:
+        execution_payload = None
+    execution_rows = execution_payload.get("list") if isinstance(execution_payload, dict) else None
+    if isinstance(execution_rows, list):
+        executions = [row for row in execution_rows if isinstance(row, dict)]
+    return _bybit_order_snapshot(item, symbol=symbol, side=side, requested_notional_usd=requested_notional_usd, executions=executions)
+
+
+async def _bybit_place_live_order(payload: dict) -> dict:
+    secret_payload = payload.get("secret_payload") if isinstance(payload.get("secret_payload"), dict) else None
+    if not isinstance(secret_payload, dict):
+        raise ValueError("secret_payload is required for Bybit live orders")
+    side = str(payload.get("side") or "buy").strip().lower()
+    if side not in {"buy", "sell"}:
+        raise ValueError("side must be buy or sell")
+    symbol = _normalize_bybit_symbol(str(payload.get("symbol") or ""))
+    if not symbol:
+        raise ValueError("symbol is required")
+    order_type = str(payload.get("order_type") or "MARKET").strip().upper()
+    requested_notional_usd = _to_float(payload.get("notional_usd"), 0.0)
+    quantity = _to_float(payload.get("quantity"), 0.0)
+    price = _to_float(payload.get("price"), 0.0)
+    instrument_spec = await _bybit_instrument_spec(symbol)
+    category = str(instrument_spec.get("category") or _bybit_category(symbol))
+    reference_price = await _reference_price_for_market_order(symbol, side)
+    sizing_reference_price = price if price > 0 else reference_price
+    if quantity <= 0:
+        if requested_notional_usd <= 0 or reference_price <= 0:
+            raise ValueError("Bybit live orders require quantity or notional_usd with a valid reference price")
+        quantity = requested_notional_usd / max(reference_price, 1e-9)
+    quantity = _bybit_normalize_quantity(quantity, instrument_spec, sizing_reference_price, requested_notional_usd)
+    if quantity <= 0:
+        raise ValueError("normalized Bybit quantity is zero")
+    max_allowed_qty = _to_float(instrument_spec.get("max_market_qty" if order_type == "MARKET" else "max_qty"), 0.0)
+    if max_allowed_qty > 0 and quantity > max_allowed_qty:
+        raise ValueError(f"normalized Bybit quantity {quantity} exceeds instrument limit {max_allowed_qty}")
+    body: dict[str, object] = {
+        "category": category,
+        "symbol": symbol,
+        "side": "Buy" if side == "buy" else "Sell",
+        "orderType": "Market" if order_type == "MARKET" else "Limit",
+        "qty": _format_decimal(quantity, max(2, int(instrument_spec.get("base_precision") or 8))),
+        "orderLinkId": str(payload.get("client_order_id") or f"txt-{int(time.time() * 1000)}")[:36],
+        "reduceOnly": bool(payload.get("reduce_only", False)),
+    }
+    position_idx = _default_bybit_position_idx(str(payload.get("position_side") or ""), bool(payload.get("reduce_only", False)))
+    if category == "linear" and position_idx > 0:
+        body["positionIdx"] = position_idx
+    if order_type != "MARKET":
+        if price <= 0:
+            raise ValueError("LIMIT-style orders require price")
+        normalized_price = _bybit_normalize_price(price, instrument_spec)
+        if normalized_price <= 0:
+            raise ValueError("normalized Bybit price is zero")
+        body["price"] = _format_decimal(normalized_price, max(2, int(instrument_spec.get("price_precision") or 8)))
+        body["timeInForce"] = str(payload.get("time_in_force") or "GTC").strip().upper()
+    order = await _bybit_signed_request(secret_payload, "POST", "/v5/order/create", body=body)
+    if not isinstance(order, dict):
+        raise RuntimeError("Bybit order placement returned an invalid payload")
+    snapshot = _bybit_order_snapshot(order, symbol=symbol, side=side, requested_notional_usd=requested_notional_usd)
+    queried = await _bybit_query_order(secret_payload, symbol, snapshot.get("order_id"), snapshot.get("client_order_id"), requested_notional_usd, side)
+    return queried or snapshot
+
+
+async def _bybit_cancel_live_order(payload: dict) -> dict:
+    secret_payload = payload.get("secret_payload") if isinstance(payload.get("secret_payload"), dict) else None
+    if not isinstance(secret_payload, dict):
+        raise ValueError("secret_payload is required for Bybit cancellations")
+    symbol = _normalize_bybit_symbol(str(payload.get("symbol") or ""))
+    if not symbol:
+        raise ValueError("symbol is required")
+    order_id = str(payload.get("order_id") or "").strip()
+    client_order_id = str(payload.get("client_order_id") or "").strip()
+    if not order_id and not client_order_id:
+        raise ValueError("order_id or client_order_id is required")
+    body: dict[str, object] = {"category": _bybit_category(symbol), "symbol": symbol}
+    if order_id:
+        body["orderId"] = order_id
+    if client_order_id:
+        body["orderLinkId"] = client_order_id
+    cancelled = await _bybit_signed_request(secret_payload, "POST", "/v5/order/cancel", body=body)
+    if not isinstance(cancelled, dict):
+        raise RuntimeError("Bybit cancel returned an invalid payload")
+    side = str(payload.get("side") or "buy").strip().lower()
+    queried = await _bybit_query_order(secret_payload, symbol, str(cancelled.get("orderId") or order_id), str(cancelled.get("orderLinkId") or client_order_id), _to_float(payload.get("notional_usd"), 0.0), side)
+    result = queried or _bybit_order_snapshot(cancelled, symbol=symbol, side=side, requested_notional_usd=_to_float(payload.get("notional_usd"), 0.0))
+    result["cancel_ack"] = cancelled
+    if result.get("status") == "unknown":
+        result["status"] = "cancelled"
+    return result
+
+
+async def _bybit_live_order_status(payload: dict) -> dict:
+    secret_payload = payload.get("secret_payload") if isinstance(payload.get("secret_payload"), dict) else None
+    if not isinstance(secret_payload, dict):
+        raise ValueError("secret_payload is required for Bybit order status")
+    symbol = _normalize_bybit_symbol(str(payload.get("symbol") or ""))
+    if not symbol:
+        raise ValueError("symbol is required")
+    order_id = str(payload.get("order_id") or "").strip()
+    client_order_id = str(payload.get("client_order_id") or "").strip()
+    if not order_id and not client_order_id:
+        raise ValueError("order_id or client_order_id is required")
+    result = await _bybit_query_order(
+        secret_payload,
+        symbol,
+        order_id or None,
+        client_order_id or None,
+        _to_float(payload.get("notional_usd"), 0.0),
+        str(payload.get("side") or "buy").strip().lower(),
+    )
+    if not isinstance(result, dict):
+        raise RuntimeError("Bybit order not found")
+    return result
+
+
+async def _bybit_amend_live_order(payload: dict) -> dict:
+    secret_payload = payload.get("secret_payload") if isinstance(payload.get("secret_payload"), dict) else None
+    if not isinstance(secret_payload, dict):
+        raise ValueError("secret_payload is required for Bybit amendments")
+    side = str(payload.get("side") or "buy").strip().lower()
+    symbol = _normalize_bybit_symbol(str(payload.get("symbol") or ""))
+    if not symbol:
+        raise ValueError("symbol is required")
+    order_id = str(payload.get("order_id") or "").strip()
+    client_order_id = str(payload.get("client_order_id") or "").strip()
+    if not order_id and not client_order_id:
+        raise ValueError("order_id or client_order_id is required")
+    body: dict[str, object] = {"category": _bybit_category(symbol), "symbol": symbol}
+    if order_id:
+        body["orderId"] = order_id
+    if client_order_id:
+        body["orderLinkId"] = client_order_id
+    price = _to_float(payload.get("price"), 0.0)
+    quantity = _to_float(payload.get("quantity"), 0.0)
+    if price <= 0 and quantity <= 0:
+        raise ValueError("price or quantity is required for amendment")
+    instrument_spec = await _bybit_instrument_spec(symbol)
+    if price > 0:
+        normalized_price = _bybit_normalize_price(price, instrument_spec)
+        if normalized_price <= 0:
+            raise ValueError("normalized Bybit price is zero")
+        body["price"] = _format_decimal(normalized_price, max(2, int(instrument_spec.get("price_precision") or 8)))
+    if quantity > 0:
+        normalized_quantity = _bybit_normalize_quantity(quantity, instrument_spec, price if price > 0 else _to_float(payload.get("reference_price"), 0.0), _to_float(payload.get("notional_usd"), 0.0))
+        if normalized_quantity <= 0:
+            raise ValueError("normalized Bybit quantity is zero")
+        body["qty"] = _format_decimal(normalized_quantity, max(2, int(instrument_spec.get("base_precision") or 8)))
+    amended = await _bybit_signed_request(secret_payload, "POST", "/v5/order/amend", body=body)
+    if not isinstance(amended, dict):
+        raise RuntimeError("Bybit amend returned an invalid payload")
+    queried = await _bybit_query_order(
+        secret_payload,
+        symbol,
+        str(amended.get("orderId") or order_id),
+        str(amended.get("orderLinkId") or client_order_id),
+        _to_float(payload.get("notional_usd"), 0.0),
+        side,
+    )
+    if not isinstance(queried, dict):
+        raise RuntimeError("Bybit amended order could not be reloaded")
+    queried["amend_ack"] = amended
+    queried["modify_supported"] = True
+    return queried
 
 
 async def _bingx_margin_snapshot(secret_payload: dict) -> dict[str, float]:
@@ -644,6 +1141,35 @@ async def _bingx_cancel_live_order(payload: dict) -> dict:
     return result
 
 
+async def _bingx_live_order_status(payload: dict) -> dict:
+    secret_payload = payload.get("secret_payload") if isinstance(payload.get("secret_payload"), dict) else None
+    if not isinstance(secret_payload, dict):
+        raise ValueError("secret_payload is required for BingX order status")
+    side = str(payload.get("side") or "buy").strip().lower()
+    symbol = _normalize_bingx_symbol(str(payload.get("symbol") or ""))
+    order_id = str(payload.get("order_id") or "").strip()
+    client_order_id = str(payload.get("client_order_id") or "").strip()
+    if not symbol:
+        raise ValueError("symbol is required")
+    if not order_id and not client_order_id:
+        raise ValueError("order_id or client_order_id is required")
+    result = await _bingx_query_order(
+        secret_payload,
+        symbol,
+        order_id or None,
+        client_order_id or None,
+        _to_float(payload.get("notional_usd"), 0.0),
+        side,
+    )
+    if not isinstance(result, dict):
+        raise RuntimeError("BingX order not found")
+    return result
+
+
+async def _bingx_amend_live_order(payload: dict) -> dict:
+    raise ValueError("native amend is not enabled for BingX in this stack")
+
+
 def _binance_sign(params: dict[str, str]) -> str:
     query = urlencode(params)
     return hmac.new(REAL_BROKER_API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
@@ -661,6 +1187,8 @@ async def health() -> dict:
         async with httpx.AsyncClient(timeout=10.0) as client:
             if REAL_BROKER_PROVIDER == "bingx":
                 response = await client.get(f"{BINGX_API_BASE_URL}/openApi/swap/v2/quote/contracts")
+            elif REAL_BROKER_PROVIDER == "bybit":
+                response = await client.get(f"{BYBIT_API_BASE_URL}/v5/market/time")
             else:
                 response = await client.get(f"{REAL_BROKER_BASE_URL}/api/v3/ping")
             if response.status_code == 200:
@@ -675,7 +1203,7 @@ async def health() -> dict:
         "provider": REAL_BROKER_PROVIDER,
         "real_status": real_status,
         "credentialed": bool(REAL_BROKER_API_KEY and REAL_BROKER_API_SECRET),
-        "capabilities": ["balance", "positions", "orderbook", "bingx-live-orders"],
+        "capabilities": ["balance", "positions", "orderbook", "bingx-live-orders", "bybit-live-orders"],
     }
 
 
@@ -714,6 +1242,33 @@ async def balance() -> dict:
                 "balances": balances,
             }
 
+    if REAL_BROKER_PROVIDER == "bybit" and REAL_BROKER_API_KEY and REAL_BROKER_API_SECRET:
+        secret_payload = {"api_key": REAL_BROKER_API_KEY, "api_secret": REAL_BROKER_API_SECRET}
+        balance_payload = await _bybit_signed_request(secret_payload, "GET", "/v5/account/wallet-balance", params={"accountType": "UNIFIED"})
+        rows = balance_payload.get("list") if isinstance(balance_payload, dict) else None
+        item = rows[0] if isinstance(rows, list) and rows else None
+        coins = item.get("coin") if isinstance(item, dict) else None
+        balances = []
+        if isinstance(coins, list):
+            for coin in coins:
+                if not isinstance(coin, dict):
+                    continue
+                wallet_balance = _to_float(coin.get("walletBalance"), 0.0)
+                locked = _to_float(coin.get("locked"), 0.0)
+                if wallet_balance <= 0 and locked <= 0:
+                    continue
+                balances.append({
+                    "currency": str(coin.get("coin") or ""),
+                    "free": wallet_balance,
+                    "locked": locked,
+                })
+        return {
+            "mode": "read-only",
+            "provider": "bybit",
+            "source": "real-credentialed",
+            "balances": balances,
+        }
+
     return {
         "mode": "read-only",
         "provider": "paper",
@@ -744,6 +1299,41 @@ async def orderbook(venue: str, instrument: str) -> dict:
     symbol = instrument.replace("-", "").replace("/", "").upper()
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
+            if venue.startswith("bingx") or REAL_BROKER_PROVIDER == "bingx":
+                bingx_symbol = _normalize_bingx_symbol(symbol)
+                payload = await _bingx_public_get("/openApi/swap/v2/quote/ticker", {"symbol": bingx_symbol})
+                if isinstance(payload, dict):
+                    bid = _to_float(payload.get("bidPrice"), 0.0)
+                    ask = _to_float(payload.get("askPrice"), 0.0)
+                    last = _to_float(payload.get("lastPrice"), (bid + ask) / 2 if bid > 0 and ask > 0 else 0.0)
+                    if bid > 0 and ask > 0:
+                        return {
+                            "venue": "bingx-public",
+                            "instrument": bingx_symbol,
+                            "bid": bid,
+                            "ask": ask,
+                            "last": last,
+                            "source": "real-read-only",
+                        }
+            if venue.startswith("bybit") or REAL_BROKER_PROVIDER == "bybit":
+                response = await client.get(
+                    f"{BYBIT_API_BASE_URL}/v5/market/tickers",
+                    params={"category": _bybit_category(symbol), "symbol": _normalize_bybit_symbol(symbol)},
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    result = data.get("result") if isinstance(data, dict) else None
+                    rows = result.get("list") if isinstance(result, dict) else None
+                    item = rows[0] if isinstance(rows, list) and rows else None
+                    if isinstance(item, dict):
+                        return {
+                            "venue": "bybit-public",
+                            "instrument": _normalize_bybit_symbol(symbol),
+                            "bid": _to_float(item.get("bid1Price"), 0.0),
+                            "ask": _to_float(item.get("ask1Price"), 0.0),
+                            "last": _to_float(item.get("lastPrice"), 0.0),
+                            "source": "real-read-only",
+                        }
             response = await client.get(f"{REAL_BROKER_BASE_URL}/api/v3/ticker/bookTicker", params={"symbol": symbol})
         if response.status_code == 200:
             data = response.json()
@@ -768,9 +1358,11 @@ async def orderbook(venue: str, instrument: str) -> dict:
 @app.post("/v1/live/orders")
 async def place_live_order(payload: dict) -> dict:
     provider = str(payload.get("provider") or "").strip().lower()
-    if provider != "bingx":
+    if provider not in {"bingx", "bybit"}:
         raise HTTPException(status_code=400, detail="unsupported live provider")
     try:
+        if provider == "bybit":
+            return await _bybit_place_live_order(payload)
         return await _bingx_place_live_order(payload)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -790,10 +1382,42 @@ async def place_live_order(payload: dict) -> dict:
 @app.post("/v1/live/orders/cancel")
 async def cancel_live_order(payload: dict) -> dict:
     provider = str(payload.get("provider") or "").strip().lower()
-    if provider != "bingx":
+    if provider not in {"bingx", "bybit"}:
         raise HTTPException(status_code=400, detail="unsupported live provider")
     try:
+        if provider == "bybit":
+            return await _bybit_cancel_live_order(payload)
         return await _bingx_cancel_live_order(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.post("/v1/live/orders/status")
+async def live_order_status(payload: dict) -> dict:
+    provider = str(payload.get("provider") or "").strip().lower()
+    if provider not in {"bingx", "bybit"}:
+        raise HTTPException(status_code=400, detail="unsupported live provider")
+    try:
+        if provider == "bybit":
+            return await _bybit_live_order_status(payload)
+        return await _bingx_live_order_status(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.post("/v1/live/orders/amend")
+async def amend_live_order(payload: dict) -> dict:
+    provider = str(payload.get("provider") or "").strip().lower()
+    if provider not in {"bingx", "bybit"}:
+        raise HTTPException(status_code=400, detail="unsupported live provider")
+    try:
+        if provider == "bybit":
+            return await _bybit_amend_live_order(payload)
+        return await _bingx_amend_live_order(payload)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:

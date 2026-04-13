@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import TxtMiniGuide from "../../../components/ui/TxtMiniGuide";
+import OperatorPanelGuide from "../../../components/ui/OperatorPanelGuide";
 
 type Snapshot = {
   key: string;
@@ -430,7 +430,7 @@ export default function ChartAutoStabilityDebugPage() {
           <div className="eyebrow">Ops Debug</div>
           <h1 className="title" style={{ fontSize: 34 }}>Chart Auto Stability</h1>
           <p className="subtle">Snapshots live du mode auto par symbole pour diagnostiquer l’hysteresis, la nervosite de calibration et la frequence de switch.</p>
-          <TxtMiniGuide
+          <OperatorPanelGuide
             title="Guide Auto Stability"
             what="Vue ops compacte des snapshots publies par les charts actifs en mode auto."
             why="Voir instantanement si la calibration commute trop souvent par symbole, timeframe ou classe d’instrument."

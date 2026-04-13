@@ -57,6 +57,9 @@ MARKET_DATA_URL = os.getenv("MARKET_DATA_URL", "http://127.0.0.1:8003")
 BROKER_ADAPTER_URL = os.getenv("BROKER_ADAPTER_URL", "http://127.0.0.1:8004")
 AI_ORCHESTRATOR_URL = os.getenv("AI_ORCHESTRATOR_URL", "http://127.0.0.1:8005")
 MT5_BRIDGE_URL = os.getenv("MT5_BRIDGE_URL", "http://127.0.0.1:8006")
+BINANCE_API_BASE_URL = os.getenv("BINANCE_API_BASE_URL", "https://api.binance.com").rstrip("/")
+BINANCE_FUTURES_API_BASE_URL = os.getenv("BINANCE_FUTURES_API_BASE_URL", "https://fapi.binance.com").rstrip("/")
+BINANCE_COINM_API_BASE_URL = os.getenv("BINANCE_COINM_API_BASE_URL", "https://dapi.binance.com").rstrip("/")
 BINGX_API_BASE_URL = os.getenv("BINGX_API_BASE_URL", "https://open-api.bingx.com").rstrip("/")
 BITGET_API_BASE_URL = os.getenv("BITGET_API_BASE_URL", "https://api.bitget.com").rstrip("/")
 OKX_API_BASE_URL = os.getenv("OKX_API_BASE_URL", "https://www.okx.com").rstrip("/")
@@ -73,6 +76,22 @@ RAW_CASH_ASSETS = {"USD", "USDT", "USDC", "BUSD", "DAI", "FDUSD", "TUSD", "USDE"
 
 AUDIT_LOG: list[AuditEvent] = []
 PENDING_INTENTS: dict[str, dict] = {}
+
+
+def _normalize_account_id(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _upstream_json_payload(response: httpx.Response) -> Any:
+    try:
+        return response.json()
+    except ValueError:
+        detail = response.text.strip()
+        return {"detail": detail or response.reason_phrase or "upstream returned a non-JSON response"}
+
+
+def _proxy_json_response(response: httpx.Response) -> JSONResponse:
+    return JSONResponse(content=_upstream_json_payload(response), status_code=response.status_code)
 
 CONNECTOR_CATALOG: list[dict[str, str]] = [
     {"name": "binance", "type": "crypto", "transport": "rest/ws", "health_group": "market"},
@@ -145,6 +164,7 @@ CONNECTOR_MARKET_OBSERVABILITY_VENUES: dict[str, str] = {
     "binance": "binance-public",
     "bingx": "paper-bingx",
     "bitget": "paper-bitget",
+    "bybit": "bybit-public",
     "coinbase": "coinbase-public",
     "okx": "okx-public",
 }
@@ -153,6 +173,7 @@ CONNECTOR_RATE_LIMIT_HINTS: dict[str, dict[str, Any]] = {
     "binance": {"rest": "1200 req/min", "ws": "100ms depth stream", "burst": "high"},
     "bitget": {"rest": "10 req/s class-dependent", "ws": "private+public multiplex", "burst": "medium"},
     "bingx": {"rest": "class-dependent", "ws": "market stream", "burst": "medium"},
+    "bybit": {"rest": "category bucketed", "ws": "public linear/spot", "burst": "high"},
     "coinbase": {"rest": "15 req/s profile-dependent", "ws": "ticker/depth channels", "burst": "medium"},
     "fireblocks": {"rest": "governed custody API", "ws": "n/a", "burst": "low"},
     "hyperliquid": {"rest": "dex api", "ws": "market stream", "burst": "medium"},
@@ -165,10 +186,54 @@ CONNECTOR_RATE_LIMIT_HINTS: dict[str, dict[str, Any]] = {
 CONNECTOR_REROUTE_HINTS: dict[str, str] = {
     "bingx": "bitget",
     "bitget": "okx",
+    "bybit": "binance",
     "coinbase": "binance",
     "kraken": "binance",
     "okx": "binance",
     "mt5": "broker-adapter",
+}
+
+EXCHANGE_CAPABILITIES: dict[str, dict[str, Any]] = {
+    "okx": {
+        "data": True,
+        "execution": False,
+        "l2": True,
+        "l3": True,
+        "execution_venue": "paper-okx",
+        "api_key_requires_passphrase": True,
+    },
+    "binance": {
+        "data": True,
+        "execution": False,
+        "l2": True,
+        "l3": False,
+        "execution_venue": "binance-public",
+        "api_key_requires_passphrase": False,
+    },
+    "bingx": {
+        "data": True,
+        "execution": True,
+        "l2": False,
+        "l3": False,
+        "execution_venue": "bingx",
+        "api_key_requires_passphrase": False,
+    },
+    "bybit": {
+        "data": True,
+        "execution": True,
+        "l2": True,
+        "l3": False,
+        "execution_venue": "bybit",
+        "api_key_requires_passphrase": False,
+    },
+    "bitget": {
+        "data": True,
+        "execution": False,
+        "l2": True,
+        "l3": False,
+        "execution_venue": "paper-bitget",
+        "api_key_requires_passphrase": True,
+    },
 }
 
 
@@ -1110,7 +1175,7 @@ def _resolve_payload_portfolio_id(payload: dict[str, Any]) -> str:
         value = str(candidate or "").strip()
         if value:
             return value
-    account_id = str(payload.get("account_id") or order_intent.get("account_id") or metadata.get("account_id") or "").strip()
+    account_id = _normalize_account_id(payload.get("account_id") or order_intent.get("account_id") or metadata.get("account_id"))
     if account_id:
         return str(_preferred_portfolio_id_for_account(account_id) or "").strip()
     return ""
@@ -1226,7 +1291,7 @@ def _build_predictor_execution_payload(
     expected_slippage_bps = _to_float((routed_execution_result or {}).get("expected_slippage_bps"), _to_float(selected_route.get("spread_bps"), 0.0) * 0.8)
     return {
         "decision_id": str(payload.get("decision_id") or "").strip(),
-        "account_id": str(payload.get("account_id") or "").strip(),
+        "account_id": _normalize_account_id(payload.get("account_id")),
         "portfolio_id": _resolve_payload_portfolio_id(payload),
         "symbol": str(payload.get("symbol") or "").strip(),
         "side": str(payload.get("side") or "buy").strip().lower(),
@@ -1918,6 +1983,83 @@ def _extract_kairos_harness_from_fills(fills: list[dict[str, Any]]) -> dict[str,
     return None
 
 
+def _requested_fill_quantity_from_payload(payload: dict[str, Any] | None) -> float:
+    raw = payload if isinstance(payload, dict) else {}
+    order_intent = raw.get("order_intent") if isinstance(raw.get("order_intent"), dict) else {}
+    raw_payload = raw.get("raw_payload") if isinstance(raw.get("raw_payload"), dict) else {}
+    for candidate in (
+        raw.get("size_base"),
+        raw.get("quantity"),
+        raw.get("qty"),
+        raw.get("lots"),
+        order_intent.get("size_base"),
+        order_intent.get("quantity"),
+        order_intent.get("qty"),
+        order_intent.get("lots"),
+        raw_payload.get("size_base"),
+        raw_payload.get("quantity"),
+        raw_payload.get("qty"),
+        raw_payload.get("lots"),
+    ):
+        numeric = _to_float(candidate, 0.0)
+        if numeric > 0:
+            return numeric
+    return 0.0
+
+
+def _realized_fill_quantity_from_result(result: dict[str, Any] | None) -> float:
+    raw = result if isinstance(result, dict) else {}
+    fills = raw.get("fills") if isinstance(raw.get("fills"), list) else []
+    filled_qty = sum(_to_float(fill.get("size_base"), 0.0) for fill in fills if isinstance(fill, dict))
+    if filled_qty > 0:
+        return filled_qty
+    for candidate in (
+        raw.get("filled_qty"),
+        raw.get("filled_quantity"),
+        raw.get("executed_qty"),
+        raw.get("size_base"),
+        raw.get("quantity"),
+        raw.get("qty"),
+        raw.get("lots"),
+    ):
+        numeric = _to_float(candidate, 0.0)
+        if numeric > 0:
+            return numeric
+    return 0.0
+
+
+def _execution_audit_summary(
+    *,
+    decision_id: str,
+    route: str,
+    reason: str,
+    expected_slippage_bps: float,
+    realized_slippage_bps: float,
+    latency_e2e_ms: int,
+    requested_payload: dict[str, Any] | None,
+    execution_result: dict[str, Any] | None,
+) -> dict[str, Any]:
+    expected_fill_quantity = _requested_fill_quantity_from_payload(requested_payload)
+    realized_fill_quantity = _realized_fill_quantity_from_result(execution_result)
+    fill_ratio = None
+    partial_fill_ratio = None
+    if expected_fill_quantity > 0:
+        fill_ratio = round(_clamp(realized_fill_quantity / expected_fill_quantity, 0.0, 1.5), 6)
+        partial_fill_ratio = round(max(0.0, 1.0 - min(fill_ratio, 1.0)), 6)
+    return {
+        "decision_id": str(decision_id or "").strip(),
+        "route": str(route or "").strip(),
+        "reason": str(reason or "").strip(),
+        "expected_slippage_bps": round(_to_float(expected_slippage_bps, 0.0), 6),
+        "realized_slippage_bps": round(_to_float(realized_slippage_bps, 0.0), 6),
+        "latency_e2e_ms": int(max(0, latency_e2e_ms)),
+        "expected_fill_quantity": round(expected_fill_quantity, 8),
+        "realized_fill_quantity": round(realized_fill_quantity, 8),
+        "fill_ratio": fill_ratio,
+        "partial_fill_ratio": partial_fill_ratio,
+    }
+
+
 def _record_platform_execution_telemetry(
     source: str,
     execution_payload: dict[str, Any],
@@ -1966,7 +2108,7 @@ def _record_platform_execution_telemetry(
         (
             telemetry_id,
             str(routed.get("decision_id") or execution_payload.get("decision_id") or ""),
-            str(((execution_payload.get("live_execution") or {}) if isinstance(execution_payload.get("live_execution"), dict) else {}).get("account_id") or route.get("account_id") or ""),
+            _normalize_account_id(((execution_payload.get("live_execution") or {}) if isinstance(execution_payload.get("live_execution"), dict) else {}).get("account_id") or route.get("account_id")),
             str(routed.get("instrument") or execution_payload.get("symbol") or ""),
             str(routed.get("side") or execution_payload.get("side") or ""),
             sum(_to_float(fill.get("size_base"), 0.0) for fill in fills if isinstance(fill, dict)),
@@ -2001,8 +2143,16 @@ def _record_platform_execution_telemetry(
         "execution_telemetry_recorded",
         {
             "telemetry_id": telemetry_id,
-            "decision_id": str(routed.get("decision_id") or execution_payload.get("decision_id") or ""),
-            "route": str(chosen.get("venue") or routed.get("venue") or route.get("preferred_venue") or ""),
+            **_execution_audit_summary(
+                decision_id=str(routed.get("decision_id") or execution_payload.get("decision_id") or ""),
+                route=str(chosen.get("venue") or routed.get("venue") or route.get("preferred_venue") or ""),
+                reason=str(route_block.get("reason") or route.get("route_key") or source),
+                expected_slippage_bps=_to_float(routed.get("expected_slippage_bps"), 0.0),
+                realized_slippage_bps=_to_float(routed.get("realized_slippage_bps"), 0.0),
+                latency_e2e_ms=latency_e2e_ms,
+                requested_payload=execution_payload,
+                execution_result=routed,
+            ),
             "source": source,
             "pre_trade_memory_gate": pre_trade_memory_gate,
         },
@@ -2016,7 +2166,7 @@ def _seed_kairos_harness_replay(payload: dict[str, Any], seeded_by: str) -> tupl
     venue = str(payload.get("venue") or "bingx").strip().lower() or "bingx"
     side = str(payload.get("side") or "buy").strip().lower() or "buy"
     decision_id = str(payload.get("decision_id") or f"kairos-harness-seed-{now.strftime('%Y%m%d%H%M%S')}-{uuid4().hex[:8]}").strip()
-    account_id = str(payload.get("account_id") or "kairos-shadow-harness").strip() or "kairos-shadow-harness"
+    account_id = _normalize_account_id(payload.get("account_id") or "kairos-shadow-harness") or "kairos-shadow-harness"
     regime = str(payload.get("regime") or "SCALP").strip().upper() or "SCALP"
     failure_source = _normalize_failure_source(payload.get("failure_source")) or "execution"
     failure_reasons = _normalize_failure_reasons(payload.get("failure_reasons")) or ["synthetic_harness_seed"]
@@ -2295,14 +2445,14 @@ def _save_connector_accounts(accounts: list[dict]) -> None:
 
 
 def _replace_connector_account_record(accounts: list[dict], record: dict) -> list[dict]:
-    provider = str(record.get("provider") or "").strip().lower()
-    account_id = str(record.get("account_id") or "").strip()
+    provider = _normalize_connector_provider(record.get("provider"))
+    account_id = _normalize_account_id(record.get("account_id"))
     remaining = [
         item
         for item in accounts
         if not (
-            str(item.get("provider", "")).strip().lower() == provider
-            and str(item.get("account_id", "")).strip() == account_id
+            _normalize_connector_provider(item.get("provider")) == provider
+            and _normalize_account_id(item.get("account_id")) == account_id
         )
     ]
     remaining.append(record)
@@ -2466,17 +2616,40 @@ def _load_decrypted_connector_credential(credential_id: str) -> dict | None:
     return hydrated
 
 
+def _latest_connector_credential_for_account(provider: str, account_id: str) -> dict | None:
+    provider_norm = _normalize_connector_provider(provider)
+    account_key = _normalize_account_id(account_id)
+    if not provider_norm or not account_key:
+        return None
+    store = _load_connector_credentials_store()
+    candidates: list[dict[str, Any]] = []
+    for credential_id, record in store.items():
+        if not isinstance(record, dict):
+            continue
+        if _normalize_connector_provider(record.get("provider")) != provider_norm:
+            continue
+        if _normalize_account_id(record.get("account_id")) != account_key:
+            continue
+        hydrated = _load_decrypted_connector_credential(str(credential_id))
+        if isinstance(hydrated, dict):
+            candidates.append(hydrated)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+    return candidates[0]
+
+
 def _find_connector_account_for_canonical_account(account: dict | None) -> dict | None:
     if not isinstance(account, dict):
         return None
-    account_id = str(account.get("account_id") or "").strip()
+    account_id = _normalize_account_id(account.get("account_id"))
     account_connector_type = str(account.get("connector_type") or "").strip().lower()
-    account_external_ref = str(account.get("external_ref") or "").strip()
+    account_external_ref = _normalize_account_id(account.get("external_ref"))
     return next(
         (
             item
             for item in _load_connector_accounts()
-            if str(item.get("account_id") or "").strip() in {account_id, account_external_ref}
+            if _normalize_account_id(item.get("account_id")) in {account_id, account_external_ref}
             and (
                 not account_connector_type
                 or str(item.get("provider") or "").strip().lower() == account_connector_type
@@ -2496,6 +2669,7 @@ def _connector_account_public_view(connector_account: dict | None) -> dict | Non
     connector_view.pop("api_secret", None)
     connector_view.pop("passphrase", None)
     connector_view["has_credentials"] = bool(connector_view.get("credential_id"))
+    connector_view["broker_capabilities"] = _derive_broker_capabilities_view(connector_view)
     return connector_view
 
 
@@ -2512,6 +2686,68 @@ def _normalize_connector_provider(value: Any) -> str:
         "paper-okx": "okx",
     }
     return aliases.get(raw, raw)
+
+
+def _exchange_capabilities(provider: str) -> dict[str, Any]:
+    provider_norm = _normalize_connector_provider(provider)
+    raw = EXCHANGE_CAPABILITIES.get(provider_norm) if provider_norm else None
+    capabilities = raw if isinstance(raw, dict) else {}
+    return {
+        "provider": provider_norm or "unknown",
+        "known": isinstance(raw, dict),
+        "data": _bool_from_any(capabilities.get("data"), False),
+        "execution": _bool_from_any(capabilities.get("execution"), False),
+        "l2": _bool_from_any(capabilities.get("l2"), False),
+        "l3": _bool_from_any(capabilities.get("l3"), False),
+        "preferred_venue": _provider_to_preferred_venue(provider_norm) if provider_norm else "",
+        "execution_venue": str(capabilities.get("execution_venue") or "").strip(),
+        "api_key_requires_passphrase": _bool_from_any(capabilities.get("api_key_requires_passphrase"), False),
+        "capability_source": "exchange-capabilities",
+    }
+
+
+def _exchange_capability_catalog() -> dict[str, Any]:
+    providers = sorted(EXCHANGE_CAPABILITIES.keys())
+    provider_rows = [_exchange_capabilities(provider) for provider in providers]
+    return {
+        "status": "ok",
+        "version": "2026-04-10",
+        "capability_source": "exchange-capabilities",
+        "providers": provider_rows,
+        "by_provider": {
+            str(item.get("provider") or "unknown"): item
+            for item in provider_rows
+            if isinstance(item, dict)
+        },
+    }
+
+
+def _derive_broker_capabilities_view(connector_account: dict | None) -> dict[str, Any]:
+    account = connector_account if isinstance(connector_account, dict) else {}
+    provider = _normalize_connector_provider(account.get("provider"))
+    exchange_capabilities = _exchange_capabilities(provider)
+    mode = str(account.get("mode") or "trade").strip().lower()
+    provider_type = str(account.get("provider_type") or "manual").strip().lower()
+    preferred_venue = _provider_to_preferred_venue(provider) if provider else ""
+    can_trade = mode == "trade" and provider_type not in {"wallet"}
+    supports_execution = can_trade and _bool_from_any(exchange_capabilities.get("execution"), False)
+    supports_cancel_replace = supports_execution and provider == "bingx"
+    supports_modify = False
+    replace_strategy = "modify" if supports_modify else "cancel_replace" if supports_cancel_replace else "reslice_only"
+    capability_source = str(exchange_capabilities.get("capability_source") or ("provider-matrix" if provider else "unknown"))
+    return {
+        "provider": provider or "unknown",
+        "preferred_venue": preferred_venue,
+        "supports_execution": supports_execution,
+        "supports_market_data": _bool_from_any(exchange_capabilities.get("data"), False),
+        "supports_l2": _bool_from_any(exchange_capabilities.get("l2"), False),
+        "supports_l3": _bool_from_any(exchange_capabilities.get("l3"), False),
+        "supports_modify": supports_modify,
+        "supports_cancel_replace": supports_cancel_replace,
+        "supports_live_cancel": supports_cancel_replace,
+        "replace_strategy": replace_strategy,
+        "capability_source": capability_source,
+    }
 
 
 def _normalize_scope_values(raw: Any) -> list[str]:
@@ -3239,7 +3475,150 @@ def _connector_outcome_analytics() -> dict[str, dict[str, Any]]:
     return analytics
 
 
-def _connector_degradation_engine(provider: str, transport: str, healthy: bool, incidents: dict[str, Any], market: dict[str, Any], capital: dict[str, Any], outcomes: dict[str, Any]) -> dict[str, Any]:
+def _connector_health_policy() -> dict[str, Any]:
+    default = {
+        "block_below": 0.70,
+        "reduce_below": 0.85,
+        "reduce_size_multiplier": 0.65,
+        "latency_warn_ms": 80.0,
+        "latency_block_ms": 120.0,
+        "slippage_block_bps": 15.0,
+        "max_error_rate_pct": 20.0,
+        "weights": {
+            "feed_quality": 0.42,
+            "execution_error": 0.22,
+            "latency": 0.16,
+            "slippage": 0.10,
+            "incidents": 0.10,
+        },
+    }
+    raw_policy = _load_live_execution_policy()
+    raw = raw_policy.get("connector_health") if isinstance(raw_policy.get("connector_health"), dict) else {}
+    merged = dict(default)
+    merged.update({key: value for key, value in raw.items() if key != "weights"})
+    weights = dict(default["weights"])
+    raw_weights = raw.get("weights") if isinstance(raw.get("weights"), dict) else {}
+    for key, value in raw_weights.items():
+        numeric = _to_float(value, None)
+        if numeric is not None and numeric >= 0:
+            weights[str(key)] = numeric
+    total = sum(max(0.0, _to_float(value, 0.0)) for value in weights.values()) or 1.0
+    merged["weights"] = {key: round(max(0.0, _to_float(value, 0.0)) / total, 6) for key, value in weights.items()}
+    block_below = _clamp(_to_float(merged.get("block_below"), default["block_below"]), 0.35, 0.95)
+    reduce_below = _clamp(_to_float(merged.get("reduce_below"), default["reduce_below"]), block_below + 0.05, 0.99)
+    latency_warn_ms = max(1.0, _to_float(merged.get("latency_warn_ms"), default["latency_warn_ms"]))
+    merged["block_below"] = round(block_below, 6)
+    merged["reduce_below"] = round(reduce_below, 6)
+    merged["reduce_size_multiplier"] = round(_clamp(_to_float(merged.get("reduce_size_multiplier"), default["reduce_size_multiplier"]), 0.1, 1.0), 6)
+    merged["latency_warn_ms"] = round(latency_warn_ms, 6)
+    merged["latency_block_ms"] = round(max(latency_warn_ms + 1.0, _to_float(merged.get("latency_block_ms"), default["latency_block_ms"])) , 6)
+    merged["slippage_block_bps"] = round(max(1.0, _to_float(merged.get("slippage_block_bps"), default["slippage_block_bps"])), 6)
+    merged["max_error_rate_pct"] = round(max(1.0, _to_float(merged.get("max_error_rate_pct"), default["max_error_rate_pct"])), 6)
+    return merged
+
+
+def _connector_health_score_snapshot(
+    *,
+    healthy: bool,
+    incidents: dict[str, Any],
+    market: dict[str, Any],
+    outcomes: dict[str, Any],
+    rest_latency_ms: float | None,
+    health_policy: dict[str, Any],
+) -> dict[str, Any]:
+    weights = health_policy.get("weights") if isinstance(health_policy.get("weights"), dict) else {}
+    feed_status = str(market.get("feed_quality_status") or "not-instrumented").strip().lower()
+    feed_quality_score = _to_float(market.get("feed_quality_score"), None)
+    if feed_quality_score is None:
+        feed_component = 0.82 if healthy else 0.58
+    else:
+        feed_component = _clamp(feed_quality_score / 100.0, 0.0, 1.0)
+    if feed_status == "watch":
+        feed_component = min(feed_component, 0.9)
+    elif feed_status == "degraded":
+        feed_component = min(feed_component, 0.8)
+    elif feed_status == "critical":
+        feed_component = min(feed_component, 0.64)
+
+    latency_warn_ms = _to_float(health_policy.get("latency_warn_ms"), 80.0)
+    latency_block_ms = max(latency_warn_ms + 1.0, _to_float(health_policy.get("latency_block_ms"), 120.0))
+    latency_ms = max(_to_float(rest_latency_ms, 0.0), _to_float(outcomes.get("avg_latency_ms_24h"), 0.0))
+    if latency_ms <= 0:
+        latency_component = 0.9 if healthy else 0.45
+    elif latency_ms <= latency_warn_ms:
+        latency_component = 1.0
+    elif latency_ms >= latency_block_ms:
+        latency_component = 0.45
+    else:
+        ratio = (latency_ms - latency_warn_ms) / max(1.0, latency_block_ms - latency_warn_ms)
+        latency_component = 1.0 - ratio * 0.55
+
+    error_rate_pct = _to_float(outcomes.get("error_rate_pct_24h"), 0.0)
+    max_error_rate_pct = max(1.0, _to_float(health_policy.get("max_error_rate_pct"), 20.0))
+    error_component = 1.0 - min(1.0, error_rate_pct / max_error_rate_pct)
+
+    slippage_bps = abs(_to_float(outcomes.get("avg_slippage_bps_24h"), 0.0))
+    slippage_block_bps = max(1.0, _to_float(health_policy.get("slippage_block_bps"), 15.0))
+    slippage_component = 1.0 - min(1.0, slippage_bps / slippage_block_bps)
+
+    active_incidents = int(incidents.get("active_count") or 0)
+    critical_incidents = int(incidents.get("critical_count") or 0)
+    throttling_count = int(incidents.get("throttling_count") or 0)
+    incident_pressure = min(1.0, critical_incidents * 0.42 + active_incidents * 0.08 + throttling_count * 0.04 + (0.18 if not healthy else 0.0))
+    incident_component = max(0.0, 1.0 - incident_pressure)
+
+    components = {
+        "feed_quality": round(_clamp(feed_component, 0.0, 1.0), 6),
+        "execution_error": round(_clamp(error_component, 0.0, 1.0), 6),
+        "latency": round(_clamp(latency_component, 0.0, 1.0), 6),
+        "slippage": round(_clamp(slippage_component, 0.0, 1.0), 6),
+        "incidents": round(_clamp(incident_component, 0.0, 1.0), 6),
+    }
+    score = sum(_to_float(weights.get(key), 0.0) * value for key, value in components.items())
+
+    block_below = _to_float(health_policy.get("block_below"), 0.70)
+    reduce_below = _to_float(health_policy.get("reduce_below"), 0.85)
+    if feed_status == "critical":
+        score = min(score, block_below - 0.06)
+    elif feed_status == "degraded":
+        score = min(score, reduce_below - 0.04)
+    elif feed_status == "watch":
+        score = min(score, 0.92)
+    if not healthy or critical_incidents > 0:
+        score = min(score, block_below - 0.08)
+    elif active_incidents > 0:
+        score = min(score, reduce_below - 0.02)
+    if error_rate_pct >= max_error_rate_pct:
+        score = min(score, block_below - 0.10)
+    elif error_rate_pct >= 5.0:
+        score = min(score, reduce_below - 0.03)
+
+    score = round(_clamp(score, 0.0, 1.0), 6)
+    if score < block_below:
+        action = "block"
+        size_multiplier = 0.0
+    elif score < reduce_below:
+        action = "reduce_size"
+        size_multiplier = _to_float(health_policy.get("reduce_size_multiplier"), 0.65)
+    else:
+        action = "ok"
+        size_multiplier = 1.0
+    return {
+        "health_score": score,
+        "health_action": action,
+        "size_multiplier": round(_clamp(size_multiplier, 0.0, 1.0), 6),
+        "score_components": components,
+        "latency_ms": round(latency_ms, 4),
+        "error_rate_pct_24h": round(error_rate_pct, 4),
+        "avg_slippage_bps_24h": round(slippage_bps, 6),
+        "thresholds": {
+            "block_below": round(block_below, 6),
+            "reduce_below": round(reduce_below, 6),
+        },
+    }
+
+
+def _connector_degradation_engine(provider: str, transport: str, healthy: bool, incidents: dict[str, Any], market: dict[str, Any], capital: dict[str, Any], outcomes: dict[str, Any], rest_latency_ms: float | None = None) -> dict[str, Any]:
     provider_norm = _normalize_connector_provider(provider)
     active_incidents = int(incidents.get("active_count") or 0)
     critical_incidents = int(incidents.get("critical_count") or 0)
@@ -3278,13 +3657,138 @@ def _connector_degradation_engine(provider: str, transport: str, healthy: bool, 
     if not diagnostics:
         diagnostics.append("nominal")
 
+    health_snapshot = _connector_health_score_snapshot(
+        healthy=healthy,
+        incidents=incidents,
+        market=market,
+        outcomes=outcomes,
+        rest_latency_ms=rest_latency_ms,
+        health_policy=_connector_health_policy(),
+    )
+
     return {
         "state": severity,
         "auto_downgrade_path": fallback_path,
-        "auto_disable_live": severity == "critical",
+        "auto_disable_live": bool(health_snapshot.get("health_action") == "block" or severity == "critical"),
         "auto_reroute_target": CONNECTOR_REROUTE_HINTS.get(provider_norm),
         "diagnostic": diagnostics[0],
         "diagnostics": diagnostics,
+        **health_snapshot,
+    }
+
+
+def _connector_catalog_entry(provider: str) -> dict[str, str]:
+    provider_norm = _normalize_connector_provider(provider)
+    return next(
+        (
+            entry
+            for entry in CONNECTOR_CATALOG
+            if str(entry.get("name") or "").strip().lower() == provider_norm
+        ),
+        {
+            "name": provider_norm,
+            "type": "crypto",
+            "transport": "rest",
+            "health_group": "market",
+        },
+    )
+
+
+def _connector_health_by_group() -> dict[str, bool]:
+    probe_urls = {
+        "market": f"{MARKET_DATA_URL}/health",
+        "broker": f"{BROKER_ADAPTER_URL}/health",
+        "mt5": f"{MT5_BRIDGE_URL}/health",
+        "ai": f"{AI_ORCHESTRATOR_URL}/health",
+        "embeddings": f"{EMBEDDINGS_SERVICE_URL}/health",
+    }
+    health_by_group = {group: False for group in probe_urls}
+    with httpx.Client(timeout=3.0) as client:
+        for group, url in probe_urls.items():
+            try:
+                response = client.get(url)
+                health_by_group[group] = response.status_code < 500
+            except Exception:
+                health_by_group[group] = False
+    return health_by_group
+
+
+def _connector_latency_by_group() -> dict[str, float | None]:
+    probe_urls = {
+        "market": f"{MARKET_DATA_URL}/health",
+        "broker": f"{BROKER_ADAPTER_URL}/health",
+        "mt5": f"{MT5_BRIDGE_URL}/health",
+        "ai": f"{AI_ORCHESTRATOR_URL}/health",
+        "embeddings": f"{EMBEDDINGS_SERVICE_URL}/health",
+    }
+    latency_by_group: dict[str, float | None] = {group: None for group in probe_urls}
+    with httpx.Client(timeout=3.0) as client:
+        for group, url in probe_urls.items():
+            started = time.perf_counter()
+            try:
+                client.get(url)
+                latency_by_group[group] = round((time.perf_counter() - started) * 1000.0, 4)
+            except Exception:
+                latency_by_group[group] = None
+    return latency_by_group
+
+
+def _connector_live_degradation_snapshot(provider: str, visible_client_ids: list[str] | None = None) -> dict[str, Any]:
+    provider_norm = _normalize_connector_provider(provider)
+    if not provider_norm:
+        return {}
+
+    connector = _connector_catalog_entry(provider_norm)
+    incidents = _build_connector_incident_summary(
+        _normalize_db_rows(
+            fetch_all(
+                """
+                SELECT ticket_key, severity, title, status, assignee, source, payload, created_by,
+                       resolution_note, closed_by, closed_at, created_at, updated_at,
+                       ROUND(EXTRACT(EPOCH FROM (NOW() - created_at)) / 60.0, 1) AS age_minutes
+                FROM incident_tickets
+                WHERE created_at >= NOW() - INTERVAL '7 days'
+                ORDER BY created_at DESC
+                LIMIT 400
+                """
+            )
+        )
+    ).get(provider_norm, {})
+    outcomes = _connector_outcome_analytics().get(provider_norm, {})
+    market = _connector_market_observability(provider_norm)
+    capital = _connector_capital_rollup(provider_norm, visible_client_ids)
+    health_group = str(connector.get("health_group") or "market")
+    healthy = bool(_connector_health_by_group().get(health_group, False))
+    rest_latency_ms = _connector_latency_by_group().get(health_group)
+    degradation = _connector_degradation_engine(
+        provider_norm,
+        str(connector.get("transport") or "rest"),
+        healthy,
+        incidents,
+        market,
+        capital,
+        outcomes,
+        rest_latency_ms,
+    )
+    return {
+        **degradation,
+        "provider": provider_norm,
+        "healthy": healthy,
+        "health_group": health_group,
+        "rest_latency_ms": round(rest_latency_ms, 4) if rest_latency_ms is not None else None,
+        "incident_summary": {
+            "active_count": int(incidents.get("active_count") or 0),
+            "critical_count": int(incidents.get("critical_count") or 0),
+            "top_diagnostic": incidents.get("top_diagnostic"),
+        },
+        "feed_quality": {
+            "status": market.get("feed_quality_status"),
+            "score": market.get("feed_quality_score"),
+        },
+        "outcomes": {
+            "samples_24h": int(outcomes.get("samples_24h") or 0),
+            "error_rate_pct_24h": _to_float(outcomes.get("error_rate_pct_24h"), 0.0),
+        },
     }
 
 
@@ -3325,6 +3829,7 @@ def _connector_row_payload(
         market,
         capital,
         outcomes,
+        rest_latency_ms,
     )
     throttling_events = int(incidents.get("throttling_count") or 0)
     throttling_rate_pct = round(min(100.0, throttling_events * 5.0), 4)
@@ -3352,6 +3857,8 @@ def _connector_row_payload(
         "healthy": healthy,
         "rest_latency_ms": round(rest_latency_ms, 2) if rest_latency_ms is not None else None,
         "websocket_latency_ms": market.get("ws_latency_ms"),
+        "health_score": degradation.get("health_score"),
+        "health_action": degradation.get("health_action"),
         "error_rate_pct": outcomes.get("error_rate_pct_24h", 0.0),
         "throttling_rate_pct": throttling_rate_pct,
         "uptime_24h_pct": incidents.get("uptime_24h_pct", 100.0),
@@ -3370,6 +3877,14 @@ def _connector_row_payload(
         "permissions_summary": {
             "aggregate": aggregate_permissions,
             "linked_accounts": permission_rows,
+        },
+        "broker_capabilities": {
+            **_derive_broker_capabilities_view({"provider": provider, "mode": "trade"}),
+            "linked_trade_accounts": sum(
+                1
+                for row in permission_rows
+                if bool((((row.get("permissions_view") or {}).get("permissions") or {}).get("trade")))
+            ),
         },
         "capital_summary": capital,
         "incident_summary": incidents,
@@ -3978,6 +4493,348 @@ def _postprocess_connector_sync(
     return persisted
 
 
+class BinanceAPIError(RuntimeError):
+    def __init__(self, path: str, detail: str, *, code: str | None = None, http_status: int | None = None):
+        self.path = path
+        self.code = str(code).strip() or None if code is not None else None
+        self.http_status = http_status
+        if http_status is not None:
+            if self.code:
+                message = f"Binance {path} failed with status {http_status} [code {self.code}]: {detail}"
+            else:
+                message = f"Binance {path} failed with status {http_status}: {detail}"
+        else:
+            if self.code:
+                message = f"Binance {path} rejected the request [code {self.code}]: {detail}"
+            else:
+                message = f"Binance {path} rejected the request: {detail}"
+        super().__init__(message)
+
+
+def _binance_error_code(body: object) -> str | None:
+    if not isinstance(body, dict):
+        return None
+    code = body.get("code")
+    if code in {None, ""}:
+        return None
+    rendered = str(code).strip()
+    return rendered or None
+
+
+def _binance_error_detail(body: object, fallback: str = "unknown error") -> str:
+    if not isinstance(body, dict):
+        return fallback
+    detail = str(body.get("msg") or body.get("message") or fallback).strip()
+    return detail or fallback
+
+
+def _binance_response_error(path: str, body: object, *, http_status: int | None = None, fallback: str = "unknown error") -> BinanceAPIError:
+    return BinanceAPIError(
+        path,
+        _binance_error_detail(body, fallback=fallback),
+        code=_binance_error_code(body),
+        http_status=http_status,
+    )
+
+
+def _unwrap_binance_response(path: str, body: object) -> object:
+    if not isinstance(body, (dict, list)):
+        raise RuntimeError(f"Binance {path} returned an invalid payload")
+    if isinstance(body, dict):
+        code = _binance_error_code(body)
+        if code not in {None, "0"}:
+            raise _binance_response_error(path, body)
+    return body
+
+
+async def _binance_public_get(
+    path: str,
+    params: dict | None = None,
+    *,
+    base_url: str = BINANCE_API_BASE_URL,
+    venue_label: str = "Binance",
+) -> object:
+    query = {
+        str(key): str(value)
+        for key, value in (params or {}).items()
+        if value is not None and str(value).strip()
+    }
+    url = f"{base_url}{path}"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(url, params=query)
+    except httpx.HTTPError as exc:
+                raise HTTPException(
+                    status_code=502 if response.status_code >= 500 else response.status_code,
+                    detail=_upstream_json_payload(response),
+                )
+    if response.status_code >= 400:
+        try:
+            body = response.json()
+        except ValueError:
+            raise RuntimeError(f"{venue_label} {path} public request failed with status {response.status_code}: {response.text[:300]}")
+        raise _binance_response_error(f"{venue_label} {path}", body, http_status=response.status_code, fallback=response.text[:300])
+    try:
+        body = response.json()
+    except ValueError as exc:
+        raise RuntimeError(f"{venue_label} {path} returned invalid JSON") from exc
+    return _unwrap_binance_response(f"{venue_label} {path}", body)
+
+
+async def _binance_signed_get(
+    secret_payload: dict,
+    path: str,
+    params: dict | None = None,
+    *,
+    base_url: str = BINANCE_API_BASE_URL,
+    venue_label: str = "Binance",
+) -> object:
+    api_key = str(secret_payload.get("api_key") or "").strip()
+    api_secret = str(secret_payload.get("api_secret") or "").strip()
+    if not api_key or not api_secret:
+        raise ValueError("Binance sync requires a linked API key and secret")
+    query = {
+        str(key): str(value)
+        for key, value in (params or {}).items()
+        if value is not None and str(value).strip()
+    }
+    query.setdefault("recvWindow", "60000")
+    query["timestamp"] = str(int(_now_utc().timestamp() * 1000))
+    query_string = urlencode(sorted(query.items()))
+    signature = hmac.new(api_secret.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
+    url = f"{base_url}{path}?{query_string}&signature={signature}"
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(url, headers={"X-MBX-APIKEY": api_key})
+    except httpx.HTTPError as exc:
+        raise RuntimeError(f"{venue_label} {path} request failed: {str(exc)[:300]}") from exc
+    if response.status_code >= 400:
+        try:
+            body = response.json()
+        except ValueError:
+            raise RuntimeError(f"{venue_label} {path} failed with status {response.status_code}: {response.text[:300]}")
+        raise _binance_response_error(f"{venue_label} {path}", body, http_status=response.status_code, fallback=response.text[:300])
+    try:
+        body = response.json()
+    except ValueError as exc:
+        raise RuntimeError(f"{venue_label} {path} returned invalid JSON") from exc
+    return _unwrap_binance_response(f"{venue_label} {path}", body)
+
+
+async def _binance_validate_api_credentials(secret_payload: dict) -> None:
+    checks = await asyncio.gather(
+        _binance_signed_get(secret_payload, "/api/v3/account"),
+        _binance_signed_get(secret_payload, "/fapi/v2/account", base_url=BINANCE_FUTURES_API_BASE_URL, venue_label="Binance Futures"),
+        _binance_signed_get(secret_payload, "/dapi/v1/account", base_url=BINANCE_COINM_API_BASE_URL, venue_label="Binance COIN-M Futures"),
+        return_exceptions=True,
+    )
+    if any(not isinstance(result, Exception) for result in checks):
+        return
+    errors = [str(result) for result in checks if isinstance(result, Exception)]
+    raise RuntimeError("; ".join(errors) if errors else "Binance credential validation failed")
+
+
+async def _binance_fetch_spot_market_stats(asset_symbols: list[str]) -> tuple[dict[str, float], dict[str, dict[str, float | None]]]:
+    prices: dict[str, float] = {}
+    stats: dict[str, dict[str, float | None]] = {}
+    quote_assets = ("USDT", "USDC", "FDUSD", "BUSD")
+    for asset in sorted({str(item or "").strip().upper() for item in asset_symbols if str(item or "").strip()}):
+        if _is_raw_cash_asset(asset):
+            prices[asset] = 1.0
+            stats[asset] = {"change_24h_pct": 0.0, "quote_volume_24h": None}
+            continue
+        for quote_asset in quote_assets:
+            symbol = f"{asset}{quote_asset}"
+            try:
+                payload = await _binance_public_get("/api/v3/ticker/24hr", {"symbol": symbol})
+            except RuntimeError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            last_price = _to_float(payload.get("lastPrice"), 0.0)
+            open_price = _to_float(payload.get("openPrice"), 0.0)
+            if last_price <= 0:
+                continue
+            prices[asset] = last_price
+            stats[asset] = {
+                "change_24h_pct": ((last_price - open_price) / open_price * 100.0) if open_price > 0 else None,
+                "quote_volume_24h": _to_float(payload.get("quoteVolume"), None),
+            }
+            break
+    return prices, stats
+
+
+def _normalize_binance_spot_balances(
+    raw_items: list[dict],
+    as_of: str,
+    *,
+    mark_prices: dict[str, float] | None = None,
+    change_stats: dict[str, dict[str, float | None]] | None = None,
+) -> list[dict]:
+    normalized: list[dict] = []
+    resolved_mark_prices = mark_prices or {}
+    resolved_change_stats = change_stats or {}
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        asset = str(item.get("asset") or item.get("coin") or "").strip().upper()
+        if not asset:
+            continue
+        available_qty = _to_float(item.get("free"), 0.0)
+        locked_qty = _to_float(item.get("locked"), 0.0)
+        total_qty = available_qty + locked_qty
+        if total_qty <= 0:
+            continue
+        mark_price = resolved_mark_prices.get(asset)
+        if (mark_price is None or mark_price <= 0) and _is_raw_cash_asset(asset):
+            mark_price = 1.0
+        equity_usd = total_qty * mark_price if mark_price else (total_qty if _is_raw_cash_asset(asset) else 0.0)
+        asset_change = resolved_change_stats.get(asset, {}) if isinstance(resolved_change_stats.get(asset), dict) else {}
+        normalized.append(
+            {
+                "asset_symbol": f"{asset}-SPOT",
+                "available_qty": available_qty,
+                "locked_qty": locked_qty,
+                "equity_usd": equity_usd,
+                "mark_price_usd": mark_price,
+                "change_24h_pct": _to_float(asset_change.get("change_24h_pct"), None),
+                "quote_volume_24h": _to_float(asset_change.get("quote_volume_24h"), None),
+                "as_of": as_of,
+                "source": "binance-spot",
+                "payload": {
+                    **item,
+                    "pocket": "spot",
+                    "change_24h_pct": _to_float(asset_change.get("change_24h_pct"), None),
+                    "quote_volume_24h": _to_float(asset_change.get("quote_volume_24h"), None),
+                },
+            }
+        )
+    return normalized
+
+
+def _normalize_binance_futures_balances(
+    raw_items: list[dict],
+    as_of: str,
+    *,
+    mark_prices: dict[str, float] | None = None,
+    change_stats: dict[str, dict[str, float | None]] | None = None,
+) -> list[dict]:
+    resolved_mark_prices = mark_prices or {}
+    resolved_change_stats = change_stats or {}
+    buckets: dict[str, dict[str, Any]] = {}
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        asset = str(item.get("asset") or item.get("marginAsset") or item.get("currency") or "").strip().upper()
+        if not asset:
+            continue
+        available_qty = _to_float(item.get("availableBalance"), _to_float(item.get("withdrawAvailable"), _to_float(item.get("walletBalance"), 0.0)))
+        total_qty = _to_float(item.get("marginBalance"), _to_float(item.get("walletBalance"), _to_float(item.get("balance"), available_qty)))
+        if total_qty <= 0 and available_qty <= 0:
+            continue
+        locked_qty = max(total_qty - available_qty, 0.0)
+        mark_price = resolved_mark_prices.get(asset)
+        if (mark_price is None or mark_price <= 0) and _is_raw_cash_asset(asset):
+            mark_price = 1.0
+        equity_usd = total_qty * mark_price if mark_price else (total_qty if _is_raw_cash_asset(asset) else 0.0)
+        bucket = buckets.setdefault(
+            asset,
+            {
+                "available_qty": 0.0,
+                "locked_qty": 0.0,
+                "equity_usd": 0.0,
+                "mark_price_usd": mark_price,
+                "market_types": set(),
+                "component_count": 0,
+            },
+        )
+        bucket["available_qty"] = _to_float(bucket.get("available_qty"), 0.0) + available_qty
+        bucket["locked_qty"] = _to_float(bucket.get("locked_qty"), 0.0) + locked_qty
+        bucket["equity_usd"] = _to_float(bucket.get("equity_usd"), 0.0) + equity_usd
+        if mark_price and (_to_float(bucket.get("mark_price_usd"), 0.0) <= 0):
+            bucket["mark_price_usd"] = mark_price
+        market_types = bucket.get("market_types")
+        if isinstance(market_types, set):
+            market_types.add(str(item.get("market_type") or "futures"))
+        bucket["component_count"] = int(bucket.get("component_count") or 0) + 1
+
+    normalized: list[dict] = []
+    for asset, bucket in sorted(buckets.items()):
+        asset_change = resolved_change_stats.get(asset, {}) if isinstance(resolved_change_stats.get(asset), dict) else {}
+        market_types = sorted(str(value) for value in (bucket.get("market_types") or set()))
+        normalized.append(
+            {
+                "asset_symbol": f"{asset}-FUTURES",
+                "available_qty": _to_float(bucket.get("available_qty"), 0.0),
+                "locked_qty": _to_float(bucket.get("locked_qty"), 0.0),
+                "equity_usd": _to_float(bucket.get("equity_usd"), 0.0),
+                "mark_price_usd": _to_float(bucket.get("mark_price_usd"), None),
+                "change_24h_pct": _to_float(asset_change.get("change_24h_pct"), None),
+                "quote_volume_24h": _to_float(asset_change.get("quote_volume_24h"), None),
+                "as_of": as_of,
+                "source": "binance-futures",
+                "payload": {
+                    "asset": asset,
+                    "pocket": "futures",
+                    "market_types": market_types,
+                    "component_count": int(bucket.get("component_count") or 0),
+                    "change_24h_pct": _to_float(asset_change.get("change_24h_pct"), None),
+                    "quote_volume_24h": _to_float(asset_change.get("quote_volume_24h"), None),
+                },
+            }
+        )
+    return normalized
+
+
+def _normalize_binance_positions(raw_items: list[dict], account_id: str, as_of: str) -> list[dict]:
+    positions: list[dict] = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        instrument = str(item.get("symbol") or item.get("pair") or "").strip().upper()
+        if not instrument:
+            continue
+        signed_quantity = _to_float(item.get("positionAmt"), 0.0)
+        side_hint = str(item.get("positionSide") or item.get("side") or "").strip().lower()
+        if side_hint == "short" or signed_quantity < 0:
+            side = "short"
+            quantity = abs(signed_quantity)
+        elif side_hint == "long" or signed_quantity > 0:
+            side = "long"
+            quantity = abs(signed_quantity)
+        else:
+            side = "flat"
+            quantity = 0.0
+        mark_price = _to_float(item.get("markPrice"), _to_float(item.get("price"), 0.0))
+        avg_entry_price = _to_float(item.get("entryPrice"), 0.0)
+        notional_usd = abs(_to_float(item.get("notional"), _to_float(item.get("notionalValue"), 0.0)))
+        if notional_usd <= 0 and quantity > 0:
+            reference_price = mark_price if mark_price > 0 else avg_entry_price
+            notional_usd = quantity * reference_price if reference_price > 0 else 0.0
+        if quantity <= 0 and notional_usd <= 0:
+            continue
+        market_type = str(item.get("market_type") or "futures").strip().lower() or "futures"
+        position_side = str(item.get("positionSide") or "BOTH").strip().upper() or "BOTH"
+        positions.append(
+            {
+                "position_id": f"binance:{market_type}:{account_id}:{instrument}:{position_side}",
+                "symbol": instrument,
+                "instrument": instrument,
+                "side": side,
+                "quantity": quantity,
+                "notional_usd": notional_usd,
+                "avg_entry_price": avg_entry_price,
+                "mark_price": mark_price,
+                "pnl_unrealized_usd": _to_float(item.get("unRealizedProfit"), _to_float(item.get("unrealizedProfit"), 0.0)),
+                "pnl_realized_usd": _to_float(item.get("realizedProfit"), 0.0),
+                "as_of": as_of,
+                "source": f"binance-futures-position-{market_type}",
+                "payload": item,
+            }
+        )
+    return positions
+
+
 def _bingx_pick_number(payload: dict, *keys: str) -> float | None:
     for key in keys:
         if key in payload and payload.get(key) not in {None, ""}:
@@ -4082,6 +4939,45 @@ def _normalize_bingx_balance_items(
             }
         )
     return normalized
+
+
+def _normalize_bingx_open_orders(raw_items: list[dict], as_of: str) -> list[dict]:
+    orders: list[dict] = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        symbol = _bingx_pick_text(item, "symbol", "contract", "pair")
+        order_id = _bingx_pick_text(item, "orderId", "clientOrderID", "clientOrderId", "id")
+        side = _bingx_pick_text(item, "side").upper()
+        position_side = _bingx_pick_text(item, "positionSide").upper()
+        order_type = _bingx_pick_text(item, "type", "orderType", "priceType").upper()
+        status = _bingx_pick_text(item, "status", "orderStatus").upper()
+        price = _bingx_pick_number(item, "price", "stopPrice", "triggerPrice") or 0.0
+        quantity = _bingx_pick_number(item, "origQty", "quantity", "qty", "orderVolume") or 0.0
+        filled_qty = _bingx_pick_number(item, "executedQty", "filledQty", "dealVolume") or 0.0
+        margin_mode = _bingx_pick_text(item, "marginMode", "positionMode", "margeMode")
+        leverage = _bingx_pick_number(item, "leverage") or 0.0
+        created_at = _bingx_pick_text(item, "createTime", "time", "timestamp", "createdAt")
+        if not symbol and not order_id:
+            continue
+        orders.append({
+            "order_id": order_id,
+            "symbol": symbol.upper() if symbol else "",
+            "side": side,
+            "position_side": position_side,
+            "order_type": order_type,
+            "status": status or "NEW",
+            "price": price,
+            "quantity": quantity,
+            "filled_qty": filled_qty,
+            "margin_mode": margin_mode,
+            "leverage": leverage,
+            "created_at": created_at,
+            "as_of": as_of,
+            "source": "bingx-open-order",
+            "payload": item,
+        })
+    return orders
 
 
 def _normalize_bingx_positions(raw_items: list[dict], account_id: str, as_of: str) -> list[dict]:
@@ -4572,6 +5468,108 @@ def _summarize_balance_pockets(balances: list[dict]) -> list[dict]:
     return ordered
 
 
+async def _sync_binance_account_state(account_id: str, account: dict | None = None) -> dict:
+    account_row = account if isinstance(account, dict) else fetch_one(
+        "SELECT account_id, client_id, account_type, venue, connector_type, mode, base_currency, status, external_ref, display_name, metadata, created_at, updated_at FROM accounts_registry WHERE account_id = %s",
+        (account_id,),
+    )
+    if not account_row:
+        raise ValueError("Canonical account not found")
+    connector_account = _find_connector_account_for_canonical_account(account_row)
+    if not connector_account or str(connector_account.get("provider") or "").strip().lower() != "binance":
+        raise ValueError("No linked Binance connector account found for this canonical account")
+    credential = _load_decrypted_connector_credential(str(connector_account.get("credential_id") or ""))
+    secret_payload = credential.get("secret_payload") if isinstance(credential, dict) else None
+    if not isinstance(secret_payload, dict):
+        raise ValueError("Binance credentials are missing or unreadable for this account")
+
+    previous_balances = _latest_account_balances(account_id)
+    previous_positions = _latest_account_positions(account_id)
+    as_of = _now_utc().isoformat()
+    fetch_results = await asyncio.gather(
+        _binance_signed_get(secret_payload, "/api/v3/account"),
+        _binance_signed_get(secret_payload, "/fapi/v2/account", base_url=BINANCE_FUTURES_API_BASE_URL, venue_label="Binance Futures"),
+        _binance_signed_get(secret_payload, "/fapi/v2/positionRisk", base_url=BINANCE_FUTURES_API_BASE_URL, venue_label="Binance Futures"),
+        _binance_signed_get(secret_payload, "/dapi/v1/account", base_url=BINANCE_COINM_API_BASE_URL, venue_label="Binance COIN-M Futures"),
+        _binance_signed_get(secret_payload, "/dapi/v1/positionRisk", base_url=BINANCE_COINM_API_BASE_URL, venue_label="Binance COIN-M Futures"),
+        return_exceptions=True,
+    )
+
+    errors: list[str] = []
+    spot_items: list[dict] = []
+    futures_balance_items: list[dict] = []
+    futures_position_items: list[dict] = []
+
+    if isinstance(fetch_results[0], Exception):
+        errors.append(f"spot: {str(fetch_results[0])}")
+    elif isinstance(fetch_results[0], dict):
+        balances = fetch_results[0].get("balances")
+        if isinstance(balances, list):
+            spot_items = [item for item in balances if isinstance(item, dict)]
+
+    if isinstance(fetch_results[1], Exception):
+        errors.append(f"futures_usdm_balance: {str(fetch_results[1])}")
+    elif isinstance(fetch_results[1], dict):
+        assets = fetch_results[1].get("assets")
+        if isinstance(assets, list):
+            futures_balance_items.extend([{**item, "market_type": "usdm"} for item in assets if isinstance(item, dict)])
+
+    if isinstance(fetch_results[2], Exception):
+        errors.append(f"futures_usdm_positions: {str(fetch_results[2])}")
+    elif isinstance(fetch_results[2], list):
+        futures_position_items.extend([{**item, "market_type": "usdm"} for item in fetch_results[2] if isinstance(item, dict)])
+
+    if isinstance(fetch_results[3], Exception):
+        errors.append(f"futures_coinm_balance: {str(fetch_results[3])}")
+    elif isinstance(fetch_results[3], dict):
+        assets = fetch_results[3].get("assets")
+        if isinstance(assets, list):
+            futures_balance_items.extend([{**item, "market_type": "coinm"} for item in assets if isinstance(item, dict)])
+
+    if isinstance(fetch_results[4], Exception):
+        errors.append(f"futures_coinm_positions: {str(fetch_results[4])}")
+    elif isinstance(fetch_results[4], list):
+        futures_position_items.extend([{**item, "market_type": "coinm"} for item in fetch_results[4] if isinstance(item, dict)])
+
+    if errors and not spot_items and not futures_balance_items and not futures_position_items:
+        raise RuntimeError("; ".join(errors))
+
+    tracked_assets = [
+        *[str(item.get("asset") or "") for item in spot_items],
+        *[str(item.get("asset") or item.get("marginAsset") or "") for item in futures_balance_items],
+    ]
+    mark_prices, change_stats = await _binance_fetch_spot_market_stats(tracked_assets)
+    balances = [
+        *_normalize_binance_spot_balances(spot_items, as_of, mark_prices=mark_prices, change_stats=change_stats),
+        *_normalize_binance_futures_balances(futures_balance_items, as_of, mark_prices=mark_prices, change_stats=change_stats),
+    ]
+    positions = _normalize_binance_positions(futures_position_items, account_id, as_of)
+    persisted = _persist_connector_account_state(
+        account_id,
+        as_of=as_of,
+        balances=balances,
+        positions=positions,
+        balance_sources=["binance-spot", "binance-futures"],
+        position_source_prefixes=["binance-futures-position"],
+    )
+    persisted = _postprocess_connector_sync(account_row, "binance", as_of, balances, positions, previous_balances, previous_positions, persisted)
+    persisted["status"] = "partial" if errors else "ok"
+    persisted["connector_account"] = _connector_account_public_view(connector_account)
+    if errors:
+        persisted["warnings"] = errors
+    persisted["risk_snapshots"] = _refresh_portfolio_risk_snapshots_for_account(account_id)
+    append_audit(
+        "binance_account_state_synced",
+        {
+            "account_id": account_id,
+            "status": persisted["status"],
+            "balance_count": persisted["summary"]["balance_count"],
+            "position_count": persisted["summary"]["position_count"],
+        },
+    )
+    return persisted
+
+
 async def _sync_bingx_account_state(account_id: str, account: dict | None = None) -> dict:
     account_row = account if isinstance(account, dict) else fetch_one(
         "SELECT account_id, client_id, account_type, venue, connector_type, mode, base_currency, status, external_ref, display_name, metadata, created_at, updated_at FROM accounts_registry WHERE account_id = %s",
@@ -4598,6 +5596,7 @@ async def _sync_bingx_account_state(account_id: str, account: dict | None = None
         _bingx_signed_get(secret_payload, "/openApi/account/v1/allAccountBalance", {"recvWindow": 60000}),
         _bingx_fetch_futures_balances(secret_payload),
         _bingx_signed_get(secret_payload, "/openApi/swap/v2/user/positions", {"recvWindow": 60000}),
+        _bingx_signed_get(secret_payload, "/openApi/swap/v2/trade/openOrders", {"recvWindow": 60000}),
         return_exceptions=True,
     )
 
@@ -4607,12 +5606,14 @@ async def _sync_bingx_account_state(account_id: str, account: dict | None = None
     account_overview_items: list[dict] = []
     futures_balance_items: list[dict] = []
     futures_position_items: list[dict] = []
+    open_order_items: list[dict] = []
     result_specs = [
         ("spot", fetch_results[0], ("balances", "balance", "data", "list")),
         ("fund", fetch_results[1], ("balances", "balance", "data", "list")),
         ("account_overview", fetch_results[2], ("data", "list")),
         ("futures_balance", fetch_results[3], ("balance", "balances", "data", "list")),
         ("futures_positions", fetch_results[4], ("positions", "data", "list")),
+        ("open_orders", fetch_results[5], ("orders", "data", "list")),
     ]
     for label, result, keys in result_specs:
         if isinstance(result, Exception):
@@ -4627,6 +5628,8 @@ async def _sync_bingx_account_state(account_id: str, account: dict | None = None
             account_overview_items = items
         elif label == "futures_balance":
             futures_balance_items = items
+        elif label == "open_orders":
+            open_order_items = items
         else:
             futures_position_items = items
 
@@ -4646,6 +5649,7 @@ async def _sync_bingx_account_state(account_id: str, account: dict | None = None
         *_normalize_bingx_balance_items(futures_balance_items, "futures", as_of),
     ]
     positions = _normalize_bingx_positions(futures_position_items, account_id, as_of)
+    open_orders = _normalize_bingx_open_orders(open_order_items, as_of)
     pocket_totals = _summarize_balance_pockets(balances)
     overview_by_type = {
         str(item.get("accountType") or "").strip().lower(): _to_float(item.get("usdtBalance"), 0.0)
@@ -4673,6 +5677,7 @@ async def _sync_bingx_account_state(account_id: str, account: dict | None = None
     persisted["status"] = "partial" if errors else "ok"
     persisted["connector_account"] = _connector_account_public_view(connector_account)
     persisted["account_overview"] = account_overview_items
+    persisted["open_orders"] = open_orders
     if diagnostic_notes:
         persisted["notes"] = diagnostic_notes
     if errors:
@@ -4696,14 +5701,54 @@ def _unwrap_okx_response(path: str, body: object) -> object:
     if not isinstance(body, (dict, list)):
         raise RuntimeError(f"OKX {path} returned an invalid payload")
     if isinstance(body, dict):
-        code = str(body.get("code") or "0").strip()
+        code = _okx_error_code(body) or "0"
         if code not in {"0", "", "success", "SUCCESS"}:
-            detail = str(body.get("msg") or body.get("message") or "unknown error")
-            raise RuntimeError(f"OKX {path} rejected the request: {detail}")
+            raise _okx_response_error(path, body)
         data = body.get("data")
         if isinstance(data, (dict, list)):
             return data
     return body
+
+
+class OKXAPIError(RuntimeError):
+    def __init__(self, path: str, detail: str, *, code: str | None = None, http_status: int | None = None):
+        self.path = path
+        self.code = str(code).strip() or None if code is not None else None
+        self.http_status = http_status
+        if http_status is not None:
+            if self.code:
+                message = f"OKX {path} failed with status {http_status} [code {self.code}]: {detail}"
+            else:
+                message = f"OKX {path} failed with status {http_status}: {detail}"
+        else:
+            if self.code:
+                message = f"OKX {path} rejected the request [code {self.code}]: {detail}"
+            else:
+                message = f"OKX {path} rejected the request: {detail}"
+        super().__init__(message)
+
+
+def _okx_error_code(body: object) -> str | None:
+    if not isinstance(body, dict):
+        return None
+    code = str(body.get("code") or "").strip()
+    return code or None
+
+
+def _okx_error_detail(body: object, fallback: str = "unknown error") -> str:
+    if not isinstance(body, dict):
+        return fallback
+    detail = str(body.get("msg") or body.get("message") or fallback).strip()
+    return detail or fallback
+
+
+def _okx_response_error(path: str, body: object, *, http_status: int | None = None, fallback: str = "unknown error") -> OKXAPIError:
+    return OKXAPIError(
+        path,
+        _okx_error_detail(body, fallback=fallback),
+        code=_okx_error_code(body),
+        http_status=http_status,
+    )
 
 
 async def _okx_public_get(path: str, params: dict | None = None) -> object:
@@ -4721,7 +5766,11 @@ async def _okx_public_get(path: str, params: dict | None = None) -> object:
     except httpx.HTTPError as exc:
         raise RuntimeError(f"OKX {path} public request failed: {str(exc)[:300]}") from exc
     if response.status_code >= 400:
-        raise RuntimeError(f"OKX {path} public request failed with status {response.status_code}: {response.text[:300]}")
+        try:
+            body = response.json()
+        except ValueError:
+            raise RuntimeError(f"OKX {path} public request failed with status {response.status_code}: {response.text[:300]}")
+        raise _okx_response_error(path, body, http_status=response.status_code, fallback=response.text[:300])
     try:
         body = response.json()
     except ValueError as exc:
@@ -4759,12 +5808,20 @@ async def _okx_signed_get(secret_payload: dict, path: str, params: dict | None =
     except httpx.HTTPError as exc:
         raise RuntimeError(f"OKX {path} request failed: {str(exc)[:300]}") from exc
     if response.status_code >= 400:
-        raise RuntimeError(f"OKX {path} failed with status {response.status_code}: {response.text[:300]}")
+        try:
+            body = response.json()
+        except ValueError:
+            raise RuntimeError(f"OKX {path} failed with status {response.status_code}: {response.text[:300]}")
+        raise _okx_response_error(path, body, http_status=response.status_code, fallback=response.text[:300])
     try:
         body = response.json()
     except ValueError as exc:
         raise RuntimeError(f"OKX {path} returned invalid JSON") from exc
     return _unwrap_okx_response(path, body)
+
+
+async def _okx_validate_api_credentials(secret_payload: dict) -> None:
+    await _okx_signed_get(secret_payload, "/api/v5/account/balance")
 
 
 async def _okx_fetch_spot_market_stats(asset_symbols: list[str]) -> tuple[dict[str, float], dict[str, dict[str, float | None]]]:
@@ -5358,6 +6415,7 @@ async def _sync_supported_connector_account_state(account_id: str, account: dict
         (connector_account or {}).get("provider") if isinstance(connector_account, dict) else account_row.get("connector_type") or ""
     ).strip().lower()
     syncers = {
+        "binance": _sync_binance_account_state,
         "bingx": _sync_bingx_account_state,
         "bitget": _sync_bitget_account_state,
         "okx": _sync_okx_account_state,
@@ -5397,6 +6455,48 @@ def _provider_to_preferred_venue(provider: str) -> str:
 def _default_live_execution_policy() -> dict[str, Any]:
     return {
         "enabled": False,
+        "connector_health": {
+            "block_below": 0.70,
+            "reduce_below": 0.85,
+            "reduce_size_multiplier": 0.65,
+            "latency_warn_ms": 80.0,
+            "latency_block_ms": 120.0,
+            "slippage_block_bps": 15.0,
+            "max_error_rate_pct": 20.0,
+        },
+        "go_live_hardening": {
+            "enabled": True,
+            "min_live_confidence": 0.7,
+            "require_human_approval_above_notional_usd": 5.0,
+            "approval_exposure_threshold_pct": 40.0,
+            "max_total_exposure_pct": 60.0,
+            "max_symbol_exposure_pct": 25.0,
+            "max_pending_live_approvals": 8,
+            "drawdown_warning_ratio": 0.7,
+            "enforce_memory_gate": True,
+            "autonomous_sources": [
+                "kairos-shadow-runtime",
+                "tradingview",
+                "quantower",
+                "webhook",
+                "signal-webhook",
+            ],
+            "anti_loop": {
+                "enabled": True,
+                "lookback_minutes": 20,
+                "same_signal_limit": 3,
+                "block_after_repeats": 5,
+                "degraded_confidence_multiplier": 0.6,
+            },
+            "watchdog": {
+                "enabled": True,
+                "max_latency_e2e_ms": 1500,
+                "max_realized_slippage_bps": 15,
+                "max_block_rate": 0.35,
+                "max_partial_fill_ratio": 0.55,
+                "kill_on_consecutive_failures": 4,
+            },
+        },
         "providers": {
             "bingx": {
                 "enabled": False,
@@ -5427,7 +6527,7 @@ def _load_live_execution_policy() -> dict[str, Any]:
             raw = json.loads(LIVE_EXECUTION_POLICY_PATH.read_text(encoding="utf-8"))
             if isinstance(raw, dict):
                 merged = dict(policy)
-                merged.update({key: value for key, value in raw.items() if key != "providers"})
+                merged.update({key: value for key, value in raw.items() if key not in {"providers", "go_live_hardening"}})
                 merged_providers = dict(policy.get("providers") or {})
                 raw_providers = raw.get("providers") if isinstance(raw.get("providers"), dict) else {}
                 for provider_key, provider_value in raw_providers.items():
@@ -5437,10 +6537,351 @@ def _load_live_execution_policy() -> dict[str, Any]:
                         merged_provider.update(provider_value)
                     merged_providers[provider_key] = merged_provider
                 merged["providers"] = merged_providers
+                default_hardening = policy.get("go_live_hardening") if isinstance(policy.get("go_live_hardening"), dict) else {}
+                merged_hardening = dict(default_hardening)
+                raw_hardening = raw.get("go_live_hardening") if isinstance(raw.get("go_live_hardening"), dict) else {}
+                if isinstance(raw_hardening, dict):
+                    merged_hardening.update({
+                        key: value
+                        for key, value in raw_hardening.items()
+                        if key not in {"anti_loop", "watchdog"}
+                    })
+                    default_anti_loop = default_hardening.get("anti_loop") if isinstance(default_hardening.get("anti_loop"), dict) else {}
+                    merged_anti_loop = dict(default_anti_loop)
+                    raw_anti_loop = raw_hardening.get("anti_loop") if isinstance(raw_hardening.get("anti_loop"), dict) else {}
+                    merged_anti_loop.update(raw_anti_loop)
+                    merged_hardening["anti_loop"] = merged_anti_loop
+                    default_watchdog = default_hardening.get("watchdog") if isinstance(default_hardening.get("watchdog"), dict) else {}
+                    merged_watchdog = dict(default_watchdog)
+                    raw_watchdog = raw_hardening.get("watchdog") if isinstance(raw_hardening.get("watchdog"), dict) else {}
+                    merged_watchdog.update(raw_watchdog)
+                    merged_hardening["watchdog"] = merged_watchdog
+                merged["go_live_hardening"] = merged_hardening
                 return merged
     except Exception:
         pass
     return policy
+
+
+def _go_live_hardening_policy() -> dict[str, Any]:
+    policy = _load_live_execution_policy()
+    hardening = policy.get("go_live_hardening") if isinstance(policy.get("go_live_hardening"), dict) else {}
+    default_hardening = _default_live_execution_policy().get("go_live_hardening")
+    merged = dict(default_hardening) if isinstance(default_hardening, dict) else {}
+    merged.update({key: value for key, value in hardening.items() if key not in {"anti_loop", "watchdog"}})
+    default_anti_loop = merged.get("anti_loop") if isinstance(merged.get("anti_loop"), dict) else {}
+    hardening_anti_loop = hardening.get("anti_loop") if isinstance(hardening.get("anti_loop"), dict) else {}
+    merged["anti_loop"] = {**default_anti_loop, **hardening_anti_loop}
+    default_watchdog = merged.get("watchdog") if isinstance(merged.get("watchdog"), dict) else {}
+    hardening_watchdog = hardening.get("watchdog") if isinstance(hardening.get("watchdog"), dict) else {}
+    merged["watchdog"] = {**default_watchdog, **hardening_watchdog}
+    return merged
+
+
+def _sanitize_go_live_hardening_policy(policy: dict[str, Any] | None = None) -> dict[str, Any]:
+    hardening = policy if isinstance(policy, dict) else _go_live_hardening_policy()
+    anti_loop = hardening.get("anti_loop") if isinstance(hardening.get("anti_loop"), dict) else {}
+    watchdog = hardening.get("watchdog") if isinstance(hardening.get("watchdog"), dict) else {}
+    return {
+        "enabled": _bool_from_any(hardening.get("enabled"), True),
+        "min_live_confidence": _to_float(hardening.get("min_live_confidence"), 0.7),
+        "require_human_approval_above_notional_usd": _to_float(hardening.get("require_human_approval_above_notional_usd"), 0.0),
+        "approval_exposure_threshold_pct": _to_float(hardening.get("approval_exposure_threshold_pct"), 0.0),
+        "max_total_exposure_pct": _to_float(hardening.get("max_total_exposure_pct"), 0.0),
+        "max_symbol_exposure_pct": _to_float(hardening.get("max_symbol_exposure_pct"), 0.0),
+        "max_pending_live_approvals": int(_to_float(hardening.get("max_pending_live_approvals"), 0.0)),
+        "drawdown_warning_ratio": _to_float(hardening.get("drawdown_warning_ratio"), 0.0),
+        "enforce_memory_gate": _bool_from_any(hardening.get("enforce_memory_gate"), True),
+        "autonomous_sources": [str(item).strip() for item in hardening.get("autonomous_sources", []) if str(item).strip()],
+        "anti_loop": {
+            "enabled": _bool_from_any(anti_loop.get("enabled"), True),
+            "lookback_minutes": int(_to_float(anti_loop.get("lookback_minutes"), 20.0)),
+            "same_signal_limit": int(_to_float(anti_loop.get("same_signal_limit"), 3.0)),
+            "block_after_repeats": int(_to_float(anti_loop.get("block_after_repeats"), 5.0)),
+            "degraded_confidence_multiplier": _to_float(anti_loop.get("degraded_confidence_multiplier"), 0.6),
+        },
+        "watchdog": {
+            "enabled": _bool_from_any(watchdog.get("enabled"), True),
+            "max_latency_e2e_ms": int(_to_float(watchdog.get("max_latency_e2e_ms"), 1500.0)),
+            "max_realized_slippage_bps": _to_float(watchdog.get("max_realized_slippage_bps"), 15.0),
+            "max_block_rate": _to_float(watchdog.get("max_block_rate"), 0.35),
+            "max_partial_fill_ratio": _to_float(watchdog.get("max_partial_fill_ratio"), 0.55),
+            "kill_on_consecutive_failures": int(_to_float(watchdog.get("kill_on_consecutive_failures"), 4.0)),
+        },
+    }
+
+
+def _extract_trade_governance(payload: dict[str, Any] | None) -> dict[str, Any]:
+    raw = payload if isinstance(payload, dict) else {}
+    metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
+    order_intent = raw.get("order_intent") if isinstance(raw.get("order_intent"), dict) else {}
+    governance = metadata.get("governance") if isinstance(metadata.get("governance"), dict) else order_intent.get("governance") if isinstance(order_intent.get("governance"), dict) else {}
+    return {
+        "approved": _bool_from_any(governance.get("approved"), False),
+        "approver": str(governance.get("approver") or "").strip(),
+        "approval_id": str(governance.get("approval_id") or "").strip(),
+        "approval_mode": str(governance.get("approval_mode") or "").strip(),
+        "override": _bool_from_any(governance.get("override"), False),
+    }
+
+
+def _account_live_exposure_snapshot(account_id: str, symbol: str, requested_notional_usd: float) -> dict[str, Any]:
+    account_key = str(account_id or "").strip()
+    normalized_symbol = _normalize_symbol(symbol)
+    if not account_key:
+        return {
+            "account_id": "",
+            "equity_usd": 0.0,
+            "gross_exposure_usd": 0.0,
+            "gross_exposure_pct": 0.0,
+            "symbol_gross_exposure_usd": 0.0,
+            "symbol_exposure_pct": 0.0,
+            "projected_total_exposure_pct": 0.0,
+            "projected_symbol_exposure_pct": 0.0,
+            "portfolio_ids": [],
+            "positions_count": 0,
+            "exposure_known": False,
+        }
+
+    balances = _latest_account_balances(account_key)
+    positions = _latest_account_positions(account_key)
+    equity_usd = sum(_to_float(item.get("equity_usd"), 0.0) for item in balances if isinstance(item, dict))
+    gross_exposure_usd = sum(abs(_to_float(item.get("notional_usd"), 0.0)) for item in positions if isinstance(item, dict))
+    symbol_gross_exposure_usd = sum(
+        abs(_to_float(item.get("notional_usd"), 0.0))
+        for item in positions
+        if isinstance(item, dict) and _normalize_symbol(str(item.get("symbol") or item.get("instrument") or "")) == normalized_symbol
+    )
+    gross_exposure_pct = (gross_exposure_usd / equity_usd * 100.0) if equity_usd > 0 else 0.0
+    symbol_exposure_pct = (symbol_gross_exposure_usd / equity_usd * 100.0) if equity_usd > 0 else 0.0
+    projected_total_exposure_pct = ((gross_exposure_usd + max(0.0, requested_notional_usd)) / equity_usd * 100.0) if equity_usd > 0 else 0.0
+    projected_symbol_exposure_pct = ((symbol_gross_exposure_usd + max(0.0, requested_notional_usd)) / equity_usd * 100.0) if equity_usd > 0 else 0.0
+    return {
+        "account_id": account_key,
+        "equity_usd": round(equity_usd, 8),
+        "gross_exposure_usd": round(gross_exposure_usd, 8),
+        "gross_exposure_pct": round(gross_exposure_pct, 4),
+        "symbol_gross_exposure_usd": round(symbol_gross_exposure_usd, 8),
+        "symbol_exposure_pct": round(symbol_exposure_pct, 4),
+        "projected_total_exposure_pct": round(projected_total_exposure_pct, 4),
+        "projected_symbol_exposure_pct": round(projected_symbol_exposure_pct, 4),
+        "portfolio_ids": _portfolio_ids_for_account(account_key),
+        "positions_count": len([item for item in positions if isinstance(item, dict)]),
+        "exposure_known": equity_usd > 0,
+    }
+
+
+def _recent_pending_live_approval_count(account_id: str = "") -> int:
+    if account_id:
+        row = fetch_one(
+            "SELECT COUNT(*) AS count FROM mt5_live_approvals WHERE status = 'pending' AND account_id = %s",
+            (account_id,),
+        ) or {"count": 0}
+    else:
+        row = fetch_one("SELECT COUNT(*) AS count FROM mt5_live_approvals WHERE status = 'pending'") or {"count": 0}
+    return int(row.get("count") or 0)
+
+
+def _go_live_signal_loop_snapshot(account_id: str, symbol: str, side: str, source: str, lookback_minutes: int) -> dict[str, Any]:
+    safe_lookback = max(1, min(24 * 60, int(lookback_minutes or 20)))
+    normalized_symbol = _normalize_symbol(symbol)
+    source_key = str(source or "").strip()
+    rows = fetch_all(
+        """
+        SELECT COALESCE(payload->>'status', '') AS status,
+               COALESCE(payload->>'account_id', '') AS account_id,
+               COALESCE(payload->>'symbol', '') AS symbol,
+               COALESCE(payload->>'side', '') AS side,
+               COALESCE(payload->>'source', '') AS source,
+               created_at
+        FROM audit_events
+        WHERE category = 'go_live_hardening_decision'
+          AND created_at >= NOW() - (%s * INTERVAL '1 minute')
+          AND COALESCE(payload->>'account_id', '') = %s
+          AND COALESCE(payload->>'symbol', '') = %s
+          AND COALESCE(payload->>'side', '') = %s
+        ORDER BY created_at DESC
+        LIMIT 24
+        """,
+        (safe_lookback, str(account_id or "").strip(), normalized_symbol, str(side or "").strip().lower()),
+    )
+    same_source_repeats = sum(1 for row in rows if not source_key or str(row.get("source") or "").strip() == source_key)
+    blocked_count = sum(1 for row in rows if str(row.get("status") or "") == "blocked")
+    return {
+        "lookback_minutes": safe_lookback,
+        "repeat_count": len(rows),
+        "same_source_repeat_count": same_source_repeats,
+        "blocked_repeat_count": blocked_count,
+    }
+
+
+def _go_live_status_rank(status: str) -> int:
+    return {"approved": 0, "require_human": 1, "blocked": 2}.get(str(status or "approved"), 0)
+
+
+def _promote_go_live_status(current: str, candidate: str) -> str:
+    return candidate if _go_live_status_rank(candidate) > _go_live_status_rank(current) else current
+
+
+def _evaluate_go_live_hardening(
+    *,
+    source: str,
+    provider: str,
+    account_id: str,
+    symbol: str,
+    side: str,
+    requested_notional_usd: float,
+    confidence: float,
+    live_requested: bool,
+    purpose: str,
+    pre_trade_memory_gate: dict[str, Any] | None = None,
+    governance: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    policy = _sanitize_go_live_hardening_policy()
+    governance_view = governance if isinstance(governance, dict) else {
+        "approved": False,
+        "approver": "",
+        "approval_id": "",
+        "approval_mode": "",
+        "override": False,
+    }
+    normalized_symbol = _normalize_symbol(symbol)
+    normalized_side = str(side or "buy").strip().lower() or "buy"
+    status = "approved"
+    reasons: list[str] = []
+    active = _bool_from_any(policy.get("enabled"), True) and (live_requested or purpose == "smoke")
+    effective_confidence = _clamp(_to_float(confidence, 0.0), 0.0, 1.0)
+    exposure = _account_live_exposure_snapshot(account_id, normalized_symbol, requested_notional_usd)
+    anti_loop_policy = policy.get("anti_loop") if isinstance(policy.get("anti_loop"), dict) else {}
+    anti_loop = _go_live_signal_loop_snapshot(
+        account_id,
+        normalized_symbol,
+        normalized_side,
+        source,
+        int(_to_float(anti_loop_policy.get("lookback_minutes"), 20.0)),
+    ) if active and _bool_from_any(anti_loop_policy.get("enabled"), True) else {
+        "lookback_minutes": int(_to_float(anti_loop_policy.get("lookback_minutes"), 20.0)),
+        "repeat_count": 0,
+        "same_source_repeat_count": 0,
+        "blocked_repeat_count": 0,
+    }
+    kill_state = _kill_switch_state()
+    drawdown_threshold = max(_kill_switch_thresholds().get("max_drawdown_intraday", 1.0), 1.0)
+    drawdown_intraday_usd = _to_float(((kill_state.get("stats") or {}) if isinstance(kill_state.get("stats"), dict) else {}).get("drawdown_intraday_usd"), 0.0)
+    pending_live_approvals = _recent_pending_live_approval_count(account_id)
+
+    if active and kill_state.get("active"):
+        reasons.append("kill_switch_active")
+        status = _promote_go_live_status(status, "blocked")
+
+    if active and _bool_from_any(policy.get("enforce_memory_gate"), True):
+        memory_gate = pre_trade_memory_gate if isinstance(pre_trade_memory_gate, dict) else {}
+        if _bool_from_any(memory_gate.get("block_execution"), False):
+            reasons.append("memory_pretrade_gate_blocked")
+            status = _promote_go_live_status(status, "blocked")
+
+    same_signal_limit = max(1, int(_to_float(anti_loop_policy.get("same_signal_limit"), 3.0)))
+    block_after_repeats = max(same_signal_limit, int(_to_float(anti_loop_policy.get("block_after_repeats"), 5.0)))
+    degraded_confidence_multiplier = _clamp(_to_float(anti_loop_policy.get("degraded_confidence_multiplier"), 0.6), 0.1, 1.0)
+    anti_loop_degraded = anti_loop.get("repeat_count", 0) >= same_signal_limit
+    anti_loop_blocked = anti_loop.get("repeat_count", 0) >= block_after_repeats
+    if active and anti_loop_degraded:
+        effective_confidence = _clamp(effective_confidence * degraded_confidence_multiplier, 0.0, 1.0)
+        reasons.append("anti_loop_confidence_degraded")
+    if active and anti_loop_blocked:
+        reasons.append("anti_loop_repetition_blocked")
+        status = _promote_go_live_status(status, "blocked")
+
+    min_live_confidence = _to_float(policy.get("min_live_confidence"), 0.7)
+    if active and min_live_confidence > 0 and effective_confidence < min_live_confidence:
+        reasons.append("confidence_below_governance_threshold")
+        status = _promote_go_live_status(status, "blocked")
+
+    max_total_exposure_pct = _to_float(policy.get("max_total_exposure_pct"), 0.0)
+    max_symbol_exposure_pct = _to_float(policy.get("max_symbol_exposure_pct"), 0.0)
+    approval_exposure_threshold_pct = _to_float(policy.get("approval_exposure_threshold_pct"), 0.0)
+    if active and not exposure.get("exposure_known"):
+        reasons.append("live_exposure_unknown")
+        if not governance_view.get("approved"):
+            status = _promote_go_live_status(status, "require_human")
+    if active and max_total_exposure_pct > 0 and _to_float(exposure.get("projected_total_exposure_pct"), 0.0) > max_total_exposure_pct:
+        reasons.append("max_total_exposure_exceeded")
+        status = _promote_go_live_status(status, "blocked")
+    if active and max_symbol_exposure_pct > 0 and _to_float(exposure.get("projected_symbol_exposure_pct"), 0.0) > max_symbol_exposure_pct:
+        reasons.append("max_symbol_exposure_exceeded")
+        status = _promote_go_live_status(status, "blocked")
+
+    max_pending_live_approvals = max(0, int(_to_float(policy.get("max_pending_live_approvals"), 0.0)))
+    if active and max_pending_live_approvals > 0 and pending_live_approvals >= max_pending_live_approvals:
+        reasons.append("pending_live_approval_backlog")
+        status = _promote_go_live_status(status, "blocked")
+
+    drawdown_warning_ratio = _clamp(_to_float(policy.get("drawdown_warning_ratio"), 0.7), 0.0, 1.0)
+    drawdown_ratio = drawdown_intraday_usd / drawdown_threshold if drawdown_threshold > 0 else 0.0
+    if active and drawdown_warning_ratio > 0 and drawdown_ratio >= drawdown_warning_ratio and not governance_view.get("approved"):
+        reasons.append("drawdown_near_limit_requires_governance")
+        status = _promote_go_live_status(status, "require_human")
+
+    autonomous_sources = {str(item).strip() for item in policy.get("autonomous_sources", []) if str(item).strip()}
+    require_human_above_notional_usd = _to_float(policy.get("require_human_approval_above_notional_usd"), 0.0)
+    if active and not governance_view.get("approved"):
+        if require_human_above_notional_usd > 0 and requested_notional_usd >= require_human_above_notional_usd:
+            reasons.append("governance_approval_required_notional")
+            status = _promote_go_live_status(status, "require_human")
+        if source in autonomous_sources:
+            reasons.append("governance_approval_required_autonomous_source")
+            status = _promote_go_live_status(status, "require_human")
+        if approval_exposure_threshold_pct > 0 and _to_float(exposure.get("projected_total_exposure_pct"), 0.0) >= approval_exposure_threshold_pct:
+            reasons.append("governance_approval_required_exposure")
+            status = _promote_go_live_status(status, "require_human")
+
+    result = {
+        "active": active,
+        "status": status,
+        "source": source,
+        "provider": provider,
+        "account_id": str(account_id or "").strip(),
+        "symbol": normalized_symbol,
+        "side": normalized_side,
+        "requested_notional_usd": round(max(0.0, requested_notional_usd), 8),
+        "input_confidence": _clamp(_to_float(confidence, 0.0), 0.0, 1.0),
+        "effective_confidence": effective_confidence,
+        "reasons": sorted(set(reasons)),
+        "governance": governance_view,
+        "policy": policy,
+        "exposure": exposure,
+        "anti_loop": {
+            **anti_loop,
+            "degraded": anti_loop_degraded,
+            "blocked": anti_loop_blocked,
+            "degraded_confidence_multiplier": degraded_confidence_multiplier,
+        },
+        "drawdown_intraday_usd": round(drawdown_intraday_usd, 8),
+        "drawdown_ratio": round(drawdown_ratio, 6),
+        "kill_switch_active": bool(kill_state.get("active")),
+        "pending_live_approvals": pending_live_approvals,
+        "purpose": purpose,
+    }
+    if active:
+        append_audit(
+            "go_live_hardening_decision",
+            {
+                "status": result["status"],
+                "source": source,
+                "provider": provider,
+                "account_id": result["account_id"],
+                "symbol": normalized_symbol,
+                "side": normalized_side,
+                "requested_notional_usd": result["requested_notional_usd"],
+                "effective_confidence": effective_confidence,
+                "reasons": result["reasons"],
+                "governance": governance_view,
+                "anti_loop": result["anti_loop"],
+                "exposure": exposure,
+                "purpose": purpose,
+            },
+        )
+    return result
 
 
 def _provider_live_env_enabled(provider: str) -> bool:
@@ -5450,7 +6891,7 @@ def _provider_live_env_enabled(provider: str) -> bool:
 
 def _linked_connector_account(provider: str, account_id: str) -> dict[str, Any] | None:
     provider_norm = _normalize_connector_provider(provider)
-    account_key = str(account_id or "").strip()
+    account_key = _normalize_account_id(account_id)
     if not provider_norm or not account_key:
         return None
     return next(
@@ -5458,7 +6899,7 @@ def _linked_connector_account(provider: str, account_id: str) -> dict[str, Any] 
             item
             for item in _load_connector_accounts()
             if str(item.get("provider", "")).strip().lower() == provider_norm
-            and str(item.get("account_id", "")).strip() == account_key
+            and _normalize_account_id(item.get("account_id")) == account_key
         ),
         None,
     )
@@ -5466,8 +6907,13 @@ def _linked_connector_account(provider: str, account_id: str) -> dict[str, Any] 
 
 def _preferred_execution_venue(provider: str, *, live_enabled: bool = False) -> str:
     provider_norm = _normalize_connector_provider(provider)
-    if live_enabled and provider_norm == "bingx":
-        return provider_norm
+    capabilities = _exchange_capabilities(provider_norm)
+    if provider_norm and not _bool_from_any(capabilities.get("known"), False):
+        return ""
+    if live_enabled and _bool_from_any(capabilities.get("execution"), False):
+        execution_venue = str(capabilities.get("execution_venue") or "").strip()
+        if execution_venue:
+            return execution_venue
     return _provider_to_preferred_venue(provider_norm)
 
 
@@ -5542,10 +6988,16 @@ def _resolve_live_execution_request(
     confidence: float = 0.0,
 ) -> dict[str, Any]:
     provider_norm = _normalize_connector_provider(provider)
+    account_key = _normalize_account_id(account_id)
+    exchange_capabilities = _exchange_capabilities(provider_norm)
     policy = _load_live_execution_policy()
     provider_policy = policy.get("providers", {}).get(provider_norm) if isinstance(policy.get("providers"), dict) else {}
     provider_policy = provider_policy if isinstance(provider_policy, dict) else {}
     reasons: list[str] = []
+    if not _bool_from_any(exchange_capabilities.get("known"), False):
+        reasons.append("unknown_provider")
+    elif not _bool_from_any(exchange_capabilities.get("execution"), False):
+        reasons.append("execution_not_supported")
     if not _bool_from_any(policy.get("enabled"), False):
         reasons.append("live_policy_globally_disabled")
     if not _bool_from_any(provider_policy.get("enabled"), False):
@@ -5565,7 +7017,33 @@ def _resolve_live_execution_request(
         )
     )
 
-    linked_account = _linked_connector_account(provider_norm, account_id)
+    connector_degradation: dict[str, Any] = {}
+    try:
+        connector_degradation = _connector_live_degradation_snapshot(provider_norm)
+    except Exception:
+        connector_degradation = {
+            "provider": provider_norm,
+            "state": "unknown",
+            "auto_disable_live": True,
+            "diagnostic": "degradation-check-failed",
+            "diagnostics": ["degradation-check-failed"],
+            "health_score": 0.0,
+            "health_action": "block",
+            "size_multiplier": 0.0,
+        }
+        reasons.append("connector_degradation_check_failed")
+    advisories: list[str] = []
+    health_action = str(connector_degradation.get("health_action") or "ok").strip().lower()
+    size_multiplier = _clamp(_to_float(connector_degradation.get("size_multiplier"), 1.0), 0.0, 1.0)
+    effective_notional_usd = round(requested_notional_usd * size_multiplier, 8)
+    if health_action == "block":
+        reasons.append("connector_health_score_blocked")
+    elif health_action == "reduce_size" and requested_notional_usd > 0 and effective_notional_usd < requested_notional_usd:
+        advisories.append("connector_health_reduce_size")
+    if bool(connector_degradation.get("auto_disable_live")):
+        reasons.append("connector_auto_disable_live")
+
+    linked_account = _linked_connector_account(provider_norm, account_key)
     if not linked_account:
         reasons.append("linked_account_missing")
         credential = None
@@ -5593,11 +7071,19 @@ def _resolve_live_execution_request(
     return {
         "enabled": enabled,
         "provider": provider_norm,
-        "account_id": str(account_id or "").strip(),
+        "account_id": account_key,
+        "capabilities": exchange_capabilities,
         "execution_venue": _preferred_execution_venue(provider_norm, live_enabled=enabled),
         "reasons": reasons,
+        "advisories": advisories,
         "paper_only": paper_only,
+        "health_score": _to_float(connector_degradation.get("health_score"), 0.0),
+        "health_action": health_action,
+        "size_multiplier": size_multiplier,
+        "requested_notional_usd": round(requested_notional_usd, 8),
+        "effective_notional_usd": effective_notional_usd,
         "policy": _sanitize_live_execution_policy(provider_policy),
+        "connector_degradation": connector_degradation,
         "linked_account": _connector_account_public_view(linked_account),
         "secret_payload": secret_payload if enabled else None,
     }
@@ -5607,7 +7093,7 @@ def _intent_live_execution_context(intent_payload: dict[str, Any]) -> dict[str, 
     explainability = intent_payload.get("explainability") if isinstance(intent_payload.get("explainability"), dict) else {}
     live = explainability.get("live_execution") if isinstance(explainability.get("live_execution"), dict) else {}
     provider = _normalize_connector_provider(live.get("provider") or intent_payload.get("venue") or "")
-    account_id = str(live.get("account_id") or explainability.get("account_id") or "").strip()
+    account_id = _normalize_account_id(live.get("account_id") or explainability.get("account_id") or "")
     requested = _bool_from_any(live.get("enabled"), False) or _bool_from_any(live.get("requested"), False)
     return {
         "requested": requested and bool(provider) and bool(account_id),
@@ -5705,7 +7191,7 @@ def _save_ui_preferences(user_id: int, preferences: dict) -> tuple[dict, str | N
 def _normalize_self_learning_v4_scope(payload: dict | None) -> tuple[str, str, str] | None:
     if not isinstance(payload, dict):
         return None
-    account_id = str(payload.get("accountId") or payload.get("account_id") or "").strip()
+    account_id = _normalize_account_id(payload.get("accountId") or payload.get("account_id"))
     symbol = str(payload.get("symbol") or "").strip().upper()
     timeframe = str(payload.get("timeframe") or "").strip().lower()
     if not account_id or not symbol or not timeframe:
@@ -5883,6 +7369,364 @@ def _list_self_learning_v4_scopes(user_id: int, account_id: str = "", symbol: st
             }
         )
     return items
+
+def _normalize_self_learning_v5_scope(payload: dict | None) -> tuple[str, str, str] | None:
+    if not isinstance(payload, dict):
+        return None
+    account_id = _normalize_account_id(payload.get("accountId") or payload.get("account_id"))
+    symbol = str(payload.get("symbol") or "").strip().upper()
+    timeframe = str(payload.get("timeframe") or "").strip().lower()
+    if not account_id or not symbol or not timeframe:
+        return None
+    return account_id, symbol, timeframe
+
+def _normalize_self_learning_v5_state(payload: dict | None) -> dict | None:
+    scope = _normalize_self_learning_v5_scope(payload)
+    if not scope:
+        return None
+    account_id, symbol, timeframe = scope
+    raw = payload if isinstance(payload, dict) else {}
+    snapshot = raw.get("snapshot") if isinstance(raw.get("snapshot"), dict) else {}
+    cycles_raw = raw.get("cycles") if isinstance(raw.get("cycles"), list) else []
+    cycles: list[dict] = []
+    seen_ids: set[str] = set()
+    for item in cycles_raw:
+        if not isinstance(item, dict):
+            continue
+        cycle_id = str(item.get("id") or "").strip()
+        if not cycle_id or cycle_id in seen_ids:
+            continue
+        seen_ids.add(cycle_id)
+        cycles.append(
+            {
+                "id": cycle_id,
+                "timestampIso": str(item.get("timestampIso") or _now_utc().isoformat()),
+                "summary": str(item.get("summary") or ""),
+                "bestStrategyId": item.get("bestStrategyId"),
+                "acceptedVariants": int(_to_float(item.get("acceptedVariants"), 0.0)),
+                "liveBlocked": bool(item.get("liveBlocked", True)),
+            }
+        )
+        if len(cycles) >= 40:
+            break
+
+    updated_at = _now_utc().isoformat()
+    return {
+        "version": max(1, int(raw.get("version", 1))) if str(raw.get("version", "")).strip() else 1,
+        "accountId": account_id,
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "enabled": bool(raw.get("enabled", True)),
+        "strictValidation": bool(raw.get("strictValidation", True)),
+        "allowLiveDeployment": bool(raw.get("allowLiveDeployment", False)),
+        "modelUpdatedAt": raw.get("modelUpdatedAt") if isinstance(raw.get("modelUpdatedAt"), str) else None,
+        "snapshot": snapshot if isinstance(snapshot, dict) else {},
+        "cycles": cycles,
+        "updatedAt": updated_at,
+    }
+
+def _get_self_learning_v5_state(user_id: int, account_id: str, symbol: str, timeframe: str) -> tuple[dict | None, str | None]:
+    row = fetch_one(
+        """
+        SELECT state, updated_at
+        FROM self_learning_v5_states
+        WHERE user_id = %s AND account_id = %s AND symbol = %s AND timeframe = %s
+        """,
+        (user_id, account_id, symbol.upper(), timeframe.lower()),
+    )
+    if not row:
+        return None, None
+    state = row.get("state") if isinstance(row.get("state"), dict) else {}
+    normalized = _normalize_self_learning_v5_state(
+        {
+            **state,
+            "accountId": account_id,
+            "symbol": symbol.upper(),
+            "timeframe": timeframe.lower(),
+        }
+    )
+    updated_at = row.get("updated_at")
+    return normalized, (updated_at.isoformat() if updated_at else None)
+
+def _save_self_learning_v5_state(user_id: int, payload: dict) -> tuple[dict, str]:
+    normalized = _normalize_self_learning_v5_state(payload)
+    if not normalized:
+        raise HTTPException(status_code=400, detail="invalid self-learning-v5 payload")
+    execute(
+        """
+        INSERT INTO self_learning_v5_states (user_id, account_id, symbol, timeframe, state)
+        VALUES (%s, %s, %s, %s, %s::jsonb)
+        ON CONFLICT (user_id, account_id, symbol, timeframe)
+        DO UPDATE SET state = EXCLUDED.state, updated_at = NOW()
+        """,
+        (
+            user_id,
+            normalized["accountId"],
+            normalized["symbol"],
+            normalized["timeframe"],
+            json_dumps(normalized),
+        ),
+    )
+    row = fetch_one(
+        """
+        SELECT updated_at
+        FROM self_learning_v5_states
+        WHERE user_id = %s AND account_id = %s AND symbol = %s AND timeframe = %s
+        """,
+        (
+            user_id,
+            normalized["accountId"],
+            normalized["symbol"],
+            normalized["timeframe"],
+        ),
+    )
+    updated_at = row.get("updated_at").isoformat() if row and row.get("updated_at") else _now_utc().isoformat()
+    normalized["updatedAt"] = updated_at
+    return normalized, updated_at
+
+def _list_self_learning_v5_scopes(user_id: int, account_id: str = "", symbol: str = "", timeframe: str = "", limit: int = 120) -> list[dict]:
+    where_clauses = ["user_id = %s"]
+    params: list[object] = [user_id]
+    if account_id:
+        where_clauses.append("account_id = %s")
+        params.append(account_id)
+    if symbol:
+        where_clauses.append("symbol = %s")
+        params.append(symbol.upper())
+    if timeframe:
+        where_clauses.append("timeframe = %s")
+        params.append(timeframe.lower())
+    params.append(max(1, min(500, int(limit))))
+    rows = fetch_all(
+        f"""
+        SELECT account_id, symbol, timeframe, state, updated_at
+        FROM self_learning_v5_states
+        WHERE {' AND '.join(where_clauses)}
+        ORDER BY updated_at DESC
+        LIMIT %s
+        """,
+        tuple(params),
+    )
+    items: list[dict] = []
+    for row in rows:
+        state = row.get("state") if isinstance(row.get("state"), dict) else {}
+        snapshot = state.get("snapshot") if isinstance(state.get("snapshot"), dict) else {}
+        registry = snapshot.get("registry") if isinstance(snapshot.get("registry"), dict) else {}
+        validation = snapshot.get("validation") if isinstance(snapshot.get("validation"), dict) else {}
+        items.append(
+            {
+                "accountId": row.get("account_id"),
+                "symbol": row.get("symbol"),
+                "timeframe": row.get("timeframe"),
+                "updatedAt": row.get("updated_at").isoformat() if row.get("updated_at") else None,
+                "cycleCount": len(state.get("cycles") or []) if isinstance(state.get("cycles"), list) else 0,
+                "registryCount": len(registry.get("entries") or []) if isinstance(registry.get("entries"), list) else 0,
+                "enabled": bool(state.get("enabled", True)),
+                "strictValidation": bool(state.get("strictValidation", True)),
+                "liveBlocked": bool(validation.get("liveBlocked", True)),
+            }
+        )
+    return items
+
+
+SELF_LEARNING_V5_PROMOTION_REQUIRED_SHADOW_CYCLES = 3
+SELF_LEARNING_V5_PROMOTION_REQUIRED_OBSERVATION_HOURS = 6.0
+SELF_LEARNING_V5_MANUAL_PROMOTION_ALLOWED_BLOCKERS = {
+    "live_handoff_disabled_by_policy",
+    "shadow_drawdown_requires_more_observation",
+    "shadow_overfit_gap_requires_more_observation",
+}
+
+
+def _default_self_learning_v5_observation(strategy_id: str | None = None) -> dict:
+    return {
+        "candidateStrategyId": strategy_id,
+        "requiredShadowCycles": SELF_LEARNING_V5_PROMOTION_REQUIRED_SHADOW_CYCLES,
+        "requiredObservationHours": SELF_LEARNING_V5_PROMOTION_REQUIRED_OBSERVATION_HOURS,
+        "observedShadowCycles": 0,
+        "observedObservationHours": 0.0,
+        "eligibleForPromotion": False,
+        "firstObservedAt": None,
+        "lastObservedAt": None,
+        "reasons": ["shadow_strategy_not_found"] if strategy_id else ["no_active_shadow_strategy"],
+    }
+
+
+def _compute_self_learning_v5_promotion_observation(state: dict | None, strategy_id: str | None = None) -> dict:
+    if not isinstance(state, dict):
+        return _default_self_learning_v5_observation(strategy_id)
+    snapshot = state.get("snapshot") if isinstance(state.get("snapshot"), dict) else {}
+    registry = snapshot.get("registry") if isinstance(snapshot.get("registry"), dict) else {}
+    entries = registry.get("entries") if isinstance(registry.get("entries"), list) else []
+    cycles = state.get("cycles") if isinstance(state.get("cycles"), list) else []
+    shadow_id = str(strategy_id or registry.get("activeShadowStrategyId") or "").strip() or None
+    observation = _default_self_learning_v5_observation(shadow_id)
+    if not shadow_id:
+        return observation
+
+    entry = next((item for item in entries if isinstance(item, dict) and str(item.get("id") or "").strip() == shadow_id), None)
+    matching_cycles = [
+        item for item in cycles
+        if isinstance(item, dict) and str(item.get("bestStrategyId") or "").strip() == shadow_id
+    ]
+    cycle_times = sorted(
+        [
+            parsed for parsed in (
+                _parse_iso_utc(str(item.get("timestampIso") or "")) for item in matching_cycles
+            )
+            if parsed is not None
+        ]
+    )
+    first_observed_at = cycle_times[0].isoformat() if cycle_times else None
+    last_observed_at = cycle_times[-1].isoformat() if cycle_times else None
+    observed_hours = 0.0
+    if len(cycle_times) >= 2:
+        observed_hours = max(0.0, (cycle_times[-1] - cycle_times[0]).total_seconds() / 3600.0)
+
+    reasons: list[str] = []
+    if not isinstance(entry, dict):
+        reasons.append("shadow_strategy_not_found")
+    else:
+        validation = entry.get("validation") if isinstance(entry.get("validation"), dict) else {}
+        live_blocked_reasons = validation.get("liveBlockedReasons") if isinstance(validation.get("liveBlockedReasons"), list) else []
+        if not bool(validation.get("accepted", False)):
+            reasons.append("strategy_not_accepted")
+        if str(registry.get("activeShadowStrategyId") or "").strip() != shadow_id:
+            reasons.append("strategy_not_active_shadow")
+        status = str(entry.get("status") or "registry").strip()
+        if status not in {"shadow", "live-blocked"}:
+            reasons.append(f"strategy_status_{status}")
+        for reason in live_blocked_reasons:
+            normalized = str(reason or "").strip()
+            if normalized and normalized not in SELF_LEARNING_V5_MANUAL_PROMOTION_ALLOWED_BLOCKERS:
+                reasons.append(normalized)
+
+    if len(matching_cycles) < SELF_LEARNING_V5_PROMOTION_REQUIRED_SHADOW_CYCLES:
+        reasons.append(f"shadow_cycle_count_below_{SELF_LEARNING_V5_PROMOTION_REQUIRED_SHADOW_CYCLES}")
+    if observed_hours < SELF_LEARNING_V5_PROMOTION_REQUIRED_OBSERVATION_HOURS:
+        reasons.append(f"shadow_observation_hours_below_{int(SELF_LEARNING_V5_PROMOTION_REQUIRED_OBSERVATION_HOURS)}")
+
+    return {
+        "candidateStrategyId": shadow_id,
+        "requiredShadowCycles": SELF_LEARNING_V5_PROMOTION_REQUIRED_SHADOW_CYCLES,
+        "requiredObservationHours": SELF_LEARNING_V5_PROMOTION_REQUIRED_OBSERVATION_HOURS,
+        "observedShadowCycles": len(matching_cycles),
+        "observedObservationHours": round(observed_hours, 2),
+        "eligibleForPromotion": len(reasons) == 0,
+        "firstObservedAt": first_observed_at,
+        "lastObservedAt": last_observed_at,
+        "reasons": reasons,
+    }
+
+
+def _promote_self_learning_v5_state(user_id: int, payload: dict, promoted_by: str) -> tuple[dict, str, dict, dict]:
+    scope = _normalize_self_learning_v5_scope(payload)
+    if not scope:
+        raise HTTPException(status_code=400, detail="invalid self-learning-v5 scope")
+    account_id, symbol, timeframe = scope
+    strategy_id = str(payload.get("strategyId") or payload.get("strategy_id") or "").strip()
+    rationale = str(payload.get("rationale") or "manual_shadow_to_live").strip() or "manual_shadow_to_live"
+    if not strategy_id:
+        raise HTTPException(status_code=400, detail="strategyId is required")
+
+    state, _updated_at = _get_self_learning_v5_state(user_id, account_id, symbol, timeframe)
+    if not isinstance(state, dict):
+        raise HTTPException(status_code=404, detail="self-learning-v5 state not found")
+
+    observation = _compute_self_learning_v5_promotion_observation(state, strategy_id)
+    if not bool(observation.get("eligibleForPromotion")):
+        raise HTTPException(status_code=409, detail={"promotion_blocked": observation.get("reasons", []), "observation": observation})
+
+    snapshot = state.get("snapshot") if isinstance(state.get("snapshot"), dict) else {}
+    validation = snapshot.get("validation") if isinstance(snapshot.get("validation"), dict) else {}
+    registry = snapshot.get("registry") if isinstance(snapshot.get("registry"), dict) else {}
+    entries = registry.get("entries") if isinstance(registry.get("entries"), list) else []
+    promotion_audit_trail = registry.get("promotionAuditTrail") if isinstance(registry.get("promotionAuditTrail"), list) else []
+    target_entry = next((item for item in entries if isinstance(item, dict) and str(item.get("id") or "").strip() == strategy_id), None)
+    if not isinstance(target_entry, dict):
+        raise HTTPException(status_code=404, detail="self-learning-v5 strategy not found")
+
+    from_status = str(target_entry.get("status") or "shadow").strip() or "shadow"
+    promoted_at = _now_utc().isoformat()
+    updated_entries: list[dict] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        cloned = dict(entry)
+        validation_block = cloned.get("validation") if isinstance(cloned.get("validation"), dict) else {}
+        if str(cloned.get("id") or "").strip() == strategy_id:
+            cloned["status"] = "live"
+            cloned["validation"] = {
+                **validation_block,
+                "liveEligible": True,
+                "liveBlockedReasons": [],
+            }
+        elif str(cloned.get("status") or "").strip() == "live":
+            cloned["status"] = "registry"
+        elif str(cloned.get("status") or "").strip() == "live-blocked":
+            cloned["status"] = "shadow"
+        updated_entries.append(cloned)
+
+    audit_payload = {
+        "strategyId": strategy_id,
+        "promotedAt": promoted_at,
+        "promotedBy": promoted_by,
+        "rationale": rationale,
+        "fromStatus": from_status,
+        "toStatus": "live",
+        "observation": {
+            "requiredShadowCycles": observation.get("requiredShadowCycles"),
+            "requiredObservationHours": observation.get("requiredObservationHours"),
+            "observedShadowCycles": observation.get("observedShadowCycles"),
+            "observedObservationHours": observation.get("observedObservationHours"),
+        },
+    }
+    next_state = {
+        **state,
+        "modelUpdatedAt": promoted_at,
+        "snapshot": {
+            **snapshot,
+            "validation": {
+                **validation,
+                "liveBlocked": False,
+                "liveBlockReasons": [],
+            },
+            "registry": {
+                **registry,
+                "activeShadowStrategyId": None,
+                "activeLiveStrategyId": strategy_id,
+                "observation": {
+                    **observation,
+                    "eligibleForPromotion": True,
+                    "reasons": [],
+                },
+                "promotionAuditTrail": [audit_payload, *promotion_audit_trail][:24],
+                "entries": updated_entries,
+            },
+        },
+        "updatedAt": promoted_at,
+    }
+    saved_state, saved_updated_at = _save_self_learning_v5_state(user_id, next_state)
+    append_audit(
+        "self_learning_v5_promoted_live",
+        {
+            "user_id": user_id,
+            "account_id": account_id,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "strategy_id": strategy_id,
+            "from_status": from_status,
+            "to_status": "live",
+            "observation": observation,
+            "rationale": rationale,
+            "approved_by": promoted_by,
+        },
+    )
+    return saved_state, saved_updated_at, {
+        **observation,
+        "eligibleForPromotion": True,
+        "reasons": [],
+    }, audit_payload
 
 
 def _activate_kill_switch(source: str, reason: str, payload: dict) -> dict:
@@ -6962,16 +8806,18 @@ def _assert_client_visible(auth: AuthContext, client_id: str) -> dict:
 
 
 def _assert_account_visible(auth: AuthContext, account_id: str) -> dict:
+    normalized_account_id = _normalize_account_id(account_id)
     account = fetch_one(
         """
         SELECT
-            account_id, client_id, account_type, venue, connector_type, mode, base_currency,
-            status, external_ref, display_name, metadata, created_at, updated_at,
+            LOWER(BTRIM(account_id)) AS account_id,
+            client_id, account_type, venue, connector_type, mode, base_currency,
+            status, LOWER(BTRIM(external_ref)) AS external_ref, display_name, metadata, created_at, updated_at,
             connector_broker, connector_server, connector_login, connector_status, connector_metadata
         FROM v_accounts_canonical
-        WHERE account_id = %s
+        WHERE LOWER(BTRIM(account_id)) = %s
         """,
-        (account_id,),
+        (normalized_account_id,),
     )
     if not account:
         raise HTTPException(status_code=404, detail="Account not found")
@@ -7436,27 +9282,29 @@ def _bootstrap_phase1_registry() -> None:
 
 
 def _latest_account_balances(account_id: str) -> list[dict]:
+    normalized_account_id = _normalize_account_id(account_id)
     rows = fetch_all(
         """
-        SELECT account_id, asset_symbol, available_qty, locked_qty, equity_usd, mark_price_usd, as_of, source, payload
+        SELECT LOWER(BTRIM(account_id)) AS account_id, asset_symbol, available_qty, locked_qty, equity_usd, mark_price_usd, as_of, source, payload
         FROM (
             SELECT DISTINCT ON (account_id, asset_symbol)
                 account_id, asset_symbol, available_qty, locked_qty, equity_usd, mark_price_usd, as_of, source, payload
             FROM account_balances
-            WHERE account_id = %s
+            WHERE LOWER(BTRIM(account_id)) = %s
             ORDER BY account_id, asset_symbol, as_of DESC, id DESC
         ) latest
         ORDER BY asset_symbol ASC
         """,
-        (account_id,),
+        (normalized_account_id,),
     )
     return _normalize_db_rows(rows)
 
 
 def _latest_account_positions(account_id: str) -> list[dict]:
+    normalized_account_id = _normalize_account_id(account_id)
     rows = fetch_all(
         """
-        SELECT position_id, account_id, portfolio_id, strategy_id, symbol, instrument, side, quantity,
+        SELECT position_id, LOWER(BTRIM(account_id)) AS account_id, portfolio_id, strategy_id, symbol, instrument, side, quantity,
                notional_usd, avg_entry_price, mark_price, pnl_unrealized_usd, pnl_realized_usd,
                as_of, source, payload
         FROM (
@@ -7465,12 +9313,12 @@ def _latest_account_positions(account_id: str) -> list[dict]:
                 notional_usd, avg_entry_price, mark_price, pnl_unrealized_usd, pnl_realized_usd,
                 as_of, source, payload
             FROM consolidated_positions
-            WHERE account_id = %s
+            WHERE LOWER(BTRIM(account_id)) = %s
             ORDER BY position_id, as_of DESC
         ) latest
         ORDER BY as_of DESC, symbol ASC
         """,
-        (account_id,),
+        (normalized_account_id,),
     )
     return _normalize_db_rows(rows)
 
@@ -8031,6 +9879,168 @@ def _performance_attribution(scope_type: str, scope_id: str, start: datetime, en
         }
         for row in rows
     ]
+
+
+def _execution_pnl_trade_from_row(row: dict[str, Any]) -> dict[str, Any]:
+    payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+    router_execution = payload.get("router_execution") if isinstance(payload.get("router_execution"), dict) else {}
+    route = router_execution.get("route") if isinstance(router_execution.get("route"), dict) else {}
+    execution_context = route.get("execution_context") if isinstance(route.get("execution_context"), dict) else {}
+    if not execution_context and isinstance(router_execution.get("execution_context"), dict):
+        execution_context = router_execution.get("execution_context")
+    policy = execution_context.get("policy") if isinstance(execution_context.get("policy"), dict) else {}
+    fallback_mode = str(execution_context.get("fallback_mode") or policy.get("fallback_mode") or "normal")
+    execution_mode = str(
+        router_execution.get("execution_mode")
+        or payload.get("source")
+        or (payload.get("webhook_execution") if isinstance(payload.get("webhook_execution"), dict) else {}).get("execution_mode")
+        or row.get("source")
+        or "unknown"
+    ).strip() or "unknown"
+    venue = str(row.get("route_chosen") or row.get("provider") or "unknown").strip() or "unknown"
+    confidence = _to_float(execution_context.get("confidence"), _to_float(row.get("score_pre_trade"), 0.0))
+    no_trade_reasons = [str(reason) for reason in execution_context.get("no_trade_reasons", []) if str(reason)] if isinstance(execution_context, dict) else []
+    dominant_reasons = [str(reason) for reason in execution_context.get("dominant_reasons", []) if str(reason)] if isinstance(execution_context, dict) else []
+    return {
+        "decision_id": str(row.get("decision_id") or ""),
+        "symbol": str(row.get("symbol") or ""),
+        "regime": str(row.get("regime") or "UNKNOWN").strip().upper() or "UNKNOWN",
+        "venue": venue,
+        "execution_mode": execution_mode,
+        "status": str(row.get("status") or "unknown"),
+        "net_result_usd": round(_to_float(row.get("net_result_usd"), 0.0), 6),
+        "fees_usd": round(_to_float(row.get("fees_usd"), 0.0), 6),
+        "score_pre_trade": round(_to_float(row.get("score_pre_trade"), 0.0), 6),
+        "confidence": round(confidence, 6),
+        "latency_ms": int(round(_to_float(row.get("latency_ms"), _to_float(row.get("latency_e2e_ms"), 0.0)))),
+        "slippage_real_bps": round(_to_float(row.get("slippage_real_bps"), _to_float(row.get("realized_slippage_bps"), 0.0)), 6),
+        "expected_slippage_bps": round(_to_float(row.get("expected_slippage_bps"), 0.0), 6),
+        "fallback_mode": fallback_mode,
+        "no_trade_dominance": bool(execution_context.get("no_trade_dominance") or policy.get("no_trade_dominance")),
+        "no_trade_state": str(execution_context.get("no_trade_state") or policy.get("no_trade_state") or "eligible"),
+        "no_trade_reasons": no_trade_reasons,
+        "dominant_reasons": dominant_reasons,
+        "created_at": str(row.get("created_at") or ""),
+    }
+
+
+def _execution_pnl_group_summary(trades: list[dict[str, Any]], field_name: str) -> list[dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for trade in trades:
+        key = str(trade.get(field_name) or "unknown").strip() or "unknown"
+        grouped.setdefault(key, []).append(trade)
+    rows: list[dict[str, Any]] = []
+    for key, items in grouped.items():
+        trade_count = len(items)
+        net_pnl_usd = sum(_to_float(item.get("net_result_usd"), 0.0) for item in items)
+        rows.append(
+            {
+                field_name: key,
+                "trade_count": trade_count,
+                "net_pnl_usd": round(net_pnl_usd, 6),
+                "avg_pnl_usd": round(net_pnl_usd / trade_count, 6) if trade_count > 0 else 0.0,
+                "win_rate_pct": round(sum(1 for item in items if _to_float(item.get("net_result_usd"), 0.0) > 0) / trade_count * 100.0, 6) if trade_count > 0 else 0.0,
+                "avg_latency_ms": round(sum(max(0.0, _to_float(item.get("latency_ms"), 0.0)) for item in items) / trade_count, 6) if trade_count > 0 else 0.0,
+                "avg_slippage_bps": round(sum(abs(_to_float(item.get("slippage_real_bps"), 0.0)) for item in items) / trade_count, 6) if trade_count > 0 else 0.0,
+                "high_confidence_losses": sum(1 for item in items if _to_float(item.get("net_result_usd"), 0.0) < 0 and _to_float(item.get("confidence"), 0.0) >= 0.7),
+            }
+        )
+    return sorted(rows, key=lambda item: (-_to_float(item.get("net_pnl_usd"), 0.0), -int(item.get("trade_count") or 0), str(item.get(field_name) or "")))
+
+
+def _build_execution_pnl_analyzer_payload(
+    rows: list[dict[str, Any]],
+    *,
+    scope_type: str,
+    scope_id: str,
+    start: datetime,
+    end: datetime,
+    confidence_flag_threshold: float,
+    trade_limit: int,
+) -> dict[str, Any]:
+    trades = [_execution_pnl_trade_from_row(row) for row in rows]
+    trades.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+    net_pnl_usd = sum(_to_float(trade.get("net_result_usd"), 0.0) for trade in trades)
+    trade_count = len(trades)
+    high_confidence_losses = [
+        {
+            **trade,
+            "flag": "bad_model_high_confidence_loss",
+        }
+        for trade in trades
+        if _to_float(trade.get("net_result_usd"), 0.0) < 0 and _to_float(trade.get("confidence"), 0.0) >= confidence_flag_threshold
+    ]
+    no_trade_dominance_trades = sum(1 for trade in trades if bool(trade.get("no_trade_dominance")))
+    return {
+        "scope_type": scope_type,
+        "scope_id": scope_id,
+        "period_start": start.isoformat(),
+        "period_end": end.isoformat(),
+        "summary": {
+            "trade_count": trade_count,
+            "net_pnl_usd": round(net_pnl_usd, 6),
+            "avg_pnl_usd": round(net_pnl_usd / trade_count, 6) if trade_count > 0 else 0.0,
+            "fees_usd": round(sum(_to_float(trade.get("fees_usd"), 0.0) for trade in trades), 6),
+            "win_rate_pct": round(sum(1 for trade in trades if _to_float(trade.get("net_result_usd"), 0.0) > 0) / trade_count * 100.0, 6) if trade_count > 0 else 0.0,
+            "avg_latency_ms": round(sum(max(0.0, _to_float(trade.get("latency_ms"), 0.0)) for trade in trades) / trade_count, 6) if trade_count > 0 else 0.0,
+            "avg_slippage_bps": round(sum(abs(_to_float(trade.get("slippage_real_bps"), 0.0)) for trade in trades) / trade_count, 6) if trade_count > 0 else 0.0,
+            "high_confidence_loss_count": len(high_confidence_losses),
+            "no_trade_dominance_count": no_trade_dominance_trades,
+        },
+        "by_regime": _execution_pnl_group_summary(trades, "regime"),
+        "by_venue": _execution_pnl_group_summary(trades, "venue"),
+        "by_execution_mode": _execution_pnl_group_summary(trades, "execution_mode"),
+        "bad_model_flags": high_confidence_losses[: min(max(trade_limit, 1), 200)],
+        "trades": trades[: min(max(trade_limit, 1), 500)],
+    }
+
+
+def _execution_pnl_analyzer(
+    scope_type: str,
+    scope_id: str,
+    start: datetime,
+    end: datetime,
+    *,
+    trade_limit: int = 50,
+    confidence_flag_threshold: float = 0.7,
+) -> dict[str, Any]:
+    base_query, params = _performance_base_query(scope_type, scope_id, start, end)
+    rows = _normalize_db_rows(
+        fetch_all(
+            f"""
+            SELECT d.decision_id,
+                   d.symbol,
+                   d.provider,
+                   d.regime,
+                   d.score_pre_trade,
+                   d.slippage_real_bps,
+                   d.latency_ms,
+                   d.fees_usd,
+                   d.net_result_usd,
+                   d.status,
+                   d.created_at,
+                   et.route_chosen,
+                   et.expected_slippage_bps,
+                   et.realized_slippage_bps,
+                   et.latency_e2e_ms,
+                   et.payload
+            {base_query}
+              AND COALESCE(d.status, '') <> 'pending'
+            ORDER BY d.created_at DESC
+            LIMIT %s
+            """,
+            tuple([*params, max(1, min(trade_limit, 500))]),
+        )
+    )
+    return _build_execution_pnl_analyzer_payload(
+        rows,
+        scope_type=scope_type,
+        scope_id=scope_id,
+        start=start,
+        end=end,
+        confidence_flag_threshold=_to_float(confidence_flag_threshold, 0.7),
+        trade_limit=trade_limit,
+    )
 
 
 def _coerce_report_month(report_month: str | None) -> tuple[str, datetime, datetime]:
@@ -8740,6 +10750,34 @@ async def get_kill_switch(auth: AuthContext = Depends(viewer_auth)) -> dict:
         "status": "ok",
         "state": _kill_switch_state(),
         "thresholds": _kill_switch_thresholds(),
+        "go_live_hardening": _sanitize_go_live_hardening_policy(),
+    }
+
+
+@app.post("/v1/system/kill-switch/activate")
+async def activate_kill_switch(payload: dict | None = None, auth: AuthContext = Depends(admin_auth)) -> dict:
+    global CURRENT_SYSTEM_MODE
+    request_payload = payload if isinstance(payload, dict) else {}
+    source = str(request_payload.get("source") or "external-watchdog").strip() or "external-watchdog"
+    reason = str(request_payload.get("reason") or "manual_activation").strip() or "manual_activation"
+    details = request_payload.get("payload") if isinstance(request_payload.get("payload"), dict) else {}
+    state = _activate_kill_switch(
+        source,
+        reason,
+        {
+            **details,
+            "by": auth.username,
+        },
+    )
+    requested_mode = str(request_payload.get("system_mode") or "").strip().lower()
+    if requested_mode in {mode.value for mode in SystemMode}:
+        CURRENT_SYSTEM_MODE = SystemMode(requested_mode)
+        persist_system_mode()
+        append_audit("system_mode_changed", {"mode": CURRENT_SYSTEM_MODE, "source": source, "reason": reason})
+    return {
+        "status": "activated",
+        "state": state,
+        "system_mode": CURRENT_SYSTEM_MODE,
     }
 
 
@@ -9007,8 +11045,8 @@ async def list_accounts(
     rows = fetch_all(
         f"""
         SELECT
-            accounts.account_id, accounts.client_id, accounts.account_type, accounts.venue, accounts.connector_type,
-            accounts.mode, accounts.base_currency, accounts.status, accounts.external_ref, accounts.display_name,
+            LOWER(BTRIM(accounts.account_id)) AS account_id, accounts.client_id, accounts.account_type, accounts.venue, accounts.connector_type,
+            accounts.mode, accounts.base_currency, accounts.status, LOWER(BTRIM(accounts.external_ref)) AS external_ref, accounts.display_name,
             accounts.metadata, accounts.created_at, accounts.updated_at,
             accounts.connector_broker, accounts.connector_server, accounts.connector_login, accounts.connector_status,
             balance_summary.equity_usd AS latest_equity_usd,
@@ -9027,7 +11065,7 @@ async def list_accounts(
                 ORDER BY ab.account_id, ab.asset_symbol, ab.as_of DESC, ab.id DESC
             ) latest
             GROUP BY latest.account_id
-        ) AS balance_summary ON balance_summary.account_id = accounts.account_id
+        ) AS balance_summary ON LOWER(BTRIM(balance_summary.account_id)) = LOWER(BTRIM(accounts.account_id))
         LEFT JOIN (
             SELECT latest.account_id,
                    COUNT(*) AS open_positions,
@@ -9040,13 +11078,13 @@ async def list_accounts(
                 ORDER BY cp.position_id, cp.as_of DESC
             ) latest
             GROUP BY latest.account_id
-        ) AS position_summary ON position_summary.account_id = accounts.account_id
+        ) AS position_summary ON LOWER(BTRIM(position_summary.account_id)) = LOWER(BTRIM(accounts.account_id))
         LEFT JOIN (
             SELECT pa.account_id, MIN(pa.portfolio_id) AS portfolio_id
             FROM portfolio_accounts pa
             WHERE pa.status = 'active'
             GROUP BY pa.account_id
-        ) AS portfolio_summary ON portfolio_summary.account_id = accounts.account_id
+        ) AS portfolio_summary ON LOWER(BTRIM(portfolio_summary.account_id)) = LOWER(BTRIM(accounts.account_id))
         {where_sql}
         ORDER BY accounts.updated_at DESC, accounts.created_at DESC
         """,
@@ -9058,6 +11096,8 @@ async def list_accounts(
 @app.post("/v1/accounts")
 async def create_account(request: AccountCreateRequest, auth: AuthContext = Depends(operator_auth)) -> dict:
     _assert_client_visible(auth, request.client_id)
+    account_id = _normalize_account_id(request.account_id)
+    external_ref = _normalize_account_id(request.external_ref) or None
     inserted = execute_rowcount(
         """
         INSERT INTO accounts_registry (
@@ -9067,7 +11107,7 @@ async def create_account(request: AccountCreateRequest, auth: AuthContext = Depe
         ON CONFLICT (account_id) DO NOTHING
         """,
         (
-            request.account_id,
+            account_id,
             request.client_id,
             request.account_type,
             request.venue,
@@ -9075,7 +11115,7 @@ async def create_account(request: AccountCreateRequest, auth: AuthContext = Depe
             request.mode,
             request.base_currency,
             request.status,
-            request.external_ref,
+            external_ref,
             request.display_name,
             json_dumps(request.metadata),
         ),
@@ -9083,13 +11123,34 @@ async def create_account(request: AccountCreateRequest, auth: AuthContext = Depe
     if inserted == 0:
         raise HTTPException(status_code=409, detail="Account already exists")
     if request.client_id == _PHASE1_INTERNAL_CLIENT_ID:
-        _sync_internal_portfolio_accounts(request.account_id)
+        _sync_internal_portfolio_accounts(account_id)
     created = fetch_one(
         "SELECT account_id, client_id, account_type, venue, connector_type, mode, base_currency, status, external_ref, display_name, metadata, created_at, updated_at FROM accounts_registry WHERE account_id = %s",
-        (request.account_id,),
+        (account_id,),
     )
-    append_audit("account_created", {"account_id": request.account_id, "client_id": request.client_id, "by": auth.username})
+    append_audit("account_created", {"account_id": account_id, "client_id": request.client_id, "by": auth.username})
     return _normalize_db_row(created) or {}
+
+
+@app.delete("/v1/accounts/{account_id}")
+async def delete_account(account_id: str, auth: AuthContext = Depends(operator_auth)) -> dict:
+    account = _assert_account_visible(auth, account_id)
+    deleted = execute_rowcount(
+        "DELETE FROM accounts_registry WHERE account_id = %s",
+        (account_id,),
+    )
+    if deleted == 0:
+        raise HTTPException(status_code=404, detail="Account not found")
+    append_audit(
+        "account_deleted",
+        {
+            "account_id": account_id,
+            "client_id": str(account.get("client_id") or ""),
+            "connector_type": str(account.get("connector_type") or ""),
+            "by": auth.username,
+        },
+    )
+    return {"status": "ok", "account_id": account_id}
 
 
 @app.post("/v1/accounts/{account_id}/sync")
@@ -9184,6 +11245,54 @@ async def internal_account_verification(account_id: str, auth: AuthContext = Dep
         notes.append(
             f"Le compte porte {total_raw_cash:.2f} USD de cash brut visible pour {total_equivalent:.2f} USD de valeur plateforme equivalente. Le delta correspond a de l'inventaire non-cash ou a du collateral valorise."
         )
+    # BingX-specific diagnostic notes
+    connector_type = str(account.get("connector_type") or "").strip().lower()
+    if connector_type == "bingx":
+        balance_sources = {str(b.get("source") or "") for b in balances}
+        # Fund pocket
+        has_fund = any("bingx-fund" in src for src in balance_sources)
+        if not has_fund:
+            notes.append(
+                "Poche Fund (epargne/earn BingX) : verifiee via /openApi/fund/v1/account/balance, aucun actif trouve. "
+                "Soit le compte n'a pas de position en epargne active, soit la cle API ne dispose pas de la permission 'Account Balance' pour ce sous-compte."
+            )
+        # Pending orders: freezedMargin > 0 but no open positions
+        if not positions:
+            futures_frozen = sum(
+                _to_float(
+                    (b.get("payload") or {}).get("freezedMargin") if isinstance(b.get("payload"), dict) else None,
+                    0.0,
+                )
+                for b in balances
+                if str(b.get("source") or "").startswith("bingx-futures")
+            )
+            if futures_frozen > 0.001:
+                notes.append(
+                    f"Marge gelee futures : {futures_frozen:.4f} USDT sans position ouverte detectee. "
+                    "Cela indique probablement un ou plusieurs ordres limites en attente d'execution. "
+                    "La marge est reservee mais aucun contrat n'est ouvert (aucune 'paire' ouverte)."
+                )
+    # BingX: fetch live open orders (best-effort, not stored in DB)
+    open_orders: list[dict] = []
+    if connector_type == "bingx":
+        try:
+            _, bingx_secret = _bingx_secret_payload_for_account(account_id, require_trade=False)
+            raw_oo = await _bingx_signed_get(bingx_secret, "/openApi/swap/v2/trade/openOrders", {"recvWindow": 60000})
+            open_orders = _normalize_bingx_open_orders(
+                _bingx_extract_dict_items(raw_oo, "orders", "data", "list"),
+                _now_utc().isoformat(),
+            )
+            if open_orders:
+                notes.append(
+                    f"{len(open_orders)} ordre(s) limite(s) en attente sur USDT-M perpetuels : "
+                    + ", ".join(
+                        f"{o.get('side')} {o.get('quantity')} {o.get('symbol')} @ {o.get('price')}"
+                        for o in open_orders
+                    )
+                    + ". La marge gelee correspond a ces ordres non executes."
+                )
+        except Exception:
+            pass  # open orders are best-effort in verification
     normalized_state = {
         "status": "ok",
         "as_of": max([str(item.get("as_of") or "") for item in balances if str(item.get("as_of") or "")], default=_now_utc().isoformat()),
@@ -9199,6 +11308,7 @@ async def internal_account_verification(account_id: str, auth: AuthContext = Dep
         "connector_account": connector_view,
         "balances": balances,
         "positions": positions,
+        "open_orders": open_orders,
         "portfolio_links": portfolio_links,
         "latest_portfolio_snapshots": latest_snapshots,
         "normalized_state": normalized_state,
@@ -9364,6 +11474,28 @@ async def get_performance_attribution(
     }
 
 
+@app.get("/v1/execution/pnl-analyzer")
+async def get_execution_pnl_analyzer(
+    scope_type: str,
+    scope_id: str,
+    limit: int = 50,
+    confidence_flag_threshold: float = 0.7,
+    start: str | None = None,
+    end: str | None = None,
+    auth: AuthContext = Depends(any_read_auth),
+) -> dict[str, Any]:
+    del auth
+    start_dt, end_dt = _coerce_period_bounds(start, end)
+    return _execution_pnl_analyzer(
+        scope_type,
+        scope_id,
+        start_dt,
+        end_dt,
+        trade_limit=limit,
+        confidence_flag_threshold=confidence_flag_threshold,
+    )
+
+
 @app.get("/v1/investor-reports")
 async def list_investor_reports(
     client_id: str = "",
@@ -9511,6 +11643,72 @@ async def list_self_learning_v4_scopes(
         "total": len(items),
     }
 
+@app.get("/v1/strategies/self-learning-v5")
+async def get_self_learning_v5_state(
+    account_id: str,
+    symbol: str,
+    timeframe: str,
+    auth: AuthContext = Depends(relaxed_auth),
+) -> dict:
+    state, updated_at = _get_self_learning_v5_state(auth.user_id, account_id, symbol, timeframe)
+    return {
+        "status": "ok",
+        "state": state,
+        "updated_at": updated_at,
+    }
+
+@app.put("/v1/strategies/self-learning-v5")
+async def put_self_learning_v5_state(payload: dict, auth: AuthContext = Depends(relaxed_auth)) -> dict:
+    state, updated_at = _save_self_learning_v5_state(auth.user_id, payload)
+    append_audit(
+        "self_learning_v5_state_upserted",
+        {
+            "user_id": auth.user_id,
+            "account_id": state.get("accountId"),
+            "symbol": state.get("symbol"),
+            "timeframe": state.get("timeframe"),
+            "best_strategy_id": state.get("snapshot", {}).get("optimizer", {}).get("bestStrategyId") if isinstance(state.get("snapshot"), dict) else None,
+        },
+    )
+    return {
+        "status": "ok",
+        "state": state,
+        "updated_at": updated_at,
+    }
+
+@app.get("/v1/strategies/self-learning-v5/scopes")
+async def list_self_learning_v5_scopes(
+    account_id: str = "",
+    symbol: str = "",
+    timeframe: str = "",
+    limit: int = 120,
+    auth: AuthContext = Depends(relaxed_auth),
+) -> dict:
+    items = _list_self_learning_v5_scopes(
+        user_id=auth.user_id,
+        account_id=account_id,
+        symbol=symbol,
+        timeframe=timeframe,
+        limit=limit,
+    )
+    return {
+        "status": "ok",
+        "items": items,
+        "total": len(items),
+    }
+
+
+@app.post("/v1/strategies/self-learning-v5/promote")
+async def promote_self_learning_v5_state(payload: dict, auth: AuthContext = Depends(operator_auth)) -> dict:
+    state, updated_at, observation, audit_payload = _promote_self_learning_v5_state(auth.user_id, payload, auth.username)
+    return {
+        "status": "ok",
+        "state": state,
+        "updated_at": updated_at,
+        "observation": observation,
+        "audit": audit_payload,
+    }
+
 
 @app.post("/v1/strategies")
 async def create_strategy(request: StrategyCreateRequest, auth: AuthContext = Depends(operator_auth)) -> dict:
@@ -9611,7 +11809,37 @@ async def proxy_market_quotes(auth: AuthContext = Depends(any_read_auth)) -> lis
     del auth
     async with httpx.AsyncClient(timeout=10.0) as client:
         response = await client.get(f"{MARKET_DATA_URL}/v1/quotes")
-        return response.json()
+        return _proxy_json_response(response)
+
+
+@app.get("/v1/market/venues/telemetry")
+async def proxy_market_venue_telemetry(auth: AuthContext = Depends(any_read_auth)) -> dict:
+    del auth
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.get(f"{MARKET_DATA_URL}/v1/market/venues/telemetry")
+        return _proxy_json_response(response)
+
+
+@app.get("/v1/routes/venues/telemetry")
+async def proxy_route_venue_telemetry(
+    lookback_minutes: int = 120,
+    auth: AuthContext = Depends(any_read_auth),
+) -> dict:
+    del auth
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.get(
+            f"{EXECUTION_ROUTER_URL}/v1/routes/venues/telemetry",
+            params={"lookback_minutes": max(5, min(lookback_minutes, 1440))},
+        )
+        return _proxy_json_response(response)
+
+
+@app.get("/v1/execution/optimizer/live-state")
+async def proxy_execution_optimizer_live_state(auth: AuthContext = Depends(any_read_auth)) -> dict:
+    del auth
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.get(f"{EXECUTION_ROUTER_URL}/v1/execution-optimizer/live-state")
+        return _proxy_json_response(response)
 
 
 async def _fetch_market_quotes() -> list[dict]:
@@ -9635,7 +11863,7 @@ async def proxy_market_ohlcv(
             f"{MARKET_DATA_URL}/v1/market/ohlcv",
             params={"instrument": market_symbol, "venue": venue, "timeframe": timeframe, "limit": max(1, min(limit, 1000))},
         )
-        return response.json()
+        return _proxy_json_response(response)
 
 
 @app.post("/v1/system/market/ohlcv/backfill-cfd")
@@ -9675,7 +11903,7 @@ async def proxy_market_trades(
             f"{MARKET_DATA_URL}/v1/market/trades",
             params={"instrument": market_symbol, "venue": venue, "limit": max(1, min(limit, 500))},
         )
-        return response.json()
+        return _proxy_json_response(response)
 
 
 @app.get("/v1/market/orderbook/depth")
@@ -9691,7 +11919,7 @@ async def proxy_market_depth(
             f"{MARKET_DATA_URL}/v1/market/orderbook/depth",
             params={"instrument": market_symbol, "venue": venue},
         )
-        return response.json()
+        return _proxy_json_response(response)
 
 
 @app.get("/v1/market/microstructure")
@@ -9708,7 +11936,7 @@ async def proxy_market_microstructure(
             f"{MARKET_DATA_URL}/v1/market/microstructure",
             params={"instrument": market_symbol, "venue": venue, "lookback_minutes": max(5, min(lookback_minutes, 720))},
         )
-        return response.json()
+        return _proxy_json_response(response)
 
 
 @app.get("/v1/market/session-state")
@@ -9716,7 +11944,7 @@ async def proxy_market_session_state(instrument: str = "BTCUSDT", auth: AuthCont
     del auth
     async with httpx.AsyncClient(timeout=10.0) as client:
         response = await client.get(f"{MARKET_DATA_URL}/v1/market/session-state", params={"instrument": instrument})
-        return response.json()
+        return _proxy_json_response(response)
 
 
 @app.get("/v1/market/bus/snapshot")
@@ -9980,7 +12208,7 @@ async def proxy_broker_balance(auth: AuthContext = Depends(any_read_auth)) -> di
     if not rows:
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.get(f"{BROKER_ADAPTER_URL}/v1/balance")
-            return response.json()
+            return _proxy_json_response(response)
     return {
         "mode": "canonical",
         "provider": "account-registry",
@@ -10026,7 +12254,7 @@ async def proxy_broker_positions(auth: AuthContext = Depends(any_read_auth)) -> 
     if not rows:
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.get(f"{BROKER_ADAPTER_URL}/v1/positions")
-            return response.json()
+            return _proxy_json_response(response)
     return _normalize_db_rows(rows)
 
 
@@ -10035,7 +12263,7 @@ async def proxy_broker_orderbook(venue: str, instrument: str, auth: AuthContext 
     del auth
     async with httpx.AsyncClient(timeout=10.0) as client:
         response = await client.get(f"{BROKER_ADAPTER_URL}/v1/orderbook/{venue}/{instrument}")
-        return response.json()
+        return _proxy_json_response(response)
 
 
 @app.post("/v1/ai/route")
@@ -10400,7 +12628,7 @@ async def proxy_mt5_accounts(auth: AuthContext = Depends(viewer_auth)) -> list[d
 
 @app.post("/v1/mt5/accounts")
 async def proxy_mt5_connect_account(payload: dict, auth: AuthContext = Depends(connector_manage_auth)) -> dict:
-    account_id = str(payload.get("account_id") or "").strip()
+    account_id = _normalize_account_id(payload.get("account_id"))
     broker = str(payload.get("broker") or "metaquotes").strip()
     server = str(payload.get("server") or "").strip()
     login = str(payload.get("login") or "").strip()
@@ -10489,6 +12717,48 @@ async def proxy_mt5_filtered_order(payload: dict, auth: AuthContext = Depends(op
         if account_response.status_code >= 400:
             raise HTTPException(status_code=502, detail="MT5 bridge unavailable")
         account = account_response.json().get("account", {})
+    account_mode = str(account.get("mode") or "paper").strip().lower() or "paper"
+
+    payload_metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    payload_order_intent = payload.get("order_intent") if isinstance(payload.get("order_intent"), dict) else {}
+    payload_source = str(
+        payload_order_intent.get("source")
+        or payload_metadata.get("source")
+        or "mission-control-ui"
+    ).strip() or "mission-control-ui"
+    payload_governance = _extract_trade_governance(payload)
+    payload_memory_gate = _extract_pre_trade_memory_gate(payload)
+    hardening_snapshot = _evaluate_go_live_hardening(
+        source=payload_source,
+        provider="mt5",
+        account_id=str(account_id),
+        symbol=str(payload.get("symbol") or ""),
+        side=str(payload.get("side") or "buy"),
+        requested_notional_usd=_to_float(payload.get("estimated_notional_usd"), 0.0),
+        confidence=_to_float(
+            payload.get("confidence"),
+            _to_float(payload_metadata.get("confidence"), 1.0 if account_mode != "live" else 0.0),
+        ),
+        live_requested=account_mode == "live",
+        purpose="execute",
+        pre_trade_memory_gate=payload_memory_gate,
+        governance=payload_governance,
+    ) if account_mode == "live" else {
+        "active": False,
+        "status": "approved",
+        "reasons": [],
+        "governance": payload_governance,
+        "exposure": {},
+        "anti_loop": {},
+    }
+    if account_mode == "live" and hardening_snapshot.get("status") == "blocked":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "status": "blocked_by_go_live_hardening",
+                "hardening": hardening_snapshot,
+            },
+        )
 
     risk_eval = _evaluate_chart_risk_rules(payload)
     if risk_eval["loss_exceeded"]:
@@ -10536,7 +12806,13 @@ async def proxy_mt5_filtered_order(payload: dict, auth: AuthContext = Depends(op
         "target_rr": risk_eval["target_rr"],
         "target_miss": risk_eval["target_miss"],
         "compliant": not risk_eval["loss_exceeded"] and not risk_eval["target_miss"],
+        "go_live_hardening": hardening_snapshot,
     }
+
+    payload.setdefault("metadata", {})
+    if isinstance(payload.get("metadata"), dict):
+        payload["metadata"]["go_live_target"] = account_mode
+        payload["metadata"]["go_live_hardening"] = hardening_snapshot
 
     if account_mode != "live":
         body = await _execute_mt5_filtered_order(payload)
@@ -10571,12 +12847,14 @@ async def proxy_mt5_filtered_order(payload: dict, auth: AuthContext = Depends(op
             "symbol": payload.get("symbol", ""),
             "side": payload.get("side", "buy"),
             "risk_context": risk_context,
+            "go_live_hardening": hardening_snapshot,
         },
     )
     return {
         "status": "pending_second_approval",
         "approval_id": approval_id,
         "message": "Live order requires a second approval by another operator/admin",
+        "hardening": hardening_snapshot,
     }
 
 
@@ -11542,7 +13820,16 @@ async def mt5_live_second_approve(approval_id: str, auth: AuthContext = Depends(
     if approval["first_approved_by"] == auth.username:
         raise HTTPException(status_code=403, detail="Second approval must be from a different operator")
 
-    body = await _execute_mt5_filtered_order(approval["order_payload"])
+    order_payload = approval["order_payload"] if isinstance(approval["order_payload"], dict) else {}
+    metadata = order_payload.setdefault("metadata", {}) if isinstance(order_payload, dict) else {}
+    if isinstance(metadata, dict):
+        metadata["governance"] = {
+            "approved": True,
+            "approver": auth.username,
+            "approval_id": approval_id,
+            "approval_mode": "mt5_double_approval",
+        }
+    body = await _execute_mt5_filtered_order(order_payload)
     execute(
         """
         UPDATE mt5_live_approvals
@@ -11719,6 +14006,32 @@ async def _execute_mt5_filtered_order(payload: dict) -> dict:
     _assert_kill_switch_allows_execution()
     ts_decision = _now_utc()
     ts_intent = _now_utc()
+    payload_metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    live_target = str(payload_metadata.get("go_live_target") or "").strip().lower()
+    hardening_snapshot = None
+    if live_target == "live":
+        hardening_snapshot = _evaluate_go_live_hardening(
+            source=str((payload.get("order_intent") or {}).get("source") if isinstance(payload.get("order_intent"), dict) else payload_metadata.get("source") or "mission-control-ui").strip() or "mission-control-ui",
+            provider="mt5",
+            account_id=_normalize_account_id(payload.get("account_id")),
+            symbol=str(payload.get("symbol") or ""),
+            side=str(payload.get("side") or "buy"),
+            requested_notional_usd=_to_float(payload.get("estimated_notional_usd"), 0.0),
+            confidence=_to_float(payload.get("confidence"), _to_float(payload_metadata.get("confidence"), 0.0)),
+            live_requested=True,
+            purpose="execute",
+            pre_trade_memory_gate=_extract_pre_trade_memory_gate(payload),
+            governance=_extract_trade_governance(payload),
+        )
+        if hardening_snapshot.get("status") != "approved":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "status": "blocked_by_go_live_hardening",
+                    "hardening": hardening_snapshot,
+                },
+            )
+
     risk_body = await _risk_check_mt5_order(payload)
     if risk_body.get("decision") != "accept":
         append_audit("mt5_order_rejected", {"risk": risk_body})
@@ -11784,7 +14097,10 @@ async def _execute_mt5_filtered_order(payload: dict) -> dict:
                 routed_execution_result = router_response.json()
             else:
                 _record_api_error("execution-router", "routed_order_failed")
-                raise HTTPException(status_code=502, detail="Execution router unavailable")
+                raise HTTPException(
+                    status_code=502 if router_response.status_code >= 500 else router_response.status_code,
+                    detail=_upstream_json_payload(router_response),
+                )
 
     selected_route = ((routed_execution_result.get("route") or {}).get("chosen") or route_best)
     selected_backup = ((routed_execution_result.get("route") or {}).get("backup") or route_backup)
@@ -11795,6 +14111,10 @@ async def _execute_mt5_filtered_order(payload: dict) -> dict:
     bridge_payload["chosen_route"] = selected_route
     bridge_payload["expected_slippage_bps"] = routed_execution_result.get("expected_slippage_bps")
     bridge_payload["predictor"] = predictor_gate
+    if hardening_snapshot is not None:
+        bridge_payload.setdefault("metadata", {})
+        if isinstance(bridge_payload.get("metadata"), dict):
+            bridge_payload["metadata"]["go_live_hardening"] = hardening_snapshot
     async with httpx.AsyncClient(timeout=12.0) as client:
         response = await client.post(f"{MT5_BRIDGE_URL}/v1/orders/filter", json=bridge_payload)
         if response.status_code >= 400:
@@ -11882,7 +14202,7 @@ async def _execute_mt5_filtered_order(payload: dict) -> dict:
                 ts_broker_accept,
                 ts_fill_partial,
                 ts_fill_final,
-                json_dumps({"routing": routing, "bridge_result": result, "risk": risk_body, "router_execution": routed_execution_result, "predictor": predictor_gate, "rust_reality_gap": routed_execution_result.get("reality_gap_sample")}),
+                json_dumps({"routing": routing, "bridge_result": result, "risk": risk_body, "router_execution": routed_execution_result, "predictor": predictor_gate, "rust_reality_gap": routed_execution_result.get("reality_gap_sample"), "go_live_hardening": hardening_snapshot}),
             ),
         )
 
@@ -11890,11 +14210,16 @@ async def _execute_mt5_filtered_order(payload: dict) -> dict:
             "execution_telemetry_recorded",
             {
                 "telemetry_id": telemetry_id,
-                "decision_id": str(result.get("broker_ticket", "")),
-                "route": selected_route.get("venue", "mt5-default"),
-                "expected_slippage_bps": expected_slippage_bps,
-                "realized_slippage_bps": realized_slippage_bps,
-                "latency_e2e_ms": latency_e2e_ms,
+                **_execution_audit_summary(
+                    decision_id=str(result.get("broker_ticket", "")),
+                    route=str(selected_route.get("venue", "mt5-default")),
+                    reason=str(routing.get("reason", "")),
+                    expected_slippage_bps=expected_slippage_bps,
+                    realized_slippage_bps=realized_slippage_bps,
+                    latency_e2e_ms=latency_e2e_ms,
+                    requested_payload=payload,
+                    execution_result=result,
+                ),
             },
         )
         reality_gap_result = await _auto_ingest_reality_gap_for_decision(
@@ -11922,6 +14247,8 @@ async def _execute_mt5_filtered_order(payload: dict) -> dict:
             }
         result["predictor"] = predictor_gate
         result["reality_gap"] = reality_gap_result
+        if hardening_snapshot is not None:
+            result["go_live_hardening"] = hardening_snapshot
         synced_state = await _sync_mt5_account_state(str(payload.get("account_id", "")).strip())
         if synced_state:
             result["canonical_account_state"] = synced_state
@@ -12493,6 +14820,199 @@ async def live_readiness_overview(auth: AuthContext = Depends(viewer_auth)) -> d
     }
 
 
+async def _fetch_execution_ai_v6_state_snapshot() -> dict[str, Any]:
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(f"{EXECUTION_ROUTER_URL}/v1/execution-ai/v6/state")
+        if response.status_code >= 400:
+            return {"status": "degraded", "detail": response.text[:200]}
+        payload = response.json()
+        return payload if isinstance(payload, dict) else {"status": "degraded"}
+    except Exception as exc:
+        return {"status": "degraded", "detail": str(exc)[:200]}
+
+
+def _format_signed_usd(value: float) -> str:
+    return f"+{value:.2f} USD" if value > 0 else f"{value:.2f} USD"
+
+
+def _build_ops_copilot_desk_brief(
+    *,
+    pnl_payload: dict[str, Any],
+    readiness_payload: dict[str, Any],
+    incidents_payload: dict[str, Any],
+    strategies_payload: list[dict[str, Any]],
+    execution_ai_v6_payload: dict[str, Any],
+) -> dict[str, Any]:
+    pnl_summary = pnl_payload.get("summary") if isinstance(pnl_payload.get("summary"), dict) else {}
+    readiness_drift = readiness_payload.get("drift") if isinstance(readiness_payload.get("drift"), dict) else {}
+    incidents = incidents_payload.get("items") if isinstance(incidents_payload.get("items"), list) else []
+    v6_snapshot = execution_ai_v6_payload.get("snapshot") if isinstance(execution_ai_v6_payload.get("snapshot"), dict) else {}
+    v6_guardrails = v6_snapshot.get("guardrails") if isinstance(v6_snapshot.get("guardrails"), dict) else {}
+
+    trade_count = int(_to_float(pnl_summary.get("trade_count"), 0.0))
+    net_pnl_usd = _to_float(pnl_summary.get("net_pnl_usd"), 0.0)
+    avg_pnl_usd = _to_float(pnl_summary.get("avg_pnl_usd"), 0.0)
+    win_rate_pct = _to_float(pnl_summary.get("win_rate_pct"), 0.0)
+    avg_latency_ms = _to_float(pnl_summary.get("avg_latency_ms"), 0.0)
+    avg_slippage_bps = _to_float(pnl_summary.get("avg_slippage_bps"), 0.0)
+    high_confidence_loss_count = int(_to_float(pnl_summary.get("high_confidence_loss_count"), 0.0))
+    no_trade_dominance_count = int(_to_float(pnl_summary.get("no_trade_dominance_count"), 0.0))
+    no_trade_ratio_pct = (no_trade_dominance_count / trade_count * 100.0) if trade_count > 0 else 0.0
+    suspended_strategies = readiness_drift.get("suspended_strategies") if isinstance(readiness_drift.get("suspended_strategies"), list) else []
+    learning_frozen = bool(v6_guardrails.get("learning_frozen"))
+    reward_ema = _to_float(v6_snapshot.get("reward_ema"), 0.0)
+
+    truth_label = "OK"
+    truth_reason = "guarded micro-live remains acceptable"
+    if trade_count >= 5 and (high_confidence_loss_count >= 2 or (net_pnl_usd < 0 and win_rate_pct < 40.0)):
+        truth_label = "BLOCK"
+        truth_reason = "PnL truth is deteriorating and the filter needs review"
+    elif trade_count < 3 or learning_frozen or avg_latency_ms > 120.0 or avg_slippage_bps > 3.0 or no_trade_ratio_pct < 10.0:
+        truth_label = "REDUCE"
+        truth_reason = "keep size minimal and let no-trade dominate harder"
+
+    top_strategy = None
+    if strategies_payload:
+        ordered = sorted(
+            strategies_payload,
+            key=lambda item: (int(item.get("current_level") or 0), str(item.get("updated_at") or "")),
+            reverse=True,
+        )
+        top_strategy = ordered[0]
+
+    parts = [
+        f"Desk truth {truth_label}. {truth_reason}.",
+        f"PnL net {_format_signed_usd(net_pnl_usd)} sur {trade_count} trade(s), expectancy {_format_signed_usd(avg_pnl_usd)}, win rate {win_rate_pct:.1f}%.",
+        f"Execution friction: {avg_latency_ms:.0f}ms de latence moyenne, {avg_slippage_bps:.2f}bps de slippage, {high_confidence_loss_count} perte(s) haute confiance.",
+        f"No-trade dominance: {no_trade_dominance_count}/{trade_count or 1} trade(s), soit {no_trade_ratio_pct:.0f}% du flux observe.",
+    ]
+    if learning_frozen:
+        parts.append(f"V6 reste figee pour le moment, reward EMA {reward_ema:.3f}.")
+    else:
+        parts.append(f"V6 reste active, reward EMA {reward_ema:.3f}.")
+    if suspended_strategies:
+        parts.append(f"Readiness: {len(suspended_strategies)} strategie(s) suspendue(s) pour drift.")
+    if incidents:
+        parts.append(f"Incidents ouverts: {len(incidents)}.")
+    if top_strategy:
+        parts.append(
+            f"Strategie la plus avancee: {top_strategy.get('strategy_id')} niveau {int(top_strategy.get('current_level') or 0)} ({top_strategy.get('status')})."
+        )
+    parts.append("Calibration semi-auto: reste verrouillee tant que plusieurs jours de micro-live propre et au moins 50 trades n'ont pas ete accumules.")
+
+    return {
+        "status": "ok",
+        "reply": " ".join(parts),
+        "data": {
+            "desk_truth": {
+                "label": truth_label,
+                "reason": truth_reason,
+            },
+            "pnl": pnl_payload,
+            "readiness": readiness_payload,
+            "incidents": incidents_payload,
+            "execution_ai_v6": execution_ai_v6_payload,
+            "strategy_progress": strategies_payload[:5],
+        },
+        "actions": ["open_live_ops", "open_terminal_truth", "open_live_readiness"],
+    }
+
+
+def _build_ops_copilot_command_brief(
+    *,
+    pnl_payload: dict[str, Any],
+    readiness_payload: dict[str, Any],
+    incidents_payload: dict[str, Any],
+    strategies_payload: list[dict[str, Any]],
+    execution_ai_v6_payload: dict[str, Any],
+) -> dict[str, Any]:
+    pnl_summary = pnl_payload.get("summary") if isinstance(pnl_payload.get("summary"), dict) else {}
+    readiness_drift = readiness_payload.get("drift") if isinstance(readiness_payload.get("drift"), dict) else {}
+    incidents = incidents_payload.get("items") if isinstance(incidents_payload.get("items"), list) else []
+    trades = pnl_payload.get("trades") if isinstance(pnl_payload.get("trades"), list) else []
+    v6_snapshot = execution_ai_v6_payload.get("snapshot") if isinstance(execution_ai_v6_payload.get("snapshot"), dict) else {}
+    v6_guardrails = v6_snapshot.get("guardrails") if isinstance(v6_snapshot.get("guardrails"), dict) else {}
+
+    trade_count = int(_to_float(pnl_summary.get("trade_count"), 0.0))
+    net_pnl_usd = _to_float(pnl_summary.get("net_pnl_usd"), 0.0)
+    avg_latency_ms = _to_float(pnl_summary.get("avg_latency_ms"), 0.0)
+    avg_slippage_bps = _to_float(pnl_summary.get("avg_slippage_bps"), 0.0)
+    win_rate_pct = _to_float(pnl_summary.get("win_rate_pct"), 0.0)
+    high_confidence_loss_count = int(_to_float(pnl_summary.get("high_confidence_loss_count"), 0.0))
+    no_trade_dominance_count = int(_to_float(pnl_summary.get("no_trade_dominance_count"), 0.0))
+    no_trade_ratio_pct = (no_trade_dominance_count / trade_count * 100.0) if trade_count > 0 else 0.0
+    learning_frozen = bool(v6_guardrails.get("learning_frozen"))
+    persistence_available = bool(v6_guardrails.get("persistence_available", True))
+    suspended_strategies = readiness_drift.get("suspended_strategies") if isinstance(readiness_drift.get("suspended_strategies"), list) else []
+    negative_streak = 0
+    for trade in trades:
+        if _to_float((trade or {}).get("net_result_usd"), 0.0) < 0.0:
+            negative_streak += 1
+            continue
+        break
+
+    decision = "ENTRY SMALL"
+    risk_label = "faible"
+    reasons: list[str] = []
+
+    if not persistence_available or (trade_count >= 5 and (high_confidence_loss_count >= 2 or (net_pnl_usd < 0.0 and win_rate_pct < 40.0))):
+        decision = "STOP"
+        risk_label = "eleve"
+        reasons = [
+            "verite PnL degradee" if persistence_available else "DB V6 indisponible",
+            f"latence {avg_latency_ms:.0f}ms / slippage {avg_slippage_bps:.2f}bps",
+            f"streak negatif {negative_streak}" if negative_streak >= 2 else f"loss haute confiance {high_confidence_loss_count}",
+        ]
+    elif no_trade_ratio_pct >= 70.0 or suspended_strategies:
+        decision = "WAIT"
+        risk_label = "eleve"
+        reasons = [
+            f"no-trade dominance {no_trade_ratio_pct:.0f}%",
+            f"strategies suspendues {len(suspended_strategies)}" if suspended_strategies else "le flux reste trop filtre pour entrer",
+            f"incidents ouverts {len(incidents)}" if incidents else "attendre un contexte plus propre",
+        ]
+    elif learning_frozen or avg_latency_ms > 120.0 or avg_slippage_bps > 3.0 or trade_count < 3:
+        decision = "REDUCE SIZE"
+        risk_label = "moyen"
+        reasons = [
+            "learning gelee" if learning_frozen else "echantillon live encore faible",
+            f"latence {avg_latency_ms:.0f}ms",
+            f"slippage {avg_slippage_bps:.2f}bps",
+        ]
+    else:
+        reasons = [
+            f"verite PnL {_format_signed_usd(net_pnl_usd)}",
+            f"no-trade dominance {no_trade_ratio_pct:.0f}%",
+            f"friction {avg_latency_ms:.0f}ms / {avg_slippage_bps:.2f}bps",
+        ]
+
+    reply = "\n".join(
+        [
+            f"DECISION: {decision}",
+            f"RISQUE: {risk_label}",
+            f"RAISON: {' ; '.join(reasons)}",
+            "OVERRIDE: possible mais visible. Si tu forces, reste en micro-size et journalise la raison.",
+        ]
+    )
+
+    return {
+        "status": "ok",
+        "reply": reply,
+        "data": {
+            "decision": decision,
+            "risk": risk_label,
+            "reasons": reasons,
+            "pnl": pnl_payload,
+            "readiness": readiness_payload,
+            "incidents": incidents_payload,
+            "execution_ai_v6": execution_ai_v6_payload,
+            "strategy_progress": strategies_payload[:5],
+        },
+        "actions": ["open_live_ops", "open_terminal_truth", "open_live_readiness"],
+    }
+
+
 @app.post("/v1/copilot/chat")
 async def copilot_chat(payload: dict, auth: AuthContext = Depends(viewer_auth)) -> dict:
     confirm_token = str(payload.get("confirm_token", "")).strip()
@@ -12531,13 +15051,52 @@ async def copilot_chat(payload: dict, auth: AuthContext = Depends(viewer_auth)) 
     if not message:
         return {
             "status": "ok",
-            "reply": "Pose une question sur readiness, drift, A/B memory, ou declenche une action guidee.",
-            "actions": ["open_live_readiness", "open_memory_ab_panel"],
+            "reply": "Pose une question sur le desk du jour, la verite PnL, le plan journalier, readiness, drift, A/B memory, ou declenche une action guidee.",
+            "actions": ["open_live_ops", "open_terminal_truth", "open_live_readiness", "open_memory_ab_panel"],
             "suggested_actions": [
                 {"type": "apply_threshold", "label": "Appliquer seuil regime"},
                 {"type": "open_incident_ticket", "label": "Ouvrir ticket incident"},
                 {"type": "run_runbook", "label": "Lancer runbook stabilize_trading"},
             ],
+        }
+
+    if any(keyword in message for keyword in {"commandant", "que faire maintenant", "dois-je trader", "je trade", "trade maintenant", "override"}):
+        end = _now_utc()
+        start = end - timedelta(days=7)
+        pnl_payload = _execution_pnl_analyzer("strategy", "mt5-live", start, end, trade_limit=50, confidence_flag_threshold=0.7)
+        readiness_payload = await live_readiness_overview(auth)
+        incidents_payload = await list_incidents(auth=auth)
+        strategies_payload = await list_strategies(auth=auth)
+        execution_ai_v6_payload = await _fetch_execution_ai_v6_state_snapshot()
+        return _build_ops_copilot_command_brief(
+            pnl_payload=pnl_payload,
+            readiness_payload=readiness_payload,
+            incidents_payload=incidents_payload,
+            strategies_payload=strategies_payload,
+            execution_ai_v6_payload=execution_ai_v6_payload,
+        )
+
+    if any(keyword in message for keyword in {"desk", "pnl", "truth", "verite", "no-trade", "journal", "plan", "priorite", "ops", "exploitation"}):
+        end = _now_utc()
+        start = end - timedelta(days=7)
+        pnl_payload = _execution_pnl_analyzer("strategy", "mt5-live", start, end, trade_limit=50, confidence_flag_threshold=0.7)
+        readiness_payload = await live_readiness_overview(auth)
+        incidents_payload = await list_incidents(auth=auth)
+        strategies_payload = await list_strategies(auth=auth)
+        execution_ai_v6_payload = await _fetch_execution_ai_v6_state_snapshot()
+        return _build_ops_copilot_desk_brief(
+            pnl_payload=pnl_payload,
+            readiness_payload=readiness_payload,
+            incidents_payload=incidents_payload,
+            strategies_payload=strategies_payload,
+            execution_ai_v6_payload=execution_ai_v6_payload,
+        )
+
+    if any(keyword in message for keyword in {"news", "nouvel", "macro", "econom", "fed", "cpi", "fomc", "calendar", "geopolit"}):
+        return {
+            "status": "ok",
+            "reply": "Je n'ai pas encore de feed macro/news live branche dans Ops Copilot. Pour l'instant je peux te rappeler le contexte macro comme filtre operationnel et te dire de bloquer ou reduire le live autour des evenements Fed/CPI/FOMC, mais pas te donner une newswire temps reel fiable.",
+            "actions": ["open_live_ops", "open_ai_desk"],
         }
 
     if "readiness" in message or "live" in message:
@@ -12680,6 +15239,12 @@ async def connectors_catalog(auth: AuthContext = Depends(viewer_auth)) -> dict:
     return {"status": "ok", "connectors": CONNECTOR_CATALOG}
 
 
+@app.get("/v1/connectors/exchange-capabilities")
+async def connectors_exchange_capabilities(auth: AuthContext = Depends(any_read_auth)) -> dict:
+    del auth
+    return _exchange_capability_catalog()
+
+
 @app.get("/v1/connectors/accounts")
 async def connectors_accounts(auth: AuthContext = Depends(any_read_auth)) -> dict:
     accounts = _filter_connector_accounts_for_auth(_load_connector_accounts(), auth)
@@ -12699,7 +15264,7 @@ async def connectors_accounts(auth: AuthContext = Depends(any_read_auth)) -> dic
 @app.post("/v1/connectors/accounts/link")
 async def connectors_link_account(payload: dict, auth: AuthContext = Depends(connector_manage_auth)) -> dict:
     provider = str(payload.get("provider") or "").strip().lower()
-    account_id = str(payload.get("account_id") or "").strip()
+    account_id = _normalize_account_id(payload.get("account_id"))
     label = str(payload.get("label") or "").strip()
     mode = str(payload.get("mode") or "read").strip().lower()
     if not provider or not account_id:
@@ -12783,7 +15348,7 @@ async def connectors_link_account(payload: dict, auth: AuthContext = Depends(con
 @app.post("/v1/connectors/accounts/link-api-key")
 async def connectors_link_api_key(payload: dict, auth: AuthContext = Depends(connector_manage_auth)) -> dict:
     provider = str(payload.get("provider") or "").strip().lower()
-    account_id = str(payload.get("account_id") or "").strip()
+    account_id = _normalize_account_id(payload.get("account_id"))
     label = str(payload.get("label") or "").strip()
     mode = str(payload.get("mode") or "trade").strip().lower()
     api_key = str(payload.get("api_key") or "").strip()
@@ -12799,15 +15364,55 @@ async def connectors_link_api_key(payload: dict, auth: AuthContext = Depends(con
         raise HTTPException(status_code=400, detail=f"unsupported provider: {provider}")
     provider_type = next((str(entry.get("type") or "crypto") for entry in CONNECTOR_CATALOG if str(entry.get("name") or "") == provider), "crypto")
 
+    existing_account = next(
+        (
+            item
+            for item in _load_connector_accounts()
+            if str(item.get("provider", "")).strip().lower() == provider
+            and str(item.get("account_id", "")).strip() == account_id
+        ),
+        None,
+    )
+    existing_credential = _load_decrypted_connector_credential(str(existing_account.get("credential_id") or "")) if isinstance(existing_account, dict) else None
+    existing_secret_payload = existing_credential.get("secret_payload") if isinstance(existing_credential, dict) and isinstance(existing_credential.get("secret_payload"), dict) else {}
+    historical_credential = _latest_connector_credential_for_account(provider, account_id)
+    historical_secret_payload = historical_credential.get("secret_payload") if isinstance(historical_credential, dict) and isinstance(historical_credential.get("secret_payload"), dict) else {}
+    if not passphrase:
+        passphrase = str(existing_secret_payload.get("passphrase") or historical_secret_payload.get("passphrase") or "").strip()
+    if provider in {"okx", "bitget"} and not passphrase:
+        raise HTTPException(status_code=400, detail=f"{provider.upper()} requires a passphrase for API key authentication")
+
+    secret_payload = {
+        "api_key": api_key,
+        "api_secret": api_secret,
+        "passphrase": passphrase,
+    }
+    if provider == "binance":
+        try:
+            await _binance_validate_api_credentials(secret_payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except BinanceAPIError as exc:
+            status_code = 400 if exc.http_status in {400, 401, 403} or exc.code else 502
+            raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=f"Binance credential validation failed: {str(exc)}") from exc
+    if provider == "okx":
+        try:
+            await _okx_validate_api_credentials(secret_payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except OKXAPIError as exc:
+            status_code = 400 if exc.http_status in {400, 401, 403} or exc.code else 502
+            raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=f"OKX credential validation failed: {str(exc)}") from exc
+
     credential_id = _store_encrypted_connector_credential(
         provider=provider,
         account_id=account_id,
         auth_method="api_key",
-        secret_payload={
-            "api_key": api_key,
-            "api_secret": api_secret,
-            "passphrase": passphrase,
-        },
+        secret_payload=secret_payload,
         created_by=auth.username,
     )
 
@@ -12847,7 +15452,7 @@ async def connectors_link_api_key(payload: dict, auth: AuthContext = Depends(con
 @app.post("/v1/connectors/oauth/start")
 async def connectors_oauth_start(payload: dict, auth: AuthContext = Depends(connector_manage_auth)) -> dict:
     provider = str(payload.get("provider") or "").strip().lower()
-    account_id = str(payload.get("account_id") or "").strip()
+    account_id = _normalize_account_id(payload.get("account_id"))
     label = str(payload.get("label") or "").strip()
     redirect_uri = str(payload.get("redirect_uri") or "").strip()
     mode = str(payload.get("mode") or "trade").strip().lower()
@@ -12944,7 +15549,7 @@ async def connectors_oauth_callback(provider: str, state: str, code: str | None 
             raise HTTPException(status_code=502, detail=f"oauth token exchange failed for {provider_norm}")
         tokens = response.json() if isinstance(response.json(), dict) else {}
 
-    account_id = str(state_payload.get("account_id") or "").strip()
+    account_id = _normalize_account_id(state_payload.get("account_id"))
     label = str(state_payload.get("label") or "").strip()
     mode = str(state_payload.get("mode") or "trade").strip().lower()
     created_by = str(state_payload.get("created_by") or "oauth-callback")
@@ -13042,7 +15647,7 @@ async def integrations_platforms(auth: AuthContext = Depends(viewer_auth)) -> di
 async def integrations_routes_upsert(payload: dict, auth: AuthContext = Depends(operator_auth)) -> dict:
     source = str(payload.get("source") or "").strip().lower()
     provider = str(payload.get("provider") or "").strip().lower()
-    account_id = str(payload.get("account_id") or "").strip()
+    account_id = _normalize_account_id(payload.get("account_id"))
     route_key = str(payload.get("route_key") or "default").strip().lower()
     if not source:
         raise HTTPException(status_code=400, detail="source is required")
@@ -13145,7 +15750,7 @@ async def _handle_signal_webhook(source: str, payload: dict, provided_secret: st
         raise HTTPException(status_code=400, detail="no integration route configured")
 
     provider = str(route.get("provider") or "").strip().lower()
-    account_id = str(route.get("account_id") or "").strip()
+    account_id = _normalize_account_id(route.get("account_id"))
     accounts = _load_connector_accounts()
     linked = next(
         (
@@ -13216,10 +15821,13 @@ async def _handle_signal_webhook(source: str, payload: dict, provided_secret: st
                 "provider": provider,
                 "account_id": account_id,
                 "reasons": live_execution.get("reasons"),
+                "capabilities": live_execution.get("capabilities"),
+                "connector_degradation": live_execution.get("connector_degradation"),
                 "policy": live_execution.get("policy"),
                 "paper_only": live_execution.get("paper_only"),
             },
         )
+    effective_notional = _to_float(live_execution.get("effective_notional_usd"), notional)
     resolved_preferred_venue = str(route.get("preferred_venue") or "").strip()
     if bool(live_execution.get("enabled")):
         if not resolved_preferred_venue or resolved_preferred_venue.startswith("paper-"):
@@ -13228,12 +15836,38 @@ async def _handle_signal_webhook(source: str, payload: dict, provided_secret: st
         resolved_preferred_venue = _preferred_execution_venue(provider, live_enabled=False)
 
     pre_trade_memory_gate = _extract_pre_trade_memory_gate(payload)
+    governance_snapshot = _extract_trade_governance(payload)
+    hardening_snapshot = None
+    if live_requested:
+        hardening_snapshot = _evaluate_go_live_hardening(
+            source=source,
+            provider=provider,
+            account_id=account_id,
+            symbol=symbol,
+            side=side,
+            requested_notional_usd=effective_notional,
+            confidence=payload_confidence,
+            live_requested=True,
+            purpose="execute",
+            pre_trade_memory_gate=pre_trade_memory_gate,
+            governance=governance_snapshot,
+        )
+        if hardening_snapshot.get("status") != "approved":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "status": "blocked_by_go_live_hardening",
+                    "provider": provider,
+                    "account_id": account_id,
+                    "hardening": hardening_snapshot,
+                },
+            )
 
     execution_payload = {
         "decision_id": str(payload.get("decision_id") or f"{source}-{uuid4()}"),
         "symbol": symbol,
         "side": side,
-        "estimated_notional_usd": notional,
+        "estimated_notional_usd": effective_notional,
         "preferred_venue": resolved_preferred_venue,
         "execution_mode": f"{source}-webhook",
         "live_execution": {
@@ -13248,10 +15882,17 @@ async def _handle_signal_webhook(source: str, payload: dict, provided_secret: st
             "source": source,
             "provider": provider,
             "account_id": account_id,
+            "capabilities": live_execution.get("capabilities"),
             "route_key": route_key or "default",
             "live_requested": live_requested,
+            "health_score": live_execution.get("health_score"),
+            "health_action": live_execution.get("health_action"),
+            "size_multiplier": live_execution.get("size_multiplier"),
+            "requested_notional_usd": notional,
+            "effective_notional_usd": effective_notional,
             "position_side": position_side,
             "pre_trade_memory_gate": pre_trade_memory_gate,
+            "go_live_hardening": hardening_snapshot,
             "raw_payload": payload,
         },
     }
@@ -13273,21 +15914,23 @@ async def _handle_signal_webhook(source: str, payload: dict, provided_secret: st
             "account_id": account_id,
             "symbol": symbol,
             "side": side,
-            "notional": notional,
+            "requested_notional_usd": notional,
+            "effective_notional_usd": effective_notional,
             "decision_id": execution_payload["decision_id"],
             "live_requested": live_requested,
             "live_enabled": bool(live_execution.get("enabled")),
             "position_side": position_side,
             "telemetry_id": telemetry_id,
             "pre_trade_memory_gate": routed_pre_trade_memory_gate,
+            "go_live_hardening": hardening_snapshot,
         },
     )
-    return {"status": "ok", "route": route, "telemetry_id": telemetry_id, "pre_trade_memory_gate": routed_pre_trade_memory_gate, "execution": routed}
+    return {"status": "ok", "route": route, "telemetry_id": telemetry_id, "pre_trade_memory_gate": routed_pre_trade_memory_gate, "go_live_hardening": hardening_snapshot, "execution": routed}
 
 
 @app.post("/v1/connectors/bingx/transfer")
 async def bingx_transfer_balance(payload: dict, auth: AuthContext = Depends(operator_auth)) -> dict:
-    account_id = str(payload.get("account_id") or "").strip()
+    account_id = _normalize_account_id(payload.get("account_id"))
     if not account_id:
         raise HTTPException(status_code=400, detail="account_id is required")
     asset = str(payload.get("asset") or payload.get("coin") or "USDT").strip().upper()
@@ -13383,7 +16026,7 @@ async def bingx_transfer_balance(payload: dict, auth: AuthContext = Depends(oper
 
 @app.post("/v1/connectors/bingx/flatten")
 async def bingx_flatten_positions(payload: dict, auth: AuthContext = Depends(operator_auth)) -> dict:
-    account_id = str(payload.get("account_id") or "").strip()
+    account_id = _normalize_account_id(payload.get("account_id"))
     if not account_id:
         raise HTTPException(status_code=400, detail="account_id is required")
     symbol = str(payload.get("symbol") or "BTCUSDT").strip().upper().replace("/", "").replace("-", "")
@@ -13503,7 +16146,7 @@ async def bingx_flatten_positions(payload: dict, auth: AuthContext = Depends(ope
 
 @app.post("/v1/connectors/bingx/transfer-and-smoke")
 async def bingx_transfer_and_smoke(payload: dict, auth: AuthContext = Depends(operator_auth)) -> dict:
-    account_id = str(payload.get("account_id") or "").strip()
+    account_id = _normalize_account_id(payload.get("account_id"))
     if not account_id:
         raise HTTPException(status_code=400, detail="account_id is required")
     symbol = str(payload.get("symbol") or "BTCUSDT").strip().upper().replace("/", "").replace("-", "")
@@ -13609,9 +16252,76 @@ async def bingx_transfer_and_smoke(payload: dict, auth: AuthContext = Depends(op
     }
 
 
+@app.post("/v1/live/orders/cancel")
+async def cancel_live_order(payload: dict, auth: AuthContext = Depends(operator_auth)) -> dict:
+    provider = str(payload.get("provider") or "bingx").strip().lower()
+    if provider != "bingx":
+        raise HTTPException(status_code=400, detail="unsupported live provider")
+
+    account_id = _normalize_account_id(payload.get("account_id"))
+    if not account_id:
+        raise HTTPException(status_code=400, detail="account_id is required")
+    _assert_account_visible(auth, account_id)
+
+    symbol = str(payload.get("symbol") or "").strip().upper().replace("/", "").replace("-", "")
+    if not symbol:
+        raise HTTPException(status_code=400, detail="symbol is required")
+    side = str(payload.get("side") or "buy").strip().lower()
+    if side not in {"buy", "sell"}:
+        raise HTTPException(status_code=400, detail="side must be buy or sell")
+
+    order_id = str(payload.get("order_id") or "").strip()
+    client_order_id = str(payload.get("client_order_id") or "").strip()
+    if not order_id and not client_order_id:
+        raise HTTPException(status_code=400, detail="order_id or client_order_id is required")
+
+    try:
+        linked_account, secret_payload = _bingx_secret_payload_for_account(account_id, require_trade=True)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    cancel_payload = {
+        "provider": provider,
+        "account_id": account_id,
+        "secret_payload": secret_payload,
+        "symbol": symbol,
+        "side": side,
+        "order_id": order_id,
+        "client_order_id": client_order_id,
+        "notional_usd": _to_float(payload.get("notional_usd"), 0.0),
+    }
+    async with httpx.AsyncClient(timeout=25.0) as client:
+        response = await client.post(f"{BROKER_ADAPTER_URL}/v1/live/orders/cancel", json=cancel_payload)
+    if response.status_code >= 400:
+        raise HTTPException(status_code=502, detail=_flatten_downstream_error("live_cancel_failed", _http_error_detail(response)))
+    body = response.json()
+    cancel_result = body if isinstance(body, dict) else {"status": "unknown"}
+
+    append_audit(
+        "live_order_cancelled",
+        {
+            "provider": provider,
+            "account_id": account_id,
+            "symbol": symbol,
+            "side": side,
+            "order_id": order_id or None,
+            "client_order_id": client_order_id or None,
+            "status": cancel_result.get("status"),
+            "operator": auth.username,
+        },
+    )
+    return {
+        "status": "ok",
+        "provider": provider,
+        "account_id": account_id,
+        "linked_account": _connector_account_public_view(linked_account),
+        "cancel": cancel_result,
+    }
+
+
 @app.post("/v1/connectors/bingx/live-smoke")
 async def bingx_live_smoke(payload: dict, auth: AuthContext = Depends(operator_auth)) -> dict:
-    account_id = str(payload.get("account_id") or "").strip()
+    account_id = _normalize_account_id(payload.get("account_id"))
     symbol = str(payload.get("symbol") or "BTCUSDT").strip().upper().replace("/", "").replace("-", "")
     side = str(payload.get("side") or "buy").strip().lower()
     if side not in {"buy", "sell"}:
@@ -13651,7 +16361,39 @@ async def bingx_live_smoke(payload: dict, auth: AuthContext = Depends(operator_a
                 "provider": "bingx",
                 "account_id": account_id,
                 "reasons": live_execution.get("reasons"),
+                "connector_degradation": live_execution.get("connector_degradation"),
                 "policy": live_execution.get("policy"),
+            },
+        )
+    effective_notional = _to_float(live_execution.get("effective_notional_usd"), notional)
+
+    hardening_snapshot = _evaluate_go_live_hardening(
+        source="bingx-live-smoke",
+        provider="bingx",
+        account_id=account_id,
+        symbol=symbol,
+        side=side,
+        requested_notional_usd=effective_notional,
+        confidence=1.0,
+        live_requested=True,
+        purpose="smoke",
+        pre_trade_memory_gate={},
+        governance={
+            "approved": True,
+            "approver": auth.username,
+            "approval_id": f"bingx-smoke:{account_id}:{symbol}",
+            "approval_mode": "operator_confirmation_text",
+            "override": False,
+        },
+    )
+    if hardening_snapshot.get("status") != "approved":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "status": "blocked_by_go_live_hardening",
+                "provider": "bingx",
+                "account_id": account_id,
+                "hardening": hardening_snapshot,
             },
         )
 
@@ -13679,7 +16421,7 @@ async def bingx_live_smoke(payload: dict, auth: AuthContext = Depends(operator_a
     offset_bps = _to_float(payload.get("limit_offset_bps"), _to_float((live_execution.get("policy") or {}).get("smoke_limit_offset_bps"), 3500.0))
     offset_bps = max(500.0, min(offset_bps, 9000.0))
     limit_price = reference_price * (1.0 - offset_bps / 10000.0 if side == "buy" else 1.0 + offset_bps / 10000.0)
-    quantity = notional / max(reference_price, 1e-9)
+    quantity = effective_notional / max(reference_price, 1e-9)
     client_order_id = f"smoke-{uuid4().hex[:20]}"
     create_payload = {
         "provider": "bingx",
@@ -13688,7 +16430,7 @@ async def bingx_live_smoke(payload: dict, auth: AuthContext = Depends(operator_a
         "symbol": symbol,
         "side": side,
         "position_side": str(payload.get("position_side") or ("LONG" if side == "buy" else "SHORT")).strip().upper(),
-        "notional_usd": notional,
+        "notional_usd": effective_notional,
         "quantity": quantity,
         "price": limit_price,
         "order_type": "LIMIT",
@@ -13716,7 +16458,7 @@ async def bingx_live_smoke(payload: dict, auth: AuthContext = Depends(operator_a
             "side": side,
             "order_id": order_id,
             "client_order_id": str(create_result.get("client_order_id") or client_order_id),
-            "notional_usd": notional,
+            "notional_usd": effective_notional,
         }
         async with httpx.AsyncClient(timeout=25.0) as client:
             cancel_response = await client.post(f"{BROKER_ADAPTER_URL}/v1/live/orders/cancel", json=cancel_payload)
@@ -13732,11 +16474,14 @@ async def bingx_live_smoke(payload: dict, auth: AuthContext = Depends(operator_a
             "account_id": account_id,
             "symbol": symbol,
             "side": side,
-            "notional_usd": notional,
+            "requested_notional_usd": notional,
+            "effective_notional_usd": effective_notional,
             "reference_price": reference_price,
             "limit_price": limit_price,
             "create_status": create_status,
             "cancel_status": cancel_result.get("status") if isinstance(cancel_result, dict) else None,
+            "go_live_hardening": hardening_snapshot,
+            "connector_health": live_execution.get("connector_degradation"),
             "operator": auth.username,
         },
     )
@@ -13746,7 +16491,8 @@ async def bingx_live_smoke(payload: dict, auth: AuthContext = Depends(operator_a
         "account_id": account_id,
         "symbol": symbol,
         "side": side,
-        "notional_usd": notional,
+        "requested_notional_usd": notional,
+        "effective_notional_usd": effective_notional,
         "reference_price": reference_price,
         "limit_price": limit_price,
         "route": {
@@ -13755,6 +16501,8 @@ async def bingx_live_smoke(payload: dict, auth: AuthContext = Depends(operator_a
             "execution_venue": live_execution.get("execution_venue"),
         },
         "policy": live_execution.get("policy"),
+        "connector_degradation": live_execution.get("connector_degradation"),
+        "go_live_hardening": hardening_snapshot,
         "create": create_result,
         "cancel": cancel_result,
     }
@@ -13936,10 +16684,11 @@ async def execute_approved_intent(intent_payload: dict, risk_decision: RiskDecis
     }
     if bool(live_hint.get("requested")):
         explainability = effective_intent_payload.get("explainability") if isinstance(effective_intent_payload.get("explainability"), dict) else {}
+        requested_live_notional = _to_float(effective_intent_payload.get("target_notional_usd"), 0.0)
         live_execution = _resolve_live_execution_request(
             str(live_hint.get("provider") or ""),
             str(live_hint.get("account_id") or ""),
-            requested_notional_usd=_to_float(effective_intent_payload.get("target_notional_usd"), 0.0),
+            requested_notional_usd=requested_live_notional,
             explicit_flag=True,
             purpose="execute",
             paper_only=_bool_from_any(risk_decision.risk_snapshot.get("paper_only"), False),
@@ -13958,10 +16707,40 @@ async def execute_approved_intent(intent_payload: dict, risk_decision: RiskDecis
                 detail={
                     "status": "live_execution_blocked",
                     "reasons": live_execution.get("reasons"),
+                    "connector_degradation": live_execution.get("connector_degradation"),
                     "policy": live_execution.get("policy"),
                     "paper_only": live_execution.get("paper_only"),
                     "provider": live_execution.get("provider"),
                     "account_id": live_execution.get("account_id"),
+                },
+            )
+        effective_live_notional = _to_float(live_execution.get("effective_notional_usd"), requested_live_notional)
+        hardening_snapshot = _evaluate_go_live_hardening(
+            source="approved-intent",
+            provider=str(live_execution.get("provider") or ""),
+            account_id=_normalize_account_id(live_execution.get("account_id")),
+            symbol=str(effective_intent_payload.get("instrument") or ""),
+            side=str(effective_intent_payload.get("side") or "buy"),
+            requested_notional_usd=effective_live_notional,
+            confidence=_clamp(_to_float(effective_intent_payload.get("confidence"), 0.0), 0.0, 1.0),
+            live_requested=True,
+            purpose="execute",
+            pre_trade_memory_gate=memory_pretrade if isinstance(memory_pretrade, dict) else {},
+            governance={
+                "approved": True,
+                "approver": "server-approved-intent",
+                "approval_id": str(effective_intent_payload.get("intent_id") or "").strip(),
+                "approval_mode": "intent_approval",
+                "override": False,
+            },
+        )
+        if hardening_snapshot.get("status") != "approved":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "status": "blocked_by_go_live_hardening",
+                    "intent_id": effective_intent_payload.get("intent_id"),
+                    "hardening": hardening_snapshot,
                 },
             )
         execution_endpoint = f"{EXECUTION_ROUTER_URL}/v1/orders/routed"
@@ -13970,8 +16749,8 @@ async def execute_approved_intent(intent_payload: dict, risk_decision: RiskDecis
             "intent_id": str(effective_intent_payload.get("intent_id") or "").strip() or None,
             "symbol": str(effective_intent_payload.get("instrument") or "").strip(),
             "side": str(effective_intent_payload.get("side") or "buy").strip().lower(),
-            "estimated_notional_usd": _to_float(effective_intent_payload.get("target_notional_usd"), 0.0),
-            "preferred_venue": _preferred_execution_venue(str(live_hint.get("provider") or ""), live_enabled=True),
+            "estimated_notional_usd": effective_live_notional,
+            "preferred_venue": str(live_execution.get("execution_venue") or _preferred_execution_venue(str(live_hint.get("provider") or ""), live_enabled=True)).strip(),
             "route_mode_override": applied_overrides.get("route_mode_override"),
             "execution_style": applied_overrides.get("execution_style"),
             "execution_mode": "live-intent",
@@ -13992,7 +16771,13 @@ async def execute_approved_intent(intent_payload: dict, risk_decision: RiskDecis
                 "intent_id": str(effective_intent_payload.get("intent_id") or "").strip(),
                 "route_mode_override": applied_overrides.get("route_mode_override"),
                 "execution_style": applied_overrides.get("execution_style"),
+                "health_score": live_execution.get("health_score"),
+                "health_action": live_execution.get("health_action"),
+                "size_multiplier": live_execution.get("size_multiplier"),
+                "requested_notional_usd": requested_live_notional,
+                "effective_notional_usd": effective_live_notional,
                 "memory_v2_pretrade": memory_pretrade,
+                "go_live_hardening": hardening_snapshot,
             },
         }
     async with httpx.AsyncClient(timeout=10.0) as client:
@@ -14003,7 +16788,10 @@ async def execute_approved_intent(intent_payload: dict, risk_decision: RiskDecis
 
         if execution_response.status_code >= 400:
             _record_api_error("execution-router", "intent_execution_failed")
-            raise HTTPException(status_code=502, detail="Execution router unavailable")
+            raise HTTPException(
+                status_code=502 if execution_response.status_code >= 500 else execution_response.status_code,
+                detail=_upstream_json_payload(execution_response),
+            )
 
         response_body = execution_response.json()
         if execution_endpoint.endswith("/routed"):
@@ -14016,7 +16804,7 @@ async def execute_approved_intent(intent_payload: dict, risk_decision: RiskDecis
                     "venue": str(response_body.get("venue") or live_execution.get("execution_venue") or effective_intent_payload.get("venue") or "unknown"),
                     "instrument": str(response_body.get("instrument") or effective_intent_payload.get("instrument") or ""),
                     "side": str(response_body.get("side") or effective_intent_payload.get("side") or "buy"),
-                    "requested_notional_usd": _to_float(response_body.get("requested_notional_usd"), _to_float(effective_intent_payload.get("target_notional_usd"), 0.0)),
+                    "requested_notional_usd": _to_float(response_body.get("requested_notional_usd"), effective_live_notional),
                     "filled_notional_usd": _to_float(response_body.get("filled_notional_usd"), 0.0),
                     "avg_fill_price": _to_float(response_body.get("avg_fill_price"), 0.0),
                     "execution_mode": str(response_body.get("execution_mode") or execution_body.get("execution_mode") or "live-intent"),

@@ -89,6 +89,12 @@ export default function ChartHudSignalDecisionPanel({
   brainAttributionHeadline,
   brainAttributionPills,
   brainLearningRatePills,
+  institutionalHealing,
+  institutionalSnapshot,
+  executionWarfare,
+  brokerAwareScheduler,
+  stabilityEngine,
+  strategyEvolution,
   executionAdaptMode,
   onSetExecutionAdaptMode,
   pendingExecutionAdaptation,
@@ -239,6 +245,103 @@ export default function ChartHudSignalDecisionPanel({
               {brainLearningRatePills.length > 0 ? brainLearningRatePills.map((pill) => (
                 <span key={`brain-lr-${pill}`} className="chart-action-pill">{pill}</span>
               )) : <span className="chart-action-pill">LR adaptation pending</span>}
+            </div>
+          </div>
+          <div className="chart-execution-brain-v3">
+            <div className="chart-signal-kicker">V7.5 + V8 Institutional</div>
+            <div className="chart-learning-strip">
+              <span>{institutionalHealing.causalMemoryLabel} · {institutionalSnapshot.memoryGraphLabel}</span>
+            </div>
+            <div className="chart-execution-brain-v3-grid">
+              <span className={`chart-action-pill chart-action-pill-status ${institutionalHealing.executionEnabled ? institutionalHealing.drift === "STABLE" ? "good" : "warn" : "bad"}`}>HEAL {institutionalHealing.action}</span>
+              <span className="chart-action-pill">Mode {institutionalHealing.mode.toUpperCase()} · Drift {institutionalHealing.drift}</span>
+              <span className={`chart-action-pill chart-action-pill-status ${institutionalSnapshot.healthState === "strong" ? "good" : institutionalSnapshot.healthState === "guarded" ? "warn" : "bad"}`}>HEALTH {institutionalSnapshot.healthScorePct.toFixed(0)}%</span>
+              <span className="chart-action-pill">Agent {institutionalSnapshot.selectedAgent}</span>
+              <span className="chart-action-pill">Failure {institutionalHealing.dominantFailureSource}</span>
+              <span className="chart-action-pill">Adapt {institutionalHealing.adaptSpeedPct.toFixed(0)}% · size x{institutionalHealing.riskMultiplier.toFixed(2)}</span>
+              <span className="chart-action-pill">Exec {institutionalSnapshot.executionStyle} · x{institutionalSnapshot.sizeMultiplier.toFixed(2)}</span>
+              <span className="chart-action-pill">Live {institutionalHealing.executionEnabled ? "ON" : "OFF"}</span>
+              {institutionalSnapshot.capitalAllocationPills.length > 0 ? institutionalSnapshot.capitalAllocationPills.map((pill) => (
+                <span key={`inst-cap-${pill}`} className="chart-action-pill">{pill}</span>
+              )) : <span className="chart-action-pill">Capital allocation warming up</span>}
+              {institutionalHealing.reasons.length > 0 ? institutionalHealing.reasons.map((reason) => (
+                <span key={`heal-reason-${reason}`} className="chart-action-pill">{reason}</span>
+              )) : null}
+              {institutionalSnapshot.reasonPills.length > 0 ? institutionalSnapshot.reasonPills.map((pill) => (
+                <span key={`inst-reason-${pill}`} className="chart-action-pill">{pill}</span>
+              )) : null}
+            </div>
+          </div>
+          <div className="chart-execution-brain-v3">
+            <div className="chart-signal-kicker">V8.5 Execution Warfare</div>
+            <div className="chart-learning-strip">
+              <span>{executionWarfare.adversarialState} · trap {executionWarfare.trapState} · guard {executionWarfare.guardAction}</span>
+            </div>
+            <div className="chart-execution-brain-v3-grid">
+              <span className={`chart-action-pill chart-action-pill-status ${executionWarfare.guardAction === "BLOCK" ? "bad" : executionWarfare.mode === "AGGRESSIVE" ? "good" : executionWarfare.mode === "STEALTH" ? "warn" : "neutral"}`}>WAR {executionWarfare.mode}</span>
+              <span className="chart-action-pill">Venue {executionWarfare.venue || "AUTO"}</span>
+              <span className={`chart-action-pill chart-action-pill-status ${executionWarfare.executionScorePct >= 72 ? "good" : executionWarfare.executionScorePct >= 50 ? "warn" : "bad"}`}>Score {executionWarfare.executionScorePct.toFixed(0)}%</span>
+              <span className="chart-action-pill">Slices {executionWarfare.slices} · {executionWarfare.sliceNotionalUsd.toFixed(0)} USD</span>
+              <span className="chart-action-pill">Delay {executionWarfare.delayMs}ms · edge {executionWarfare.latencyEdgeMs >= 0 ? "+" : ""}{executionWarfare.latencyEdgeMs.toFixed(0)}ms</span>
+              <span className="chart-action-pill">Hidden {executionWarfare.hiddenLiquidityPct.toFixed(0)}% · spoof {executionWarfare.spoofProbabilityPct.toFixed(0)}%</span>
+              <span className="chart-action-pill">Sweep {executionWarfare.sweepRiskPct.toFixed(0)}% · {executionWarfare.adversarialState}</span>
+              <span className="chart-action-pill">Trap {executionWarfare.trapState}</span>
+              {executionWarfare.reasons.length > 0 ? executionWarfare.reasons.map((reason) => (
+                <span key={`warfare-reason-${reason}`} className="chart-action-pill">{reason}</span>
+              )) : <span className="chart-action-pill">warfare nominal</span>}
+            </div>
+          </div>
+          <div className="chart-execution-brain-v3">
+            <div className="chart-signal-kicker">V8.5.1 Broker Scheduler</div>
+            <div className="chart-learning-strip">
+              <span>{brokerAwareScheduler.mode} · {brokerAwareScheduler.action} · {brokerAwareScheduler.activeChildState} · {brokerAwareScheduler.replaceStrategy}</span>
+            </div>
+            <div className="chart-execution-brain-v3-grid">
+              <span className={`chart-action-pill chart-action-pill-status ${brokerAwareScheduler.action === "BLOCK" ? "bad" : brokerAwareScheduler.action === "CANCEL_REPLACE" || brokerAwareScheduler.action === "RESLICE" ? "warn" : "good"}`}>SCHED {brokerAwareScheduler.scheduleScorePct.toFixed(0)}%</span>
+              <span className="chart-action-pill">Venue {brokerAwareScheduler.venue || "AUTO"} · {brokerAwareScheduler.provider || "unknown"}</span>
+              <span className="chart-action-pill">Children {brokerAwareScheduler.childCount} · state {brokerAwareScheduler.activeChildState}</span>
+              <span className="chart-action-pill">Fill {brokerAwareScheduler.averageFillRatioPct.toFixed(0)}% · partial {brokerAwareScheduler.partialFillRatioPct.toFixed(0)}%</span>
+              <span className="chart-action-pill">Replace x{brokerAwareScheduler.replaceBudget} · reslice +{brokerAwareScheduler.resliceCount}</span>
+              <span className="chart-action-pill">Caps modify {brokerAwareScheduler.supportsModify ? "ON" : "OFF"} · cancel/replace {brokerAwareScheduler.supportsCancelReplace ? "ON" : "OFF"}</span>
+              {brokerAwareScheduler.reasons.length > 0 ? brokerAwareScheduler.reasons.map((reason) => (
+                <span key={`scheduler-reason-${reason}`} className="chart-action-pill">{reason}</span>
+              )) : <span className="chart-action-pill">scheduler nominal</span>}
+            </div>
+          </div>
+          <div className="chart-execution-brain-v3">
+            <div className="chart-signal-kicker">Stability Engine</div>
+            <div className="chart-learning-strip">
+              <span>{stabilityEngine.mode.toUpperCase()} · {stabilityEngine.driftWatchdog} · {stabilityEngine.comparatorLabel}</span>
+            </div>
+            <div className="chart-execution-brain-v3-grid">
+              <span className={`chart-action-pill chart-action-pill-status ${stabilityEngine.shouldBlockExecution ? "bad" : stabilityEngine.mode === "live" ? "good" : "warn"}`}>STAB {stabilityEngine.monitorScorePct.toFixed(0)}%</span>
+              <span className="chart-action-pill">Fallback {stabilityEngine.shadowFallbackRatePct.toFixed(2)}%</span>
+              <span className="chart-action-pill">Net timeout {stabilityEngine.timeoutRatePct.toFixed(1)}% · dns {stabilityEngine.dnsTransientRatePct.toFixed(1)}%</span>
+              <span className="chart-action-pill">Degraded {stabilityEngine.degradedUsageRatioPct.toFixed(1)}% · kill {stabilityEngine.externalKillSwitchActive ? "ON" : "OFF"}</span>
+              {stabilityEngine.alerts.length > 0 ? stabilityEngine.alerts.map((alert) => (
+                <span key={`stability-alert-${alert}`} className="chart-action-pill">{alert}</span>
+              )) : <span className="chart-action-pill">stability nominal</span>}
+              {stabilityEngine.reasons.length > 0 ? stabilityEngine.reasons.map((reason) => (
+                <span key={`stability-reason-${reason}`} className="chart-action-pill">{reason}</span>
+              )) : null}
+            </div>
+          </div>
+          <div className="chart-execution-brain-v3">
+            <div className="chart-signal-kicker">V9 Strategy Evolution</div>
+            <div className="chart-learning-strip">
+              <span>{strategyEvolution.capitalMode} · {strategyEvolution.evolutionMode} · pipeline {strategyEvolution.preservePipeline ? "preserved" : "mutating"}</span>
+            </div>
+            <div className="chart-execution-brain-v3-grid">
+              <span className={`chart-action-pill chart-action-pill-status ${strategyEvolution.capitalMode === "growth" ? "good" : strategyEvolution.capitalMode === "balanced" ? "neutral" : strategyEvolution.capitalMode === "halt" ? "bad" : "warn"}`}>V9 {strategyEvolution.capitalMode}</span>
+              <span className="chart-action-pill">Strategy {strategyEvolution.selectedStrategy}</span>
+              <span className="chart-action-pill">Shift {strategyEvolution.allocationShiftPct >= 0 ? "+" : ""}{strategyEvolution.allocationShiftPct.toFixed(1)}%</span>
+              <span className="chart-action-pill">Learning {strategyEvolution.learningBiasPct.toFixed(0)}%</span>
+              {strategyEvolution.allocationPills.length > 0 ? strategyEvolution.allocationPills.map((pill) => (
+                <span key={`v9-alloc-${pill}`} className="chart-action-pill">{pill}</span>
+              )) : <span className="chart-action-pill">allocation pending</span>}
+              {strategyEvolution.reasons.length > 0 ? strategyEvolution.reasons.map((reason) => (
+                <span key={`v9-reason-${reason}`} className="chart-action-pill">{reason}</span>
+              )) : null}
             </div>
           </div>
           <div className="chart-auto-exec-panel">

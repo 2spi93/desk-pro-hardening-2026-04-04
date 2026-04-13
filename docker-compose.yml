@@ -48,6 +48,8 @@ services:
       - ./.env
     command: >
       sh -c "uvicorn apps.control_plane.main:app --host 0.0.0.0 --port 8000 --ws websockets"
+    ports:
+      - "127.0.0.1:8000:8000"
     expose:
       - "8000"
     secrets:

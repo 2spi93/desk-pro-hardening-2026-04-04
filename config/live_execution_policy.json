@@ -1,5 +1,38 @@
 {
   "enabled": true,
+  "go_live_hardening": {
+    "enabled": true,
+    "min_live_confidence": 0.7,
+    "require_human_approval_above_notional_usd": 5.0,
+    "approval_exposure_threshold_pct": 40.0,
+    "max_total_exposure_pct": 60.0,
+    "max_symbol_exposure_pct": 25.0,
+    "max_pending_live_approvals": 8,
+    "drawdown_warning_ratio": 0.7,
+    "enforce_memory_gate": true,
+    "autonomous_sources": [
+      "kairos-shadow-runtime",
+      "tradingview",
+      "quantower",
+      "webhook",
+      "signal-webhook"
+    ],
+    "anti_loop": {
+      "enabled": true,
+      "lookback_minutes": 20,
+      "same_signal_limit": 3,
+      "block_after_repeats": 5,
+      "degraded_confidence_multiplier": 0.6
+    },
+    "watchdog": {
+      "enabled": true,
+      "max_latency_e2e_ms": 1500,
+      "max_realized_slippage_bps": 15.0,
+      "max_block_rate": 0.35,
+      "max_partial_fill_ratio": 0.55,
+      "kill_on_consecutive_failures": 4
+    }
+  },
   "providers": {
     "bingx": {
       "enabled": true,

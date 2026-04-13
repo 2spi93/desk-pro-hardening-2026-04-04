@@ -11,8 +11,8 @@
  * This adapter offloads compute to a Web Worker thread.
  *
  * PHASE 2 IMPLEMENTATION:
- *   - Create /public/workers/indicatorWorker.ts
- *   - Send bars + params → worker
+ *   - Serve /public/workers/indicatorWorker.js
+ *   - Send bars + params -> worker
  *   - Receive serialized result
  *   - Main thread never blocks
  *

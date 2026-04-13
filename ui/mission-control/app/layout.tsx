@@ -3,6 +3,7 @@ import type { ReactNode } from "react";
 import Script from "next/script";
 
 import OpsChatbot from "../components/OpsChatbot";
+import GlobalPlatformWalkthrough from "../components/ui/GlobalPlatformWalkthrough";
 import TxtGlobalNav from "../components/ui/TxtGlobalNav";
 import UiModeController from "../components/ui/UiModeController";
 import { getServerRoleGroup } from "../lib/serverAuth";
@@ -217,6 +218,7 @@ export default async function RootLayout({ children }: { children: ReactNode }) 
         </Script>
         <UiModeController />
         <TxtGlobalNav roleGroup={roleGroup} />
+        <GlobalPlatformWalkthrough roleGroup={roleGroup} />
         {children}
         <OpsChatbot />
       </body>

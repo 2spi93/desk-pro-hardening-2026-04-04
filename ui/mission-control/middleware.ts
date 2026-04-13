@@ -89,6 +89,9 @@ export function middleware(request: NextRequest): NextResponse {
   if (!token) {
     const url = request.nextUrl.clone();
     url.pathname = "/login";
+    if (pathname && pathname !== "/login") {
+      url.searchParams.set("next", `${pathname}${request.nextUrl.search}`);
+    }
     return NextResponse.redirect(url);
   }
 
@@ -98,6 +101,9 @@ export function middleware(request: NextRequest): NextResponse {
   if (!role) {
     const url = request.nextUrl.clone();
     url.pathname = "/login";
+    if (pathname && pathname !== "/login") {
+      url.searchParams.set("next", `${pathname}${request.nextUrl.search}`);
+    }
     return NextResponse.redirect(url);
   }
 

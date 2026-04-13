@@ -50,7 +50,8 @@ Notes:
 
 - This avoids host/compose OS binary mismatches that can cause `chrome-headless-shell ENOENT` false negatives.
 - You can override image and base URL if needed with `PLAYWRIGHT_DOCKER_IMAGE`, `PLAYWRIGHT_BASE_URL`, and `PLAYWRIGHT_WEB_SERVER_COMMAND`.
-- E2E dev runs set `MC_E2E_DEV_DEGRADED=1` by default to consolidate non-blocking control-plane fetch noise into deduplicated degraded warnings.
+- E2E dev runs set `MC_E2E_DEV_DEGRADED=1` by default and can add `MC_E2E_DEV_DEGRADED_SILENT=1` to suppress even the deduplicated control-plane warnings during Playwright noise-sensitive runs.
+- Shadow-mode observability logs (`[TXT][SHADOW_METRIC]`, `[TXT][SHADOW_DIFF]`) are auto-suppressed for `PLAYWRIGHT_TEST=1`, or explicitly via `MC_SHADOW_SILENT=1`.
 
 ## Full Pass
 

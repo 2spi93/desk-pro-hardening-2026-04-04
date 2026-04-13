@@ -32,11 +32,29 @@ function isE2eDevDegradedModeEnabled(): boolean {
   return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
 }
 
+function isTruthyEnvFlag(name: string): boolean {
+  const raw = String(process.env[name] || "").toLowerCase();
+  return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
+}
+
+function isControlPlaneDevNoiseSuppressed(): boolean {
+  if (!isE2eDevDegradedModeEnabled()) {
+    return false;
+  }
+  if (String(process.env.MC_E2E_DEV_DEGRADED_SILENT || "").trim()) {
+    return isTruthyEnvFlag("MC_E2E_DEV_DEGRADED_SILENT");
+  }
+  return isTruthyEnvFlag("PLAYWRIGHT_TEST");
+}
+
 function warnDegradedOnce(key: string, message: string): void {
   if (degradedWarnedKeys.has(key)) {
     return;
   }
   degradedWarnedKeys.add(key);
+  if (isControlPlaneDevNoiseSuppressed()) {
+    return;
+  }
   console.warn(message);
 }
 
@@ -547,9 +565,11 @@ export async function cpFetch(path: string, init: RequestInit = {}): Promise<Res
           lastError = error;
           lastFailure = classifyFetchError(error);
           if (shouldRetryFetchFailure(method, lastFailure, attemptIndex, requestPolicy)) {
-            console.info(
-              `[mc:cp] retrying ${method} ${toRouteFamily(path)} after transient ${lastFailure.classification} via ${candidate} (${attemptIndex + 2}/${requestPolicy.attempts}) policy=${requestPolicy.networkRegime}/${requestPolicy.baseDelayMs}ms`,
-            );
+            if (!isControlPlaneDevNoiseSuppressed()) {
+              console.info(
+                `[mc:cp] retrying ${method} ${toRouteFamily(path)} after transient ${lastFailure.classification} via ${candidate} (${attemptIndex + 2}/${requestPolicy.attempts}) policy=${requestPolicy.networkRegime}/${requestPolicy.baseDelayMs}ms`,
+              );
+            }
             await sleep(getRetryDelayMs(attemptIndex, requestPolicy));
             continue;
           }

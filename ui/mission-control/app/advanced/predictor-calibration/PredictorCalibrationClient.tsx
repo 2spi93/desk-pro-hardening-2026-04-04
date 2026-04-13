@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 
-import TxtMiniGuide from "../../../components/ui/TxtMiniGuide";
+import OperatorPanelGuide from "../../../components/ui/OperatorPanelGuide";
 
 type JsonMap = Record<string, unknown>;
 
@@ -256,7 +256,7 @@ export default function PredictorCalibrationClient() {
         <div className="eyebrow">Predictor Admin</div>
         <h1 className="title" style={{ fontSize: 34 }}>Failure LR Calibration</h1>
         <p className="subtle">Vue admin des fenetres de calibration offline, comparaison par source et historique des snapshots periodiques.</p>
-        <TxtMiniGuide
+        <OperatorPanelGuide
           title="Guide Calibration"
           what="Compare les fenetres 24h/7j/30j/all replay et la confiance empirique par source d'echec."
           why="Verifier que les multiplicateurs sortent progressivement du prior-blended a mesure que le replay reel s'enrichit."

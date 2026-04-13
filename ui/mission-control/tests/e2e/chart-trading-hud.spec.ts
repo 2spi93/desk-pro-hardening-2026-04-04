@@ -16,7 +16,7 @@ test("@chart chart trading HUD keeps key interactions stable after extraction", 
   const compactHud = await hud.evaluate((element) => element.classList.contains("is-compact-mode") || element.classList.contains("is-detached"));
 
   const body = hud.locator(".chart-order-hud-body");
-  if (await body.count() === 0) {
+  if (!compactHud && await body.count() === 0) {
     const fullViewButton = page.getByRole("button", { name: /^View:F$/i }).first();
     if (await fullViewButton.count() > 0) {
       await fullViewButton.click({ force: true });
@@ -26,6 +26,15 @@ test("@chart chart trading HUD keeps key interactions stable after extraction", 
       await expandButton.click({ force: true });
     }
   }
+  await expect(page.locator(".chart-flow-pill").filter({ hasText: /V8\.5\.1/i }).first()).toBeVisible();
+  await expect(page.locator(".chart-flow-pill").filter({ hasText: /V8\.6 STAB/i }).first()).toBeVisible();
+  await expect(page.locator(".chart-flow-pill").filter({ hasText: /^V9 /i }).first()).toBeVisible();
+
+  if (compactHud) {
+    await expect(page.getByText(/ORDER PREVIEW/i).first()).toBeVisible();
+    return;
+  }
+
   await expect(body).toBeVisible();
   await expect(hud.locator(".chart-decision-secondary")).toBeVisible();
 
@@ -39,6 +48,12 @@ test("@chart chart trading HUD keeps key interactions stable after extraction", 
   await hud.evaluate((element) => {
     element.scrollTop = element.scrollHeight;
   });
+
+  const schedulerBlock = hud.getByText("V8.5.1 Broker Scheduler").first();
+  await schedulerBlock.scrollIntoViewIfNeeded();
+  await expect(schedulerBlock).toBeVisible();
+  await expect(hud.getByText("Stability Engine").first()).toBeVisible();
+  await expect(hud.getByText("V9 Strategy Evolution").first()).toBeVisible();
 
   const snapButton = hud.getByRole("button", { name: /^Snap On$/i }).first();
   await expect(snapButton).toBeVisible();

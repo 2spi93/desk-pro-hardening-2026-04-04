@@ -132,6 +132,10 @@ test("live capital desk distinguishes source types and supports portfolio creati
     await route.fulfill({ json: { accounts: connectorAccounts } });
   });
 
+  await page.route("**/api/connectors/exchange-capabilities", async (route) => {
+    await route.fulfill({ json: { bitget: { api_key_requires_passphrase: true } } });
+  });
+
   await page.route("**/api/portfolios", async (route, request) => {
     if (request.method() === "GET") {
       await route.fulfill({ json: portfolios });
@@ -183,6 +187,10 @@ test("live capital desk distinguishes source types and supports portfolio creati
     await route.fulfill({ json: [{ symbol: "BTCUSDT", qty: 0.5 }] });
   });
 
+  await page.route(/\/api\/accounts\/[^/]+\/sync$/, async (route) => {
+    await route.fulfill({ json: { ok: true, synced: true } });
+  });
+
   await page.route(/\/api\/internal\/accounts\/[^/]+\/verification$/, async (route) => {
     await route.fulfill({
       json: {
@@ -220,7 +228,7 @@ test("live capital desk distinguishes source types and supports portfolio creati
   await allocationDesk.locator("select").nth(1).selectOption("pf-live-client");
 
   await page.getByRole("button", { name: "Appeler et vérifier le compte" }).click();
-  await expect(page.getByText("Total compte").first()).toBeVisible();
+  await expect(page.getByText("Valeur plateforme équivalente").first()).toBeVisible();
   await expect(page.getByText("USDT").first()).toBeVisible();
 
   await allocationDesk.locator('input[placeholder="allocation_weight"]').fill("0.8");

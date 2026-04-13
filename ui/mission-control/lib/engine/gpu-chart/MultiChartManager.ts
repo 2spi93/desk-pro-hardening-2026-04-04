@@ -1,16 +1,28 @@
 import { CandleLayer } from "./CandleLayer";
 import { GridLayer } from "./GridLayer";
-import { OverlayLayer } from "./OverlayLayer";
+import { HeatmapHistoryLayer } from "./HeatmapHistoryLayer";
+import { OverlayLayer, type OverlayHeatmapLevel } from "./OverlayLayer";
+import { PriceSignalLayer, type PriceSignalBand } from "./PriceSignalLayer";
+import { TradeBubbleLayer, type TradeBubblePoint } from "./TradeBubbleLayer";
+import { resolvePerceptualRange } from "./chartPerceptualDominance";
 import type { OhlcBar } from "./sharedBuffer";
+import type { DomHistoryFrame } from "../../domHistoryBuffer";
 
 export type ChartViewport = {
   id: string;
+  symbol?: string;
   x: number;
   y: number;
   width: number;
   height: number;
   candles: OhlcBar[];
+  renderCandles?: boolean;
+  heatmapLevels?: OverlayHeatmapLevel[];
+  domHistory?: DomHistoryFrame[];
+  tradeBubbles?: TradeBubblePoint[];
+  priceSignalBands?: PriceSignalBand[];
   overlayAlpha: number;
+  overlayHeatIntensity: number;
   overlayDiscardThreshold: number;
   gridAlpha: number;
   gridVerticalLines: number;
@@ -21,7 +33,10 @@ export class MultiChartManager {
   private gl: WebGL2RenderingContext;
   private candleLayer: CandleLayer;
   private gridLayer: GridLayer;
+  private heatmapHistoryLayer: HeatmapHistoryLayer;
   private overlayLayer: OverlayLayer;
+  private tradeBubbleLayer: TradeBubbleLayer;
+  private priceSignalLayer: PriceSignalLayer;
   private viewports: ChartViewport[] = [];
   private _drawCallCount = 0;
   private _lastBatchSize = 0;
@@ -37,13 +52,19 @@ export class MultiChartManager {
     this.gl = gl;
     this.candleLayer = new CandleLayer(gl);
     this.gridLayer = new GridLayer(gl);
+    this.heatmapHistoryLayer = new HeatmapHistoryLayer(gl);
     this.overlayLayer = new OverlayLayer(gl);
+    this.tradeBubbleLayer = new TradeBubbleLayer(gl);
+    this.priceSignalLayer = new PriceSignalLayer(gl);
   }
 
   dispose(): void {
     this.candleLayer.dispose();
     this.gridLayer.dispose();
+    this.heatmapHistoryLayer.dispose();
     this.overlayLayer.dispose();
+    this.tradeBubbleLayer.dispose();
+    this.priceSignalLayer.dispose();
   }
 
   setViewports(viewports: ChartViewport[]): void {
@@ -93,17 +114,39 @@ export class MultiChartManager {
       });
       this._drawCallCount += 1;
 
-      gl.disable(gl.BLEND);
-      this.candleLayer.draw(viewport.id, viewport.candles, {
-        allowUpload: uploadSet.has(viewport.id),
-        frameTimeMs,
-        smoothingMs: this.lastBarSmoothingMs,
-        canvasWidth: gl.canvas.width,
-        canvasHeight: gl.canvas.height,
-      });
-      this._drawCallCount += 1;
-      if (viewport.candles.length > this._lastBatchSize) {
-        this._lastBatchSize = viewport.candles.length;
+      const range = resolvePerceptualRange(viewport.candles, viewport.candles.length);
+      const minTime = viewport.candles[0]?.time ?? 0;
+      const maxTime = viewport.candles[viewport.candles.length - 1]?.time ?? minTime;
+
+      if ((viewport.domHistory || []).length > 0 && maxTime > minTime) {
+        gl.enable(gl.BLEND);
+        gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+        this.heatmapHistoryLayer.draw({
+          historyFrames: viewport.domHistory || [],
+          alpha: Math.min(0.34, viewport.overlayAlpha * 1.25),
+          heatIntensity: viewport.overlayHeatIntensity,
+          discardThreshold: viewport.overlayDiscardThreshold * 0.82,
+          minPrice: range.minPrice,
+          maxPrice: range.maxPrice,
+          minTime,
+          maxTime,
+        });
+        this._drawCallCount += 1;
+      }
+
+      if (viewport.renderCandles !== false) {
+        gl.disable(gl.BLEND);
+        this.candleLayer.draw(viewport.id, viewport.candles, {
+          allowUpload: uploadSet.has(viewport.id),
+          frameTimeMs,
+          smoothingMs: this.lastBarSmoothingMs,
+          canvasWidth: gl.canvas.width,
+          canvasHeight: gl.canvas.height,
+        });
+        this._drawCallCount += 1;
+        if (viewport.candles.length > this._lastBatchSize) {
+          this._lastBatchSize = viewport.candles.length;
+        }
       }
 
       // Stagger: initialise first-draw time for each viewport so they are
@@ -117,19 +160,50 @@ export class MultiChartManager {
           ? this.overlayLastDrawMs.get(viewport.id)!
           : defaultLastMs;
         if (frameTimeMs - lastOverlayMs >= this.overlayIntervalMs) {
-          const last = viewport.candles[viewport.candles.length - 1];
-          const focusY = resolveFocusY(viewport.candles, last?.close ?? 0);
           gl.enable(gl.BLEND);
           gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-          this.overlayLayer.draw(
-            frameTimeMs,
-            viewport.overlayAlpha,
-            focusY,
-            viewport.overlayDiscardThreshold,
-          );
-          this._drawCallCount += 1;
-          this.overlayLastDrawMs.set(viewport.id, frameTimeMs);
+          this.overlayLayer.draw({
+            viewportId: viewport.id,
+            alpha: viewport.overlayAlpha,
+            heatIntensity: viewport.overlayHeatIntensity,
+            discardThreshold: viewport.overlayDiscardThreshold,
+            heatmapLevels: viewport.heatmapLevels || [],
+            minPrice: range.minPrice,
+            maxPrice: range.maxPrice,
+          });
+          if ((viewport.heatmapLevels || []).length > 0) {
+            this._drawCallCount += 1;
+            this.overlayLastDrawMs.set(viewport.id, frameTimeMs);
+          }
         }
+      }
+
+      if ((viewport.tradeBubbles || []).length > 0 && maxTime > minTime) {
+        gl.enable(gl.BLEND);
+        gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+        this.tradeBubbleLayer.draw({
+          bubbles: viewport.tradeBubbles || [],
+          alpha: Math.min(0.9, viewport.overlayAlpha * 3.8),
+          minPrice: range.minPrice,
+          maxPrice: range.maxPrice,
+          minTime,
+          maxTime,
+          viewportWidth: viewport.width,
+          viewportHeight: viewport.height,
+        });
+        this._drawCallCount += 1;
+      }
+
+      if ((viewport.priceSignalBands || []).length > 0) {
+        gl.enable(gl.BLEND);
+        gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+        this.priceSignalLayer.draw({
+          signals: viewport.priceSignalBands || [],
+          alpha: Math.min(0.92, viewport.overlayAlpha * 4.8),
+          minPrice: range.minPrice,
+          maxPrice: range.maxPrice,
+        });
+        this._drawCallCount += 1;
       }
     }
 
@@ -198,23 +272,4 @@ export class MultiChartManager {
     this.uploadCursor = (this.uploadCursor + Math.max(1, slots)) % Math.max(1, count);
     return selected;
   }
-}
-
-function resolveFocusY(candles: OhlcBar[], lastClose: number): number {
-  if (candles.length === 0) {
-    return 0.5;
-  }
-
-  let minPrice = Number.POSITIVE_INFINITY;
-  let maxPrice = Number.NEGATIVE_INFINITY;
-  for (const candle of candles) {
-    minPrice = Math.min(minPrice, candle.low, candle.open, candle.close);
-    maxPrice = Math.max(maxPrice, candle.high, candle.open, candle.close);
-  }
-
-  if (!Number.isFinite(minPrice) || !Number.isFinite(maxPrice) || minPrice === maxPrice) {
-    return 0.5;
-  }
-
-  return Math.min(1, Math.max(0, (lastClose - minPrice) / Math.max(1e-6, maxPrice - minPrice)));
 }

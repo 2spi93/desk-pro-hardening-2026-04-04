@@ -1,3 +1,25 @@
+export type GpuVisualMetadata = {
+  intensity?: number;
+  wickBoost?: number;
+  opacity?: number;
+  wickWidth?: number;
+  bodyBoost?: number;
+  wickOpacity?: number;
+  importance?: number;
+  wickType?: "absorption" | "rejection" | "neutral";
+  lastCandleEmphasis?: number;
+  footprintSignal?: "absorption" | "stacked-imbalance" | "exhaustion" | "neutral";
+  footprintBias?: number;
+  footprintHeat?: number;
+  liquidityScore?: number;
+  timeframeHint?: string;
+  absorptionScore?: number;
+  qualityScore?: number;
+  candleRole?: "noise" | "context" | "trigger";
+  noiseClass?: "noise" | "weak" | "valid";
+  microstructureNoise?: number;
+};
+
 export type OhlcBar = {
   time: number;
   open: number;
@@ -5,6 +27,7 @@ export type OhlcBar = {
   low: number;
   close: number;
   volume?: number;
+  __visual?: GpuVisualMetadata;
 };
 
 export type SharedOhlcBuffer = {

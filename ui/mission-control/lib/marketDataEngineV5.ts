@@ -30,13 +30,14 @@ import {
   type VenueTick,
   type TradeInput,
 } from "./marketDataEngineV4";
-import { CandleEngineV5, type TradeForCandle, type GapRange } from "./candleEngineV5";
+import { CandleEngineV5, type TradeForCandle, type GapRange, type CandleAuditResult } from "./candleEngineV5";
 import type { NormalizedOhlcvBar } from "./ohlcvIntegrity";
-import { aggregateBarsToTimeframe, canDeriveTimeframe, normalizeTimeframe, SUPPORTED_TIMEFRAMES } from "./ohlcvDataEngine";
+import { aggregateBarsToTimeframe, canDeriveTimeframe, normalizeTimeframe, SUPPORTED_TIMEFRAMES, timeframeToMs } from "./ohlcvDataEngine";
+import { buildSyncedFrame, type SyncedMarketFrame } from "./syncedMarketFrame";
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
-export type { GapRange };
+export type { GapRange, CandleAuditResult, SyncedMarketFrame };
 
 export type BootstrapInput = {
   ohlcvBars: NormalizedOhlcvBar[];
@@ -135,6 +136,10 @@ export class MarketDataEngineV5 {
     if (timeframe === this.timeframe) {
       this.lastGaps = runtime.lastGaps;
     }
+  }
+
+  private isMicroTradeOnlyTimeframe(timeframe: string): boolean {
+    return timeframeToMs(normalizeTimeframe(timeframe)) <= 5_000;
   }
 
   private mergedSeriesFor(timeframe: string): NormalizedOhlcvBar[] {
@@ -253,7 +258,9 @@ export class MarketDataEngineV5 {
         continue;
       }
       const runtime = this.ensureRuntime(timeframe);
-      const aggregated = aggregateBarsToTimeframe(activeRuntime.v3.getSeries(), timeframe);
+      // Use tick-reconstructed merged series as HTF source (not raw V3-only backfill).
+      // Critical: ensures 1m candle micro-structure is preserved when building 5m/15m/etc.
+      const aggregated = aggregateBarsToTimeframe(this.mergedSeriesFor(this.timeframe), timeframe);
       runtime.v3.reset();
       runtime.v3.ingestSnapshot(aggregated);
     }
@@ -298,7 +305,9 @@ export class MarketDataEngineV5 {
     this.v4.ingestTick(v4tick);
     let activeChanged = false;
     for (const [timeframe, runtime] of this.runtimes.entries()) {
-      const v3Changed = runtime.v3.ingestTick(price, tsMs);
+      const v3Changed = this.isMicroTradeOnlyTimeframe(timeframe)
+        ? false
+        : runtime.v3.ingestTick(price, tsMs);
       const tradeChanged = runtime.candleEngine.ingestPriceTick(price, tsMs);
       if (timeframe === this.timeframe) {
         activeChanged = v3Changed || tradeChanged;
@@ -461,6 +470,37 @@ export class MarketDataEngineV5 {
       timeframeCount: this.runtimes.size,
       activeTimeframe: this.timeframe,
     };
+  }
+
+  // ── Synced Frame ──────────────────────────────────────────────────────────────
+
+  /**
+   * Returns an atomic frame tying the current candle, DOM depth and footprint delta
+   * to the same UTC-aligned timestamp.  Callers may supply raw depth rows from an
+   * external orderbook snapshot; if omitted the V4 microstructure best-level is used.
+   */
+  getSyncedFrame(bidsRaw?: DepthRow[], asksRaw?: DepthRow[]): SyncedMarketFrame {
+    const candle = this.getCurrentBar();
+    const micro = this.v4.getSnapshot();
+    const runtime = this.ensureRuntime(this.timeframe);
+    const series = this.getSeries();
+    const auditResult: CandleAuditResult = runtime.candleEngine.audit(series);
+
+    const effectiveBids: DepthRow[] = bidsRaw ?? (micro.bestBid > 0 ? [[micro.bestBid, micro.bidVolume]] : []);
+    const effectiveAsks: DepthRow[] = asksRaw ?? (micro.bestAsk > 0 ? [[micro.bestAsk, micro.askVolume]] : []);
+
+    return buildSyncedFrame(
+      candle,
+      effectiveBids,
+      effectiveAsks,
+      micro.cvdDelta,
+      runtime.candleEngine.getCandleCount() > 0,
+      {
+        wickConsistency: auditResult.wickConsistency,
+        tfAlignmentScore: auditResult.tfAlignmentScore,
+        gapCount: auditResult.gapCount,
+      },
+    );
   }
 
   // ── Reset ──────────────────────────────────────────────────────────────────────
