@@ -168,9 +168,11 @@ warmup_slot_snapshots() {
   docker exec "$service" sh -lc "
 set -eu
 base=\"http://127.0.0.1:${port}\"
-wget -qO- \"\$base/api/system/canonical-spine?fresh=1\" >/dev/null
-wget -qO- \"\$base/api/runtime/truth?fresh=1\" >/dev/null
-wget -qO- \"\$base/api/system/live-ops\" >/dev/null
+probe_token=\"\${CONTROLLED_LIVE_GATE_AUTH_TOKEN:-\${MC_OPERATOR_PROBE_TOKEN:-\${CONTROL_PLANE_INTERNAL_TOKEN:-\${CONTROL_PLANE_TOKEN:-}}}}\"
+auth_header=\"Authorization: Bearer \$probe_token\"
+wget -qO- --header \"\$auth_header\" \"\$base/api/system/canonical-spine?fresh=1\" >/dev/null
+wget -qO- --header \"\$auth_header\" \"\$base/api/runtime/truth?fresh=1\" >/dev/null
+wget -qO- --header \"\$auth_header\" \"\$base/api/system/live-ops\" >/dev/null
 "
   printf '[blue-green] snapshots warm for slot=%s\n' "$slot"
 }

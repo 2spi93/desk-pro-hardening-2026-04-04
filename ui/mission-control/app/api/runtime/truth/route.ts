@@ -6,7 +6,7 @@ import { buildRuntimeTruthSnapshot } from "../../../../lib/runtimeTruth";
 export const dynamic = "force-dynamic";
 
 export async function GET(request: NextRequest): Promise<NextResponse> {
-  const authError = await requireControlPlaneSession();
+  const authError = await requireControlPlaneSession(request, { allowServiceProbe: true });
   if (authError) {
     return authError;
   }
