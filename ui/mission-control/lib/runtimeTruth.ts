@@ -398,7 +398,11 @@ function deriveVerdict(input: {
   const reliabilityState = String(input.runtimeDecision?.reliability?.state || "").trim();
   const liveState = String(input.runtimeDecision?.opportunity?.liveState || "").trim();
   if (reliabilityState && reliabilityState !== "RELIABLE") {
-    if (input.runtimeReliabilityBlocked) {
+    // While the kill switch is latched the system cannot accumulate
+    // observation hours or journal entries, so BLOCKED_BY_DATA is a
+    // consequence of the halt, not an independent failure: report it as
+    // degradation instead of a blocker to keep reset eligibility decidable.
+    if (input.runtimeReliabilityBlocked && !input.killSwitchActive) {
       blockers.push(`runtime_reliability:${reliabilityState}`);
     } else {
       degradedReasons.push(`runtime_reliability:${reliabilityState}`);
