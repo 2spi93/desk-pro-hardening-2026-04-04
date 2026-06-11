@@ -30,7 +30,7 @@ export type ReplayCertificationArtifact = {
 };
 
 export type ControlledLiveRampGateReport = {
-  schema_version: "controlled-live-ramp-gate/v1.7";
+  schema_version: "controlled-live-ramp-gate/v1.9";
   generated_at_iso: string;
   context: ControlledLiveRampGateContext;
   controlled_live_ramp_gate: {
@@ -153,9 +153,20 @@ export type ControlledLiveRampGateReport = {
     publisher: {
       status: "online" | "stale" | "unknown";
       stream: string | null;
+      producer_id: string | null;
       last_heartbeat_at: string | null;
       last_event_id: string | null;
       event_lag_ms: number | null;
+    };
+    live_observation: {
+      status: "online" | "degraded" | "unavailable" | "unknown";
+      source: string | null;
+      opportunity_gate_status: string | null;
+      valid_observation: boolean | null;
+      bus_seq: number | null;
+      updated_at: string | null;
+      freshness_ms: number | null;
+      flags: string[];
     };
     consumer: {
       status: "online" | "stale" | "unknown" | "unavailable";
@@ -168,8 +179,31 @@ export type ControlledLiveRampGateReport = {
       url: string | null;
       ping_ms: number | null;
       streams_checked: string[];
+      streams: Array<{
+        name: string;
+        length: number | null;
+        groups: number | null;
+        last_generated_id: string | null;
+        error: string | null;
+      }>;
       errors: string[];
     };
+    repair_hint: string | null;
+  };
+  legacy_watchdog_reconciliation: {
+    schema_version: "legacy-watchdog-reconciliation/v1";
+    stream: "txt.watchdog";
+    expected_publisher: string | null;
+    writer_process_detected: boolean | null;
+    publisher_last_seen_at: string | null;
+    redis_stream_status: "fresh" | "stale" | "missing" | "unreachable" | "unknown";
+    redis_groups: number | null;
+    redis_last_generated_id: string | null;
+    live_observation_status: "online" | "degraded" | "unavailable" | "unknown";
+    consumer_mode: "consumer_group_present" | "no_consumer_group_configured" | "unknown";
+    reconciliation_mode: "required" | "superseded" | "not_required";
+    decision: "recover_legacy_publisher_or_formally_supersede" | "legacy_publisher_recovered" | "redis_transport_unreachable";
+    blocks_reset: boolean;
     repair_hint: string | null;
   };
   runtime_truth_matrix: {
@@ -231,12 +265,22 @@ type RedisStreamEntry = {
   fields: JsonMap;
 };
 
+type RedisStreamInfo = {
+  name: string;
+  length: number | null;
+  groups: number | null;
+  last_generated_id: string | null;
+  error: string | null;
+};
+
 type RedisBusProbe = {
   transport_status: "online" | "offline" | "unknown";
   url: string | null;
   ping_ms: number | null;
   streams_checked: string[];
+  stream_info: RedisStreamInfo[];
   errors: string[];
+  entries: RedisStreamEntry[];
   latest_entry: RedisStreamEntry | null;
 };
 
@@ -950,6 +994,33 @@ function redisEntryFromResp(stream: string, value: unknown): RedisStreamEntry | 
   return { stream, id, fields };
 }
 
+function redisStreamInfoFromResp(stream: string, value: unknown): RedisStreamInfo {
+  const info: RedisStreamInfo = {
+    name: stream,
+    length: null,
+    groups: null,
+    last_generated_id: null,
+    error: null,
+  };
+  if (!Array.isArray(value)) {
+    return info;
+  }
+  for (let index = 0; index + 1 < value.length; index += 2) {
+    const key = String(value[index] || "").trim().toLowerCase();
+    const raw = value[index + 1];
+    if (key === "length") {
+      const numeric = Number(raw);
+      info.length = Number.isFinite(numeric) ? numeric : null;
+    } else if (key === "groups") {
+      const numeric = Number(raw);
+      info.groups = Number.isFinite(numeric) ? numeric : null;
+    } else if (key === "last-generated-id") {
+      info.last_generated_id = String(raw || "").trim() || null;
+    }
+  }
+  return info;
+}
+
 async function probeRedisBus(): Promise<RedisBusProbe> {
   const url = resolveRuntimeRedisUrl();
   const streams = ["txt.runtime", "txt.watchdog", "txt.execution", "txt.observations"];
@@ -963,25 +1034,46 @@ async function probeRedisBus(): Promise<RedisBusProbe> {
       url,
       ping_ms: null,
       streams_checked: streams,
+      stream_info: streams.map((stream) => ({
+        name: stream,
+        length: null,
+        groups: null,
+        last_generated_id: null,
+        error: error instanceof Error ? error.message : String(error || "redis_ping_failed"),
+      })),
       errors: [error instanceof Error ? error.message : String(error || "redis_ping_failed")],
+      entries: [],
       latest_entry: null,
     };
   }
 
   let latestEntry: RedisStreamEntry | null = null;
+  const entries: RedisStreamEntry[] = [];
+  const streamInfo: RedisStreamInfo[] = [];
   for (const stream of streams) {
     try {
       const entry = redisEntryFromResp(stream, await redisCommand(["XREVRANGE", stream, "+", "-", "COUNT", "1"]));
       if (!entry) {
+        streamInfo.push(redisStreamInfoFromResp(stream, await redisCommand(["XINFO", "STREAM", stream])));
         continue;
       }
+      entries.push(entry);
       const entryMs = parseIsoMs(String(entry.fields.emitted_at || entry.fields.as_of || entry.fields.timestamp || ""));
       const latestMs = latestEntry ? parseIsoMs(String(latestEntry.fields.emitted_at || latestEntry.fields.as_of || latestEntry.fields.timestamp || "")) : null;
       if (!latestEntry || (entryMs !== null && (latestMs === null || entryMs > latestMs))) {
         latestEntry = entry;
       }
+      streamInfo.push(redisStreamInfoFromResp(stream, await redisCommand(["XINFO", "STREAM", stream])));
     } catch (error) {
-      errors.push(`${stream}:${error instanceof Error ? error.message : String(error || "stream_probe_failed")}`);
+      const detail = error instanceof Error ? error.message : String(error || "stream_probe_failed");
+      errors.push(`${stream}:${detail}`);
+      streamInfo.push({
+        name: stream,
+        length: null,
+        groups: null,
+        last_generated_id: null,
+        error: detail,
+      });
     }
   }
 
@@ -990,7 +1082,9 @@ async function probeRedisBus(): Promise<RedisBusProbe> {
     url,
     ping_ms: Math.max(0, Date.now() - startedAt),
     streams_checked: streams,
+    stream_info: streamInfo,
     errors,
+    entries,
     latest_entry: latestEntry,
   };
 }
@@ -1365,9 +1459,20 @@ async function buildBusHealthDiagnostic(
       publisher: {
         status: "unknown",
         stream: null,
+        producer_id: null,
         last_heartbeat_at: null,
         last_event_id: null,
         event_lag_ms: null,
+      },
+      live_observation: {
+        status: "unknown",
+        source: null,
+        opportunity_gate_status: null,
+        valid_observation: null,
+        bus_seq: null,
+        updated_at: null,
+        freshness_ms: null,
+        flags: [],
       },
       consumer: {
         status: "unknown",
@@ -1380,6 +1485,7 @@ async function buildBusHealthDiagnostic(
         url: null,
         ping_ms: null,
         streams_checked: [],
+        streams: [],
         errors: [],
       },
       repair_hint: null,
@@ -1391,14 +1497,20 @@ async function buildBusHealthDiagnostic(
   const raw = asRecord(runtimeTruthRecord.raw);
   const network = asRecord(raw.network);
   const killSwitchNetwork = asRecord(network.kill_switch);
+  const rawOpportunityGate = asRecord(raw.opportunity_gate);
+  const opportunityGate = asRecord(rawOpportunityGate.gate || rawOpportunityGate);
+  const opportunityMetrics = asRecord(opportunityGate.metrics);
   const health = asRecord(layers.health);
+  const routing = asRecord(layers.routing);
   const readiness = asRecord(layers.readiness);
   const controlled = asRecord(raw.controlled_collection);
   const expectedBaseUrl = configuredControlPlaneBaseUrl();
   const checkedUrl = `${expectedBaseUrl.replace(/\/+$/, "")}/v1/system/kill-switch`;
   const generatedAt = pickString(runtimeTruthRecord, ["generated_at", "generated_at_iso"]);
-  const redisLastEventAt = redisBus.latest_entry
-    ? String(redisBus.latest_entry.fields.emitted_at || redisBus.latest_entry.fields.as_of || redisBus.latest_entry.fields.timestamp || "").trim() || null
+  const watchdogEntry = redisBus.entries.find((entry) => entry.stream === "txt.watchdog") || null;
+  const publisherEntry = watchdogEntry || redisBus.latest_entry;
+  const redisLastEventAt = publisherEntry
+    ? String(publisherEntry.fields.emitted_at || publisherEntry.fields.as_of || publisherEntry.fields.timestamp || "").trim() || null
     : null;
   const lastEventAt = redisLastEventAt || pickString(controlled, ["lastSnapshotAt", "latestFillAt", "latestLabeledAt", "openedAt"]);
   const lastEventMs = parseIsoMs(lastEventAt);
@@ -1406,7 +1518,26 @@ async function buildBusHealthDiagnostic(
   const reason = String(health.kill_switch_reason || "").trim();
   const liveState = String(readiness.live_state || "").trim().toUpperCase();
   const reliability = String(readiness.runtime_reliability || "").trim().toUpperCase();
-  const publisherStatus: ControlledLiveRampGateReport["bus_health"]["publisher"]["status"] = redisBus.latest_entry && eventLagMs !== null
+  const opportunityStatus = String(opportunityGate.status || routing.status || "").trim().toLowerCase() || null;
+  const opportunityFlags = asStringArray(opportunityMetrics.flags).map((item) => item.toUpperCase());
+  const opportunityValidObservation = typeof opportunityGate.valid_observation === "boolean"
+    ? Boolean(opportunityGate.valid_observation)
+    : null;
+  const opportunityBusSeq = Number.isFinite(Number(opportunityMetrics.bus_seq)) ? Number(opportunityMetrics.bus_seq) : null;
+  const opportunityFreshnessMs = Number.isFinite(Number(opportunityMetrics.freshness_ms)) ? Number(opportunityMetrics.freshness_ms) : null;
+  const opportunityUpdatedAt = pickString(opportunityGate, ["updated_at", "evaluated_at"]);
+  const liveObservationOnline = opportunityStatus === "go"
+    && opportunityValidObservation !== false
+    && opportunityBusSeq !== null
+    && opportunityBusSeq > 0
+    && !opportunityFlags.includes("BUS_OFFLINE")
+    && !opportunityFlags.includes("OBSERVATION_ERROR");
+  const liveObservationStatus: ControlledLiveRampGateReport["bus_health"]["live_observation"]["status"] = liveObservationOnline
+    ? "online"
+    : opportunityStatus || opportunityBusSeq !== null || opportunityUpdatedAt
+      ? "degraded"
+      : "unavailable";
+  const publisherStatus: ControlledLiveRampGateReport["bus_health"]["publisher"]["status"] = publisherEntry && eventLagMs !== null
     ? eventLagMs > 10 * 60 * 1000 ? "stale" : "online"
     : "unknown";
   const consumerSource = String(controlled.killSwitchSource || liveState || "unknown").trim() || "unknown";
@@ -1417,6 +1548,8 @@ async function buildBusHealthDiagnostic(
       : "unknown";
   const status: ControlledLiveRampGateReport["bus_health"]["status"] = redisBus.transport_status === "offline"
     ? "offline"
+    : liveObservationOnline && publisherStatus === "stale"
+      ? "degraded"
     : publisherStatus === "stale"
       ? "offline"
       : reason === "BUS_OFFLINE"
@@ -1431,6 +1564,8 @@ async function buildBusHealthDiagnostic(
     ? null
     : redisBus.transport_status === "offline"
       ? "verify_runtime_redis_transport"
+      : liveObservationOnline && publisherStatus === "stale"
+        ? "reconcile_runtime_redis_stream_publisher"
       : publisherStatus === "stale"
         ? "restart_or_reconcile_runtime_bus_publishers"
         : "verify_event_bus_publishers_and_consumers";
@@ -1449,10 +1584,21 @@ async function buildBusHealthDiagnostic(
     consumer_status: consumerStatus,
     publisher: {
       status: publisherStatus,
-      stream: redisBus.latest_entry?.stream || null,
+      stream: publisherEntry?.stream || null,
+      producer_id: publisherEntry ? String(publisherEntry.fields.producer_id || "").trim() || null : null,
       last_heartbeat_at: lastEventAt,
-      last_event_id: redisBus.latest_entry?.id || null,
+      last_event_id: publisherEntry?.id || null,
       event_lag_ms: eventLagMs,
+    },
+    live_observation: {
+      status: liveObservationStatus,
+      source: String(opportunityGate.source || "execution-router/health").trim() || null,
+      opportunity_gate_status: opportunityStatus,
+      valid_observation: opportunityValidObservation,
+      bus_seq: opportunityBusSeq,
+      updated_at: opportunityUpdatedAt,
+      freshness_ms: opportunityFreshnessMs,
+      flags: opportunityFlags,
     },
     consumer: {
       status: consumerStatus,
@@ -1465,9 +1611,56 @@ async function buildBusHealthDiagnostic(
       url: redisBus.url,
       ping_ms: redisBus.ping_ms,
       streams_checked: redisBus.streams_checked,
+      streams: redisBus.stream_info,
       errors: redisBus.errors,
     },
     repair_hint: repairHint,
+  };
+}
+
+function buildLegacyWatchdogReconciliation(
+  context: ControlledLiveRampGateContext,
+  busHealth: ControlledLiveRampGateReport["bus_health"],
+): ControlledLiveRampGateReport["legacy_watchdog_reconciliation"] {
+  const watchdogStream = busHealth.transport.streams.find((stream) => stream.name === "txt.watchdog") || null;
+  const publisherStatus = busHealth.publisher.status;
+  const transportStatus = busHealth.transport.status;
+  const liveObservationStatus = busHealth.live_observation.status;
+  const redisStreamStatus: ControlledLiveRampGateReport["legacy_watchdog_reconciliation"]["redis_stream_status"] = transportStatus === "offline"
+    ? "unreachable"
+    : !watchdogStream || watchdogStream.error
+      ? "unknown"
+      : publisherStatus === "online"
+        ? "fresh"
+        : publisherStatus === "stale"
+          ? "stale"
+          : "unknown";
+  const consumerMode: ControlledLiveRampGateReport["legacy_watchdog_reconciliation"]["consumer_mode"] = typeof watchdogStream?.groups === "number"
+    ? watchdogStream.groups > 0 ? "consumer_group_present" : "no_consumer_group_configured"
+    : "unknown";
+  const decision: ControlledLiveRampGateReport["legacy_watchdog_reconciliation"]["decision"] = transportStatus === "offline"
+    ? "redis_transport_unreachable"
+    : publisherStatus === "online"
+      ? "legacy_publisher_recovered"
+      : "recover_legacy_publisher_or_formally_supersede";
+  const blocksReset = context === "ops" && decision !== "legacy_publisher_recovered";
+  return {
+    schema_version: "legacy-watchdog-reconciliation/v1",
+    stream: "txt.watchdog",
+    expected_publisher: busHealth.publisher.producer_id || "control-plane/runtime-headless",
+    writer_process_detected: publisherStatus === "online" ? true : publisherStatus === "stale" ? false : null,
+    publisher_last_seen_at: busHealth.publisher.last_heartbeat_at,
+    redis_stream_status: redisStreamStatus,
+    redis_groups: watchdogStream?.groups ?? null,
+    redis_last_generated_id: watchdogStream?.last_generated_id || busHealth.publisher.last_event_id,
+    live_observation_status: liveObservationStatus,
+    consumer_mode: consumerMode,
+    reconciliation_mode: decision === "legacy_publisher_recovered" ? "not_required" : "required",
+    decision,
+    blocks_reset: blocksReset,
+    repair_hint: blocksReset
+      ? "recover_legacy_watchdog_publisher_or_formally_supersede_with_live_observation_contract"
+      : null,
   };
 }
 
@@ -1683,6 +1876,7 @@ export async function buildControlledLiveRampGateReport(input: ControlledLiveRam
     degradedRuntimeTruthSources: runtimeTruthSourceDiagnostics.degraded_runtime_truth_sources,
   });
   const busHealth = await buildBusHealthDiagnostic(context, runtimeTruth.snapshot, runtimeTruthGate);
+  const legacyWatchdogReconciliation = buildLegacyWatchdogReconciliation(context, busHealth);
   const killSwitch = buildKillSwitchDiagnostics(
     context,
     runtimeTruth.snapshot,
@@ -1695,12 +1889,17 @@ export async function buildControlledLiveRampGateReport(input: ControlledLiveRam
     publicProbe,
     replayGate,
   );
+  if (context === "ops" && legacyWatchdogReconciliation.blocks_reset && !killSwitch.reset_blockers.includes("legacy_watchdog_reconciliation_required")) {
+    killSwitch.reset_eligible = false;
+    killSwitch.reset_blockers = [...killSwitch.reset_blockers, "legacy_watchdog_reconciliation_required"];
+  }
 
   const blockReasons = [
     ...lifecycleBlockReasons,
     ...(context === "ops" && killSwitch.active ? ["kill_switch_active"] : []),
     ...(context === "ops" && runtimeTruthGate.verdict === "BLOCKED" ? runtimeTruthGate.blockers.map((reason) => `runtime_truth:${reason}`) : []),
     ...(context === "ops" && gatewayPublicHealth.available && gatewayPublicHealth.healthy === false ? [`gateway_public_health:${gatewayPublicHealth.summary}`] : []),
+    ...(context === "ops" && legacyWatchdogReconciliation.blocks_reset ? [`legacy_watchdog_reconciliation:${legacyWatchdogReconciliation.decision}`] : []),
   ];
 
   const opsVerdictUnavailableReasons = context === "ops"
@@ -1758,7 +1957,7 @@ export async function buildControlledLiveRampGateReport(input: ControlledLiveRam
   const allowed = effectiveBlockReasons.length === 0 && (context !== "ops" || opsVerdictAvailable);
 
   return {
-    schema_version: "controlled-live-ramp-gate/v1.7",
+    schema_version: "controlled-live-ramp-gate/v1.9",
     generated_at_iso: input.generatedAtIso || new Date().toISOString(),
     context,
     controlled_live_ramp_gate: {
@@ -1791,6 +1990,7 @@ export async function buildControlledLiveRampGateReport(input: ControlledLiveRam
     settlement_source_context_diff: settlementSourceContextDiff,
     ops_runner_context: opsRunnerContext,
     bus_health: busHealth,
+    legacy_watchdog_reconciliation: legacyWatchdogReconciliation,
     runtime_truth_matrix: runtimeTruthMatrix,
     runtime_source_degradation_map: runtimeSourceDegradationMap,
     new_cycle_cleanliness: {
