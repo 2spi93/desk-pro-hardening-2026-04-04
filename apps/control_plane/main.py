@@ -289,14 +289,38 @@ def _save_opportunity_gate_state(state: dict[str, Any]) -> None:
     )
 
 
+_OBSERVATION_FAILURE_STREAK = 0
+_LAST_GOOD_OBSERVATION: dict[str, Any] | None = None
+_LAST_GOOD_OBSERVATION_AT: datetime | None = None
+
+
+def _execution_router_observation_timeout_sec() -> float:
+    return max(5.0, min(60.0, _env_float("EXECUTION_ROUTER_OBSERVATION_TIMEOUT_SEC", 15.0)))
+
+
+def _bus_offline_grace_sec() -> float:
+    return max(15.0, min(300.0, _env_float("OPPORTUNITY_GATE_BUS_OFFLINE_GRACE_SEC", 60.0)))
+
+
 async def _fetch_execution_router_observation() -> dict[str, Any]:
-    async with httpx.AsyncClient(timeout=5.0) as client:
-        response = await client.get(f"{EXECUTION_ROUTER_URL}/health")
-    if response.status_code >= 400:
-        raise RuntimeError(f"execution_router_health_{response.status_code}")
-    payload = response.json()
-    observation = payload.get("observation") if isinstance(payload, dict) else {}
-    return observation if isinstance(observation, dict) else {}
+    # Single-worker services on this host stall their event loop for up to
+    # ~13s windows; one slow probe must not be read as a dead bus.
+    timeout = _execution_router_observation_timeout_sec()
+    last_exc: Exception | None = None
+    for attempt in range(2):
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.get(f"{EXECUTION_ROUTER_URL}/health")
+            if response.status_code >= 400:
+                raise RuntimeError(f"execution_router_health_{response.status_code}")
+            payload = response.json()
+            observation = payload.get("observation") if isinstance(payload, dict) else {}
+            return observation if isinstance(observation, dict) else {}
+        except Exception as exc:
+            last_exc = exc
+            if attempt == 0:
+                await asyncio.sleep(0.5)
+    raise last_exc if last_exc else RuntimeError("execution_router_observation_failed")
 
 
 def _compute_opportunity_health_score(
@@ -401,24 +425,52 @@ def _evaluate_opportunity_gate(observation: dict[str, Any], *, last_error: str |
 
 
 async def _refresh_opportunity_gate_state() -> dict[str, Any]:
+    global _OBSERVATION_FAILURE_STREAK, _LAST_GOOD_OBSERVATION, _LAST_GOOD_OBSERVATION_AT
     try:
         observation = await _fetch_execution_router_observation()
+        _OBSERVATION_FAILURE_STREAK = 0
+        _LAST_GOOD_OBSERVATION = dict(observation)
+        _LAST_GOOD_OBSERVATION_AT = _now_utc()
         state = _evaluate_opportunity_gate(observation)
     except Exception as exc:
-        fallback_observation = _default_opportunity_gate_state()["metrics"]
-        state = _evaluate_opportunity_gate(
-            {
-                "consistency": fallback_observation.get("consistency"),
-                "candidate_count": fallback_observation.get("candidates"),
-                "deviation_bps": fallback_observation.get("deviation_bps"),
-                "freshness_ms": fallback_observation.get("freshness_ms"),
-                "bus_seq": fallback_observation.get("bus_seq"),
-                "failure_blocking": fallback_observation.get("failure_blocking"),
-                "flags": ["BUS_OFFLINE", "OBSERVATION_ERROR"],
-                "updated_at": None,
-            },
-            last_error=str(exc),
+        _OBSERVATION_FAILURE_STREAK += 1
+        last_good_age_sec = (
+            (_now_utc() - _LAST_GOOD_OBSERVATION_AT).total_seconds()
+            if _LAST_GOOD_OBSERVATION_AT is not None
+            else None
         )
+        if (
+            _LAST_GOOD_OBSERVATION is not None
+            and last_good_age_sec is not None
+            and last_good_age_sec < _bus_offline_grace_sec()
+        ):
+            # Hysteresis: within the grace window a probe failure degrades the
+            # gate (no-go via OBSERVATION_RETRY) without raising the severe
+            # BUS_OFFLINE kill flag for a bus that was just observed alive.
+            degraded_observation = dict(_LAST_GOOD_OBSERVATION)
+            degraded_flags = [str(flag) for flag in (degraded_observation.get("flags") or []) if str(flag)]
+            if "OBSERVATION_RETRY" not in degraded_flags:
+                degraded_flags.append("OBSERVATION_RETRY")
+            degraded_observation["flags"] = degraded_flags
+            state = _evaluate_opportunity_gate(
+                degraded_observation,
+                last_error=f"observation_retry_streak_{_OBSERVATION_FAILURE_STREAK}: {exc}",
+            )
+        else:
+            fallback_observation = _default_opportunity_gate_state()["metrics"]
+            state = _evaluate_opportunity_gate(
+                {
+                    "consistency": fallback_observation.get("consistency"),
+                    "candidate_count": fallback_observation.get("candidates"),
+                    "deviation_bps": fallback_observation.get("deviation_bps"),
+                    "freshness_ms": fallback_observation.get("freshness_ms"),
+                    "bus_seq": fallback_observation.get("bus_seq"),
+                    "failure_blocking": fallback_observation.get("failure_blocking"),
+                    "flags": ["BUS_OFFLINE", "OBSERVATION_ERROR"],
+                    "updated_at": None,
+                },
+                last_error=str(exc),
+            )
 
     if state.get("kill_switch_recommended") and CURRENT_SYSTEM_MODE in {SystemMode.GUARDED_AUTO, SystemMode.MANAGED_LIVE}:
         kill_state = _kill_switch_state()
