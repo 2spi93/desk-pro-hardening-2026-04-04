@@ -68,7 +68,12 @@ const LIVE_OPS_CORE_CP_FETCH_TIMEOUT_MS = 3_500;
 const LIVE_OPS_OPTIONAL_CP_FETCH_TIMEOUT_MS = 1_800;
 const LIVE_OPS_EDGE_OBSERVATION_TIMEOUT_MS = 700;
 const LIVE_OPS_SERVER_TRUTH_TIMEOUT_MS = 1_800;
-const LIVE_OPS_SERVER_PROJECTION_TIMEOUT_MS = 1_500;
+// Projections call control-plane and Postgres; 1.5s turned any contention
+// (ops scans, deploy warmups) into null snapshots that crashed the contract.
+const LIVE_OPS_SERVER_PROJECTION_TIMEOUT_MS = Math.max(
+  1_500,
+  Number(process.env.LIVE_OPS_SERVER_PROJECTION_TIMEOUT_MS || 8_000),
+);
 const LIVE_OPS_SOURCE_TREE_PROVENANCE_TIMEOUT_MS = 700;
 const LIVE_OPS_DIAGNOSTICS_HISTORY_TIMEOUT_MS = 250;
 const LIVE_OPS_UI_CACHE_TTL_MS = Math.max(1_000, Math.min(15_000, toNumber(process.env.LIVE_OPS_UI_CACHE_TTL_MS, 5_000)));
@@ -1267,6 +1272,19 @@ export async function GET(request: Request): Promise<NextResponse> {
     false,
   );
 
+  if (!canonicalSpine || !tradeLifecycleHealth || !hardeningAnalytics30d) {
+    // A projection timed out: answer with an explicit degraded status instead
+    // of letting the payload contract crash on a null snapshot (HTTP 500).
+    const missing = [
+      !canonicalSpine ? "canonical_spine" : null,
+      !tradeLifecycleHealth ? "trade_lifecycle_health" : null,
+      !hardeningAnalytics30d ? "hardening_analytics_30d" : null,
+    ].filter(Boolean);
+    return NextResponse.json(
+      { status: "degraded", reason: "projection_timeout", missing_projections: missing, retry: true },
+      { status: 503, headers: { "Cache-Control": "no-store", "Retry-After": "2" } },
+    );
+  }
   const validatedResponseBody = assertLiveOpsCriticalPayload(responseBody);
   if (shouldUseUiCache) {
     liveOpsUiResponseCache.set(cacheKey, {

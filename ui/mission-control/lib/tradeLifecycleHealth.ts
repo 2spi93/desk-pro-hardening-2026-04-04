@@ -645,6 +645,9 @@ export type TradeLifecycleHealthSnapshot = {
 };
 
 export function assertTradeLifecycleHealthSnapshot(snapshot: TradeLifecycleHealthSnapshot): TradeLifecycleHealthSnapshot {
+  if (!snapshot || typeof snapshot !== "object") {
+    throw new Error("TradeLifecycleHealth snapshot unavailable (projection timed out or failed)");
+  }
   const diagnostics = snapshot.source_diagnostics || { rows_scanned: 0, rows_returned: 0 };
   const numericFields = [
     snapshot.window_days,
