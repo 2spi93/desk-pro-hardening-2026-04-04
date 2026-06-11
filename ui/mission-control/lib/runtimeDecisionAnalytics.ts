@@ -4244,7 +4244,14 @@ function buildDeskRead(summary: RuntimeDecisionAnalyticsSummary): RuntimeDecisio
   };
 }
 
-const RUNTIME_DECISION_ANALYTICS_LOAD_TIMEOUT_MS = 3_500;
+// control-plane runs a single uvicorn worker whose event loop stalls for
+// ~10-13s windows (periodic background reconcile); the telemetry budget must
+// survive one full stall or liveState degrades to NO_DATA_PARTIAL and blocks
+// kill-switch reset eligibility.
+const RUNTIME_DECISION_ANALYTICS_LOAD_TIMEOUT_MS = Math.max(
+  3_500,
+  Number(process.env.RUNTIME_DECISION_ANALYTICS_LOAD_TIMEOUT_MS || 20_000),
+);
 
 async function withRuntimeDecisionTimeout<T>(promise: Promise<T>, timeoutMs: number, fallback: T): Promise<T> {
   let timeoutId: ReturnType<typeof setTimeout> | null = null;
