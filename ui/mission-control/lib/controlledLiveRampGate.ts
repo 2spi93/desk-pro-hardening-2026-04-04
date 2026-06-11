@@ -858,9 +858,18 @@ function buildKillSwitchDiagnostics(
   const nonLatchRuntimeTruthBlockers = runtimeTruthGate.blockers.filter((item) => item !== "kill_switch_active");
   const runtimeTruthReadyForReset = runtimeTruthGate.available
     && (runtimeTruthGate.verdict === "READY" || nonLatchRuntimeTruthBlockers.length === 0);
-  // edge_evidence_truth measures opportunity quality (NO_EDGE on an empty
-  // halted window), not unlatch safety; it gates trade promotion, not reset.
-  const haltInducedDegradedSources = new Set(Boolean(active) ? ["controlled_collection_truth", "edge_evidence_truth"] : []);
+  // While latched: edge_evidence_truth measures opportunity quality (NO_EDGE
+  // on an empty halted window), runtime_reliability_live_state is demoted to
+  // degradation by design (a halted system cannot accumulate observation
+  // hours), and runtime_truth_matrix is a derivative aggregate of the other
+  // sources' degradations. None of them measures unlatch safety; primary
+  // sources (control_plane, execution_truth, settlement, position, decision)
+  // keep their individual veto.
+  const haltInducedDegradedSources = new Set(
+    Boolean(active)
+      ? ["controlled_collection_truth", "edge_evidence_truth", "runtime_reliability_live_state", "runtime_truth_matrix"]
+      : [],
+  );
   const blockingDegradedSources = degradedRuntimeTruthSources.filter((source) => !haltInducedDegradedSources.has(source));
   const resetBlockers = dedupe([
     !Boolean(active) ? "kill_switch_not_active" : null,
