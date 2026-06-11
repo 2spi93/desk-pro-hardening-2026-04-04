@@ -97,7 +97,14 @@ runtimeTruthGlobal.__runtimeTruthInflight__ = runtimeTruthInflight;
 
 const RUNTIME_TRUTH_CP_TIMEOUT_MS = 8_000;
 const RUNTIME_TRUTH_SETTLEMENT_TIMEOUT_MS = Math.max(RUNTIME_TRUTH_CP_TIMEOUT_MS, Math.round(Number(process.env.RUNTIME_TRUTH_SETTLEMENT_TIMEOUT_MS || 45_000)));
-const RUNTIME_TRUTH_ANALYTICS_TIMEOUT_MS = 8_000;
+// Must exceed RUNTIME_DECISION_ANALYTICS_LOAD_TIMEOUT_MS (20s): the inner
+// budget absorbs control-plane event loop stalls and returns real telemetry;
+// if this outer budget fires first, runtime_decision degrades to null and
+// decision_truth goes missing, blocking kill-switch reset eligibility.
+const RUNTIME_TRUTH_ANALYTICS_TIMEOUT_MS = Math.max(
+  8_000,
+  Number(process.env.RUNTIME_TRUTH_ANALYTICS_TIMEOUT_MS || 25_000),
+);
 const RUNTIME_TRUTH_EDGE_EVIDENCE_TIMEOUT_MS = 900;
 const RUNTIME_TRUTH_CACHE_MS = Math.max(5_000, Math.round(Number(process.env.RUNTIME_TRUTH_SNAPSHOT_TTL_MS || 15_000)));
 

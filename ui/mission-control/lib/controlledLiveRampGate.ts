@@ -784,7 +784,7 @@ function buildRuntimeTruthSourceDiagnostics(
   if (!hasKeys(asRecord(raw.edge_evidence))) {
     missing.push("edge_evidence_truth");
   }
-  if (runtimeTruthGate.verdict === "BLOCKED" && runtimeTruthGate.blockers.length > 0) {
+  if (runtimeTruthGate.verdict === "BLOCKED" && runtimeTruthGate.blockers.some((reason) => reason !== "kill_switch_active")) {
     degraded.push("runtime_truth_matrix");
   }
   if (runtimeTruthGate.blockers.some((reason) => reason.includes("BLOCKED_BY_DATA") || reason.includes("NO_DATA_PARTIAL"))) {
@@ -851,15 +851,24 @@ function buildKillSwitchDiagnostics(
   const reason = String(health.kill_switch_reason || killSwitchState.reason || "").trim() || null;
   const lastTransition = String(killSwitchState.activated_at || killSwitchState.updated_at || killSwitchState.last_transition || "").trim() || null;
   const blockedDecisionTotal = toNumber(executionGapDiagnostic.blocked_decision_total, 0);
+  // Reset eligibility asks "is it safe to unlatch?", so conditions that are
+  // pure consequences of the latch itself must not veto it: the latch makes
+  // the runtime truth verdict BLOCKED and keeps controlled collection stale
+  // by design, which would otherwise deadlock the reset forever.
+  const nonLatchRuntimeTruthBlockers = runtimeTruthGate.blockers.filter((item) => item !== "kill_switch_active");
+  const runtimeTruthReadyForReset = runtimeTruthGate.available
+    && (runtimeTruthGate.verdict === "READY" || nonLatchRuntimeTruthBlockers.length === 0);
+  const haltInducedDegradedSources = new Set(Boolean(active) ? ["controlled_collection_truth"] : []);
+  const blockingDegradedSources = degradedRuntimeTruthSources.filter((source) => !haltInducedDegradedSources.has(source));
   const resetBlockers = dedupe([
     !Boolean(active) ? "kill_switch_not_active" : null,
     lifecyclePublishBlocked ? "lifecycle_publish_gate_blocked" : null,
     activeDebtTotal > 0 ? "active_debt_present" : null,
     blockedDecisionTotal > 0 ? "execution_gap_blocked" : null,
     !runtimeTruthGate.available ? "runtime_truth_unavailable" : null,
-    runtimeTruthGate.verdict !== "READY" ? "runtime_truth_not_ready" : null,
+    !runtimeTruthReadyForReset ? "runtime_truth_not_ready" : null,
     ...missingRuntimeTruthSources.map((source) => `${source}_missing`),
-    ...degradedRuntimeTruthSources.map((source) => `${source}_degraded`),
+    ...blockingDegradedSources.map((source) => `${source}_degraded`),
     publicProbe.status !== "pass" ? "public_probe_not_pass" : null,
     !replayGate.available ? "replay_certification_gate_unavailable" : null,
     replayGate.ready === false ? "replay_certification_gate_not_ready" : null,
@@ -869,10 +878,9 @@ function buildKillSwitchDiagnostics(
     && !lifecyclePublishBlocked
     && activeDebtTotal === 0
     && blockedDecisionTotal === 0
-    && runtimeTruthGate.available
-    && runtimeTruthGate.verdict === "READY"
+    && runtimeTruthReadyForReset
     && missingRuntimeTruthSources.length === 0
-    && degradedRuntimeTruthSources.length === 0
+    && blockingDegradedSources.length === 0
     && publicProbe.status === "pass"
     && replayGate.available
     && replayGate.ready !== false
@@ -1585,6 +1593,9 @@ async function buildBusHealthDiagnostic(
     : runtimeTruthGate.blockers.some((item) => item.includes("NO_DATA") || item.includes("BLOCKED_BY_DATA"))
       ? "unverified"
       : runtimeTruthGate.verdict === "READY"
+        || (runtimeTruthGate.verdict === "BLOCKED"
+          && runtimeTruthGate.blockers.length > 0
+          && runtimeTruthGate.blockers.every((item) => item === "kill_switch_active"))
         ? "online"
         : "degraded";
   const verified = status === "online";
