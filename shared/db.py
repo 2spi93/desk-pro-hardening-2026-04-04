@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from contextlib import contextmanager
 from typing import Any, Iterable
@@ -1303,23 +1304,48 @@ def _json_default(value: Any) -> Any:
     return str(value)
 
 
-@contextmanager
-def get_conn():
+_THREAD_CONNECTIONS = threading.local()
+
+
+def _open_connection() -> psycopg.Connection:
     last_error: Exception | None = None
     for _ in range(20):
         try:
-            conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
-            break
+            return psycopg.connect(DATABASE_URL, row_factory=dict_row)
         except Exception as exc:  # pragma: no cover - startup resilience
             last_error = exc
             time.sleep(1)
-    else:
-        raise last_error or RuntimeError("Unable to connect to database")
+    raise last_error or RuntimeError("Unable to connect to database")
 
+
+def _thread_connection() -> psycopg.Connection:
+    conn = getattr(_THREAD_CONNECTIONS, "conn", None)
+    if conn is None or conn.closed:
+        conn = _open_connection()
+        _THREAD_CONNECTIONS.conn = conn
+    return conn
+
+
+@contextmanager
+def get_conn():
+    # One persistent connection per thread: opening a fresh TCP+auth
+    # connection per query stalled the asyncio event loop of every service
+    # importing this module (369 call sites in control-plane alone).
+    conn = _thread_connection()
     try:
         yield conn
-    finally:
-        conn.close()
+        # End the implicit read transaction so the cached connection never
+        # idles in transaction; no-op when the caller already committed.
+        conn.rollback()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            try:
+                conn.close()
+            finally:
+                _THREAD_CONNECTIONS.conn = None
+        raise
 
 
 def ensure_schema() -> None:
