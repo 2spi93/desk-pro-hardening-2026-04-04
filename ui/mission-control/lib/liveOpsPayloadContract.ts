@@ -76,7 +76,7 @@ export function assertLiveOpsCriticalPayload(payload: unknown): LiveOpsCriticalP
   }
   if (
     Object.keys(controlledLiveRampGate).length > 0
-    && !["controlled-live-ramp-gate/v1", "controlled-live-ramp-gate/v1.1", "controlled-live-ramp-gate/v1.2", "controlled-live-ramp-gate/v1.3", "controlled-live-ramp-gate/v1.4", "controlled-live-ramp-gate/v1.5", "controlled-live-ramp-gate/v1.6", "controlled-live-ramp-gate/v1.7", "controlled-live-ramp-gate/v1.8", "controlled-live-ramp-gate/v1.9"].includes(String(controlledLiveRampGate.schema_version || ""))
+    && !["controlled-live-ramp-gate/v1", "controlled-live-ramp-gate/v1.1", "controlled-live-ramp-gate/v1.2", "controlled-live-ramp-gate/v1.3", "controlled-live-ramp-gate/v1.4", "controlled-live-ramp-gate/v1.5", "controlled-live-ramp-gate/v1.6", "controlled-live-ramp-gate/v1.7", "controlled-live-ramp-gate/v1.8", "controlled-live-ramp-gate/v1.9", "controlled-live-ramp-gate/v2.0"].includes(String(controlledLiveRampGate.schema_version || ""))
   ) {
     throw new Error(`LiveOps controlled_live_ramp_gate schema mismatch: ${String(controlledLiveRampGate.schema_version || "missing")}`);
   }

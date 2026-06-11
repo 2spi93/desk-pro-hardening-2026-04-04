@@ -2,6 +2,10 @@ import net from "node:net";
 
 import { readHealthwatchDashboard } from "./healthwatchDashboard";
 import { cpFetchJsonSafe } from "./controlPlane";
+import {
+  LEGACY_WATCHDOG_SUPERSESSION,
+  type LegacyWatchdogSupersessionDeclaration,
+} from "./legacyWatchdogSupersession";
 import { buildRuntimeTruthSnapshot } from "./runtimeTruth";
 import { buildTradeLifecycleHealthSnapshot } from "./tradeLifecycleHealth";
 
@@ -30,7 +34,7 @@ export type ReplayCertificationArtifact = {
 };
 
 export type ControlledLiveRampGateReport = {
-  schema_version: "controlled-live-ramp-gate/v1.9";
+  schema_version: "controlled-live-ramp-gate/v2.0";
   generated_at_iso: string;
   context: ControlledLiveRampGateContext;
   controlled_live_ramp_gate: {
@@ -169,9 +173,10 @@ export type ControlledLiveRampGateReport = {
       flags: string[];
     };
     consumer: {
-      status: "online" | "stale" | "unknown" | "unavailable";
+      status: "online" | "stale" | "unknown" | "unavailable" | "not_required";
       source: string | null;
       last_read_at: string | null;
+      reason: string | null;
     };
     transport: {
       status: "online" | "offline" | "unknown";
@@ -191,7 +196,7 @@ export type ControlledLiveRampGateReport = {
     repair_hint: string | null;
   };
   legacy_watchdog_reconciliation: {
-    schema_version: "legacy-watchdog-reconciliation/v1";
+    schema_version: "legacy-watchdog-reconciliation/v2";
     stream: "txt.watchdog";
     expected_publisher: string | null;
     writer_process_detected: boolean | null;
@@ -202,7 +207,17 @@ export type ControlledLiveRampGateReport = {
     live_observation_status: "online" | "degraded" | "unavailable" | "unknown";
     consumer_mode: "consumer_group_present" | "no_consumer_group_configured" | "unknown";
     reconciliation_mode: "required" | "superseded" | "not_required";
-    decision: "recover_legacy_publisher_or_formally_supersede" | "legacy_publisher_recovered" | "redis_transport_unreachable";
+    decision: "recover_legacy_publisher_or_formally_supersede" | "legacy_publisher_recovered" | "formally_superseded_by_live_observation" | "redis_transport_unreachable";
+    supersession: {
+      schema_version: LegacyWatchdogSupersessionDeclaration["schema_version"];
+      declared: boolean;
+      superseded_by: string;
+      declared_at: string;
+      declared_by: string;
+      reason: string;
+      effective: boolean;
+      ineffective_reasons: string[];
+    } | null;
     blocks_reset: boolean;
     repair_hint: string | null;
   };
@@ -820,6 +835,7 @@ function buildKillSwitchDiagnostics(
   executionGapDiagnostic: JsonMap,
   publicProbe: ControlledLiveRampGateReport["public_probe"],
   replayGate: ControlledLiveRampGateReport["replay_certification_gate"],
+  busHealthVerified: boolean,
 ): ControlledLiveRampGateReport["controlled_live_ramp_gate"]["kill_switch"] {
   if (context !== "ops") {
     return { active: null, reason: null, last_transition: null, reset_eligible: false, reset_blockers: [] };
@@ -847,7 +863,7 @@ function buildKillSwitchDiagnostics(
     publicProbe.status !== "pass" ? "public_probe_not_pass" : null,
     !replayGate.available ? "replay_certification_gate_unavailable" : null,
     replayGate.ready === false ? "replay_certification_gate_not_ready" : null,
-    reason === "BUS_OFFLINE" ? "bus_health_unverified" : null,
+    reason === "BUS_OFFLINE" && !busHealthVerified ? "bus_health_unverified" : null,
   ]);
   const resetEligible = Boolean(active)
     && !lifecyclePublishBlocked
@@ -1478,6 +1494,7 @@ async function buildBusHealthDiagnostic(
         status: "unknown",
         source: null,
         last_read_at: null,
+        reason: null,
       },
       transport: {
         status: "unknown",
@@ -1540,19 +1557,30 @@ async function buildBusHealthDiagnostic(
   const publisherStatus: ControlledLiveRampGateReport["bus_health"]["publisher"]["status"] = publisherEntry && eventLagMs !== null
     ? eventLagMs > 10 * 60 * 1000 ? "stale" : "online"
     : "unknown";
+  // Formal supersession of the legacy txt.watchdog channel: only effective
+  // while its declared conditions hold, and a recovered legacy publisher
+  // always takes precedence over the declaration.
+  const supersessionEffective = LEGACY_WATCHDOG_SUPERSESSION.declared
+    && publisherStatus !== "online"
+    && redisBus.transport_status === "online"
+    && liveObservationOnline;
   const consumerSource = String(controlled.killSwitchSource || liveState || "unknown").trim() || "unknown";
-  const consumerStatus: ControlledLiveRampGateReport["bus_health"]["consumer"]["status"] = consumerSource === "unavailable"
-    ? "unavailable"
-    : ["GO", "LIVE", "READY", "RELIABLE"].includes(consumerSource.toUpperCase())
-      ? "online"
-      : "unknown";
+  const consumerStatus: ControlledLiveRampGateReport["bus_health"]["consumer"]["status"] = supersessionEffective
+    ? "not_required"
+    : consumerSource === "unavailable"
+      ? "unavailable"
+      : ["GO", "LIVE", "READY", "RELIABLE"].includes(consumerSource.toUpperCase())
+        ? "online"
+        : "unknown";
+  const legacyPublisherBlocking = publisherStatus === "stale" && !supersessionEffective;
+  const latchedBusOfflineBlocking = reason === "BUS_OFFLINE" && !supersessionEffective;
   const status: ControlledLiveRampGateReport["bus_health"]["status"] = redisBus.transport_status === "offline"
     ? "offline"
-    : liveObservationOnline && publisherStatus === "stale"
+    : liveObservationOnline && legacyPublisherBlocking
       ? "degraded"
-    : publisherStatus === "stale"
+    : legacyPublisherBlocking
       ? "offline"
-      : reason === "BUS_OFFLINE"
+      : latchedBusOfflineBlocking
     ? "offline"
     : runtimeTruthGate.blockers.some((item) => item.includes("NO_DATA") || item.includes("BLOCKED_BY_DATA"))
       ? "unverified"
@@ -1564,9 +1592,9 @@ async function buildBusHealthDiagnostic(
     ? null
     : redisBus.transport_status === "offline"
       ? "verify_runtime_redis_transport"
-      : liveObservationOnline && publisherStatus === "stale"
+      : liveObservationOnline && legacyPublisherBlocking
         ? "reconcile_runtime_redis_stream_publisher"
-      : publisherStatus === "stale"
+      : legacyPublisherBlocking
         ? "restart_or_reconcile_runtime_bus_publishers"
         : "verify_event_bus_publishers_and_consumers";
   return {
@@ -1604,6 +1632,7 @@ async function buildBusHealthDiagnostic(
       status: consumerStatus,
       source: consumerSource,
       last_read_at: generatedAt,
+      reason: supersessionEffective ? LEGACY_WATCHDOG_SUPERSESSION.reason : null,
     },
     transport: {
       status: redisBus.transport_status,
@@ -1638,14 +1667,25 @@ function buildLegacyWatchdogReconciliation(
   const consumerMode: ControlledLiveRampGateReport["legacy_watchdog_reconciliation"]["consumer_mode"] = typeof watchdogStream?.groups === "number"
     ? watchdogStream.groups > 0 ? "consumer_group_present" : "no_consumer_group_configured"
     : "unknown";
+  const supersessionIneffectiveReasons = dedupe([
+    !LEGACY_WATCHDOG_SUPERSESSION.declared ? "supersession_not_declared" : null,
+    transportStatus !== "online" ? "redis_transport_not_online" : null,
+    liveObservationStatus !== "online" ? "live_observation_not_online" : null,
+    publisherStatus === "online" ? "legacy_publisher_recovered_takes_precedence" : null,
+  ]);
+  const supersessionEffective = supersessionIneffectiveReasons.length === 0;
   const decision: ControlledLiveRampGateReport["legacy_watchdog_reconciliation"]["decision"] = transportStatus === "offline"
     ? "redis_transport_unreachable"
     : publisherStatus === "online"
       ? "legacy_publisher_recovered"
-      : "recover_legacy_publisher_or_formally_supersede";
-  const blocksReset = context === "ops" && decision !== "legacy_publisher_recovered";
+      : supersessionEffective
+        ? "formally_superseded_by_live_observation"
+        : "recover_legacy_publisher_or_formally_supersede";
+  const blocksReset = context === "ops"
+    && decision !== "legacy_publisher_recovered"
+    && decision !== "formally_superseded_by_live_observation";
   return {
-    schema_version: "legacy-watchdog-reconciliation/v1",
+    schema_version: "legacy-watchdog-reconciliation/v2",
     stream: "txt.watchdog",
     expected_publisher: busHealth.publisher.producer_id || "control-plane/runtime-headless",
     writer_process_detected: publisherStatus === "online" ? true : publisherStatus === "stale" ? false : null,
@@ -1655,8 +1695,24 @@ function buildLegacyWatchdogReconciliation(
     redis_last_generated_id: watchdogStream?.last_generated_id || busHealth.publisher.last_event_id,
     live_observation_status: liveObservationStatus,
     consumer_mode: consumerMode,
-    reconciliation_mode: decision === "legacy_publisher_recovered" ? "not_required" : "required",
+    reconciliation_mode: decision === "legacy_publisher_recovered"
+      ? "not_required"
+      : decision === "formally_superseded_by_live_observation"
+        ? "superseded"
+        : "required",
     decision,
+    supersession: LEGACY_WATCHDOG_SUPERSESSION.declared
+      ? {
+        schema_version: LEGACY_WATCHDOG_SUPERSESSION.schema_version,
+        declared: LEGACY_WATCHDOG_SUPERSESSION.declared,
+        superseded_by: LEGACY_WATCHDOG_SUPERSESSION.superseded_by,
+        declared_at: LEGACY_WATCHDOG_SUPERSESSION.declared_at,
+        declared_by: LEGACY_WATCHDOG_SUPERSESSION.declared_by,
+        reason: LEGACY_WATCHDOG_SUPERSESSION.reason,
+        effective: supersessionEffective,
+        ineffective_reasons: supersessionIneffectiveReasons,
+      }
+      : null,
     blocks_reset: blocksReset,
     repair_hint: blocksReset
       ? "recover_legacy_watchdog_publisher_or_formally_supersede_with_live_observation_contract"
@@ -1888,6 +1944,7 @@ export async function buildControlledLiveRampGateReport(input: ControlledLiveRam
     executionGapDiagnostic,
     publicProbe,
     replayGate,
+    busHealth.verified,
   );
   if (context === "ops" && legacyWatchdogReconciliation.blocks_reset && !killSwitch.reset_blockers.includes("legacy_watchdog_reconciliation_required")) {
     killSwitch.reset_eligible = false;
@@ -1957,7 +2014,7 @@ export async function buildControlledLiveRampGateReport(input: ControlledLiveRam
   const allowed = effectiveBlockReasons.length === 0 && (context !== "ops" || opsVerdictAvailable);
 
   return {
-    schema_version: "controlled-live-ramp-gate/v1.9",
+    schema_version: "controlled-live-ramp-gate/v2.0",
     generated_at_iso: input.generatedAtIso || new Date().toISOString(),
     context,
     controlled_live_ramp_gate: {
