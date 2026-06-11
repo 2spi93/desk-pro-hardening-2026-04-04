@@ -51,6 +51,8 @@ ui/mission-control/scripts/*
 !ui/mission-control/scripts/risk-workspace.integration.js
 !ui/mission-control/scripts/run_terminal_*.sh
 !ui/mission-control/scripts/test-*.js
+!ui/mission-control/scripts/scan-*.sh
+!ui/mission-control/scripts/scan-*.ts
 !ui/mission-control/scripts/test-*.sh
 
 # Smoke scripts at root
