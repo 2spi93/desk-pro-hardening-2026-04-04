@@ -14,6 +14,7 @@ from functools import partial
 from pathlib import Path
 import random
 import secrets
+import threading
 import time
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
@@ -103,7 +104,18 @@ VENUE_NATIVE_HISTORY_EVENT_TYPES = {"funding_fee", "realized_pnl", "trading_fee"
 AUDIT_LOG: list[AuditEvent] = []
 PENDING_INTENTS: dict[str, dict] = {}
 OPPORTUNITY_GATE_TASK: asyncio.Task | None = None
-LIVE_POSITION_PROTECTION_TASK: asyncio.Task | None = None
+# V2.2 : la réconciliation protection live tourne dans un thread dédié avec sa propre
+# event loop — ses requêtes psycopg synchrones ne touchent plus la loop principale.
+LIVE_POSITION_PROTECTION_THREAD: threading.Thread | None = None
+LIVE_POSITION_PROTECTION_STOP = threading.Event()
+LIVE_PROTECTION_RECONCILE_METRICS: dict[str, Any] = {
+    "cycles": 0,
+    "errors": 0,
+    "timeouts": 0,
+    "last_cycle_ms": None,
+    "last_success_at": None,
+    "last_error": None,
+}
 OPPORTUNITY_GATE_STATE_CACHE: dict[str, Any] | None = None
 MT5_EXTERNAL_BROKER_STATE_LAST_PULL: dict[str, datetime] = {}
 
@@ -122,6 +134,10 @@ def _opportunity_gate_loop_interval_sec() -> float:
 
 def _live_position_protection_loop_interval_sec() -> float:
     return max(15.0, min(300.0, _env_float("LIVE_POSITION_PROTECTION_RECONCILE_INTERVAL_SEC", 45.0)))
+
+
+def _live_protection_reconcile_timeout_sec() -> float:
+    return max(30.0, min(600.0, _env_float("LIVE_PROTECTION_RECONCILE_TIMEOUT_SEC", 180.0)))
 
 
 def _live_snapshot_stale_after_seconds(provider: str) -> int:
@@ -9587,9 +9603,8 @@ async def _reconcile_live_position_protection(
     }
 
 
-async def _reconcile_live_position_protection_loop() -> None:
-    while True:
-        rows = fetch_all(
+async def _reconcile_live_position_protection_cycle() -> None:
+    rows = fetch_all(
             """
             SELECT
                 ar.account_id,
@@ -9606,32 +9621,62 @@ async def _reconcile_live_position_protection_loop() -> None:
             """,
             (["bingx", "mt5"],),
         )
-        for row in rows:
-            account_id = str(row.get("account_id") or "").strip()
-            connector_type = str(row.get("connector_type") or "").strip().lower()
-            if not account_id or connector_type not in {"bingx", "mt5"}:
-                continue
-            try:
-                if connector_type == "mt5":
-                    mt5_mode = str(row.get("mt5_mode") or "").strip().lower()
-                    mt5_status = str(row.get("mt5_status") or "").strip().lower()
-                    mt5_metadata = row.get("mt5_metadata") if isinstance(row.get("mt5_metadata"), dict) else {}
-                    alias_for = str(mt5_metadata.get("bridge_alias_for") or mt5_metadata.get("alias_of_account_id") or "").strip()
-                    if mt5_mode != "live" or mt5_status not in {"connected", "active", "ready"} or alias_for:
-                        continue
-                    await _sync_mt5_account_state(account_id)
-                else:
-                    await _sync_supported_connector_account_state(account_id, row)
-            except Exception as exc:
-                append_audit(
-                    "live_position_protection_reconcile_failed",
-                    {
-                        "account_id": account_id,
-                        "provider": connector_type,
-                        "detail": str(exc)[:500],
-                    },
-                )
-        await asyncio.sleep(_live_position_protection_loop_interval_sec())
+    for row in rows:
+        account_id = str(row.get("account_id") or "").strip()
+        connector_type = str(row.get("connector_type") or "").strip().lower()
+        if not account_id or connector_type not in {"bingx", "mt5"}:
+            continue
+        try:
+            if connector_type == "mt5":
+                mt5_mode = str(row.get("mt5_mode") or "").strip().lower()
+                mt5_status = str(row.get("mt5_status") or "").strip().lower()
+                mt5_metadata = row.get("mt5_metadata") if isinstance(row.get("mt5_metadata"), dict) else {}
+                alias_for = str(mt5_metadata.get("bridge_alias_for") or mt5_metadata.get("alias_of_account_id") or "").strip()
+                if mt5_mode != "live" or mt5_status not in {"connected", "active", "ready"} or alias_for:
+                    continue
+                await _sync_mt5_account_state(account_id)
+            else:
+                await _sync_supported_connector_account_state(account_id, row)
+        except Exception as exc:
+            append_audit(
+                "live_position_protection_reconcile_failed",
+                {
+                    "account_id": account_id,
+                    "provider": connector_type,
+                    "detail": str(exc)[:500],
+                },
+            )
+
+
+async def _live_position_protection_thread_runner() -> None:
+    while not LIVE_POSITION_PROTECTION_STOP.is_set():
+        started = time.perf_counter()
+        try:
+            await asyncio.wait_for(_reconcile_live_position_protection_cycle(), timeout=_live_protection_reconcile_timeout_sec())
+            LIVE_PROTECTION_RECONCILE_METRICS["cycles"] = int(LIVE_PROTECTION_RECONCILE_METRICS.get("cycles") or 0) + 1
+            LIVE_PROTECTION_RECONCILE_METRICS["last_success_at"] = _now_utc().isoformat()
+            LIVE_PROTECTION_RECONCILE_METRICS["last_error"] = None
+        except asyncio.TimeoutError:
+            LIVE_PROTECTION_RECONCILE_METRICS["timeouts"] = int(LIVE_PROTECTION_RECONCILE_METRICS.get("timeouts") or 0) + 1
+            LIVE_PROTECTION_RECONCILE_METRICS["last_error"] = "cycle_timeout"
+            append_audit(
+                "live_position_protection_reconcile_timeout",
+                {"timeout_sec": _live_protection_reconcile_timeout_sec()},
+            )
+        except Exception as exc:
+            LIVE_PROTECTION_RECONCILE_METRICS["errors"] = int(LIVE_PROTECTION_RECONCILE_METRICS.get("errors") or 0) + 1
+            LIVE_PROTECTION_RECONCILE_METRICS["last_error"] = f"{type(exc).__name__}: {str(exc)[:300]}"
+        finally:
+            LIVE_PROTECTION_RECONCILE_METRICS["last_cycle_ms"] = round((time.perf_counter() - started) * 1000.0, 1)
+        deadline = time.monotonic() + _live_position_protection_loop_interval_sec()
+        while time.monotonic() < deadline and not LIVE_POSITION_PROTECTION_STOP.is_set():
+            await asyncio.sleep(1.0)
+
+
+def _live_position_protection_thread_main() -> None:
+    # Event loop dédiée au thread : le cycle (httpx async + psycopg sync) s'exécute
+    # entièrement ici, jamais sur la loop principale d'uvicorn.
+    asyncio.run(_live_position_protection_thread_runner())
 
 
 def _recent_pending_live_approval_count(account_id: str = "") -> int:
@@ -16916,7 +16961,7 @@ def persist_intent(intent_payload: dict, status: str, risk_decision: RiskDecisio
 
 @app.on_event("startup")
 async def startup() -> None:
-    global CURRENT_SYSTEM_MODE, OPPORTUNITY_GATE_TASK, LIVE_POSITION_PROTECTION_TASK
+    global CURRENT_SYSTEM_MODE, OPPORTUNITY_GATE_TASK, LIVE_POSITION_PROTECTION_THREAD
     ensure_schema()
     await seed_default_users()
     _bootstrap_phase1_registry()
@@ -16936,23 +16981,28 @@ async def startup() -> None:
     _save_micro_live_stage_state(_micro_live_stage_state())
     if OPPORTUNITY_GATE_TASK is None or OPPORTUNITY_GATE_TASK.done():
         OPPORTUNITY_GATE_TASK = asyncio.create_task(_opportunity_gate_loop())
-    if LIVE_POSITION_PROTECTION_TASK is None or LIVE_POSITION_PROTECTION_TASK.done():
-        LIVE_POSITION_PROTECTION_TASK = asyncio.create_task(_reconcile_live_position_protection_loop())
+    if LIVE_POSITION_PROTECTION_THREAD is None or not LIVE_POSITION_PROTECTION_THREAD.is_alive():
+        LIVE_POSITION_PROTECTION_STOP.clear()
+        LIVE_POSITION_PROTECTION_THREAD = threading.Thread(
+            target=_live_position_protection_thread_main,
+            name="live-protection-reconcile",
+            daemon=True,
+        )
+        LIVE_POSITION_PROTECTION_THREAD.start()
 
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
-    global OPPORTUNITY_GATE_TASK, LIVE_POSITION_PROTECTION_TASK
+    global OPPORTUNITY_GATE_TASK, LIVE_POSITION_PROTECTION_THREAD
     if OPPORTUNITY_GATE_TASK is not None:
         OPPORTUNITY_GATE_TASK.cancel()
         with suppress(asyncio.CancelledError):
             await OPPORTUNITY_GATE_TASK
         OPPORTUNITY_GATE_TASK = None
-    if LIVE_POSITION_PROTECTION_TASK is not None:
-        LIVE_POSITION_PROTECTION_TASK.cancel()
-        with suppress(asyncio.CancelledError):
-            await LIVE_POSITION_PROTECTION_TASK
-        LIVE_POSITION_PROTECTION_TASK = None
+    if LIVE_POSITION_PROTECTION_THREAD is not None and LIVE_POSITION_PROTECTION_THREAD.is_alive():
+        LIVE_POSITION_PROTECTION_STOP.set()
+        LIVE_POSITION_PROTECTION_THREAD.join(timeout=5.0)
+        LIVE_POSITION_PROTECTION_THREAD = None
 
 
 async def seed_default_users() -> None:
@@ -17223,6 +17273,12 @@ async def health() -> dict:
         "pending_intents": len(PENDING_INTENTS),
         "opportunity_gate": _opportunity_gate_state(),
         "connectors_status_metrics": dict(_CONNECTORS_STATUS_METRICS),
+        "live_protection_reconcile_metrics": {
+            **LIVE_PROTECTION_RECONCILE_METRICS,
+            "interval_sec": _live_position_protection_loop_interval_sec(),
+            "timeout_sec": _live_protection_reconcile_timeout_sec(),
+            "thread_alive": bool(LIVE_POSITION_PROTECTION_THREAD is not None and LIVE_POSITION_PROTECTION_THREAD.is_alive()),
+        },
     }
 
 
