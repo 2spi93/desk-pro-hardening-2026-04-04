@@ -10,6 +10,7 @@ import json
 import math
 import os
 from enum import Enum
+from functools import partial
 from pathlib import Path
 import random
 import secrets
@@ -21,6 +22,7 @@ from urllib.parse import urlencode, urlparse
 from uuid import uuid4
 
 import httpx
+from anyio import fail_after, to_thread
 from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, PlainTextResponse
 
@@ -16988,8 +16990,7 @@ def _create_session(user_id: int, user_agent: str = "", ip_address: str = "") ->
     return session_id, expires_at
 
 
-@app.post("/v1/auth/login", response_model=LoginResponse)
-async def login(request: LoginRequest) -> LoginResponse:
+def _login_blocking(request: LoginRequest) -> LoginResponse:
     user = fetch_one(
         "SELECT id, username, password_hash, role, is_active, password_must_change FROM users WHERE username = %s",
         (request.username,),
@@ -17021,6 +17022,12 @@ async def login(request: LoginRequest) -> LoginResponse:
         username=user["username"],
         password_must_change=bool(user["password_must_change"]),
     )
+
+
+@app.post("/v1/auth/login", response_model=LoginResponse)
+async def login(request: LoginRequest) -> LoginResponse:
+    # Hash de mot de passe (CPU) + écritures psycopg synchrones : hors event loop.
+    return await to_thread.run_sync(partial(_login_blocking, request), abandon_on_cancel=True)
 
 
 @app.get("/v1/auth/me")
@@ -17215,6 +17222,7 @@ async def health() -> dict:
         "audit_events": len(AUDIT_LOG),
         "pending_intents": len(PENDING_INTENTS),
         "opportunity_gate": _opportunity_gate_state(),
+        "connectors_status_metrics": dict(_CONNECTORS_STATUS_METRICS),
     }
 
 
@@ -22433,6 +22441,55 @@ async def _execute_mt5_filtered_order(payload: dict) -> dict:
         return result
 
 
+def _connectors_status_env_int(name: str, default: int) -> int:
+    try:
+        return max(0, int(os.getenv(name, str(default))))
+    except ValueError:
+        return default
+
+
+# Le snapshot N+1 prend 12-25s en l'état (mesuré 2026-06-12) ; le timeout doit rester au-dessus
+# tant que le batch des requêtes (correctif de fond) n'est pas fait.
+CONNECTORS_STATUS_THREADPOOL_TIMEOUT_MS = _connectors_status_env_int("CONNECTORS_STATUS_THREADPOOL_TIMEOUT_MS", 30000)
+CONNECTORS_STATUS_CACHE_TTL_MS = _connectors_status_env_int("CONNECTORS_STATUS_CACHE_TTL_MS", 0)
+# Lu et exposé dans les métriques, mais pas encore appliqué (v2: semaphore sur le threadpool partagé).
+CONNECTORS_STATUS_MAX_CONCURRENCY = _connectors_status_env_int("CONNECTORS_STATUS_MAX_CONCURRENCY", 0)
+
+_CONNECTORS_STATUS_METRICS: dict[str, Any] = {
+    "calls": 0,
+    "errors": 0,
+    "timeouts": 0,
+    "cache_hits": 0,
+    "in_flight": 0,
+    "max_in_flight": 0,
+    "last_duration_ms": None,
+    "threadpool_timeout_ms": CONNECTORS_STATUS_THREADPOOL_TIMEOUT_MS,
+    "cache_ttl_ms": CONNECTORS_STATUS_CACHE_TTL_MS,
+    "max_concurrency_configured": CONNECTORS_STATUS_MAX_CONCURRENCY,
+}
+# Le snapshot dépend de l'auth (comptes filtrés par client) : cache par user_id+role.
+_CONNECTORS_STATUS_CACHE: dict[str, tuple[float, dict]] = {}
+
+
+def _connectors_status_cache_get(cache_key: str) -> dict | None:
+    if CONNECTORS_STATUS_CACHE_TTL_MS <= 0:
+        return None
+    entry = _CONNECTORS_STATUS_CACHE.get(cache_key)
+    if not entry:
+        return None
+    cached_at, snapshot = entry
+    if (time.monotonic() - cached_at) * 1000.0 > CONNECTORS_STATUS_CACHE_TTL_MS:
+        _CONNECTORS_STATUS_CACHE.pop(cache_key, None)
+        return None
+    return snapshot
+
+
+def _connectors_status_cache_put(cache_key: str, snapshot: dict) -> None:
+    if CONNECTORS_STATUS_CACHE_TTL_MS <= 0:
+        return
+    _CONNECTORS_STATUS_CACHE[cache_key] = (time.monotonic(), snapshot)
+
+
 async def _compute_connectors_snapshot(auth: AuthContext | None = None) -> dict:
     async with httpx.AsyncClient(timeout=8.0) as client:
         async def _probe(url: str) -> tuple[bool, float | None]:
@@ -22457,6 +22514,32 @@ async def _compute_connectors_snapshot(auth: AuthContext | None = None) -> dict:
             _probe(f"{EMBEDDINGS_SERVICE_URL}/health"),
         )
 
+    health_by_group = {
+        "market": market_ok,
+        "broker": broker_ok,
+        "mt5": mt5_ok,
+        "ai": ai_ok,
+        "embeddings": embeddings_ok,
+    }
+    latency_by_group = {
+        "market": market_latency_ms,
+        "broker": broker_latency_ms,
+        "mt5": mt5_latency_ms,
+        "ai": ai_latency_ms,
+        "embeddings": embeddings_latency_ms,
+    }
+    # Les requêtes psycopg sont synchrones : exécutées dans le threadpool pour ne pas geler l'event loop.
+    return await to_thread.run_sync(
+        partial(_compute_connectors_snapshot_blocking, auth, health_by_group, latency_by_group),
+        abandon_on_cancel=True,
+    )
+
+
+def _compute_connectors_snapshot_blocking(
+    auth: AuthContext | None,
+    health_by_group: dict[str, bool],
+    latency_by_group: dict[str, float | None],
+) -> dict:
     pending = fetch_one("SELECT COUNT(*) AS count FROM mt5_live_approvals WHERE status = 'pending'") or {"count": 0}
     recent_approvals = _normalize_db_rows(
         fetch_all(
@@ -22493,20 +22576,6 @@ async def _compute_connectors_snapshot(auth: AuthContext | None = None) -> dict:
             }
         )
 
-    health_by_group = {
-        "market": market_ok,
-        "broker": broker_ok,
-        "mt5": mt5_ok,
-        "ai": ai_ok,
-        "embeddings": embeddings_ok,
-    }
-    latency_by_group = {
-        "market": market_latency_ms,
-        "broker": broker_latency_ms,
-        "mt5": mt5_latency_ms,
-        "ai": ai_latency_ms,
-        "embeddings": embeddings_latency_ms,
-    }
     visible_client_ids = _visible_client_ids(auth) if auth is not None else None
     linked_accounts = _filter_connector_accounts_for_auth(_load_connector_accounts(), auth) if auth is not None else _load_connector_accounts()
     linked_accounts_by_provider: dict[str, list[dict[str, Any]]] = {}
@@ -23648,7 +23717,34 @@ async def copilot_chat(payload: dict, auth: AuthContext = Depends(viewer_auth)) 
 
 @app.get("/v1/connectors/status")
 async def connectors_status(auth: AuthContext = Depends(viewer_auth)) -> dict:
-    return await _compute_connectors_snapshot(auth)
+    cache_key = f"{auth.user_id}:{auth.role}"
+    cached = _connectors_status_cache_get(cache_key)
+    if cached is not None:
+        _CONNECTORS_STATUS_METRICS["cache_hits"] += 1
+        return cached
+    _CONNECTORS_STATUS_METRICS["calls"] += 1
+    _CONNECTORS_STATUS_METRICS["in_flight"] += 1
+    _CONNECTORS_STATUS_METRICS["max_in_flight"] = max(
+        _CONNECTORS_STATUS_METRICS["max_in_flight"], _CONNECTORS_STATUS_METRICS["in_flight"]
+    )
+    started = time.perf_counter()
+    try:
+        with fail_after(CONNECTORS_STATUS_THREADPOOL_TIMEOUT_MS / 1000.0):
+            snapshot = await _compute_connectors_snapshot(auth)
+    except TimeoutError:
+        _CONNECTORS_STATUS_METRICS["timeouts"] += 1
+        raise HTTPException(
+            status_code=503,
+            detail={"reason": "connectors_snapshot_timeout", "source": "connectors_status"},
+        )
+    except Exception:
+        _CONNECTORS_STATUS_METRICS["errors"] += 1
+        raise
+    finally:
+        _CONNECTORS_STATUS_METRICS["in_flight"] -= 1
+        _CONNECTORS_STATUS_METRICS["last_duration_ms"] = round((time.perf_counter() - started) * 1000.0, 1)
+    _connectors_status_cache_put(cache_key, snapshot)
+    return snapshot
 
 
 @app.get("/v1/connectors/catalog")
