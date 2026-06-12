@@ -6,6 +6,7 @@ from contextlib import suppress
 from enum import Enum
 import math
 import os
+import threading
 import time
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -45,6 +46,24 @@ MARKET_DATA_URL = os.getenv("MARKET_DATA_URL", "http://127.0.0.1:8003")
 BROKER_ADAPTER_URL = os.getenv("BROKER_ADAPTER_URL", "http://127.0.0.1:8004")
 VENUE_STABILITY: dict[str, dict[str, object]] = {}
 EXECUTION_OPTIMIZER_PROFILE_CACHE: dict[str, object] = {"expires_at": 0.0, "profiles": {}, "updated_at": None}
+EXECUTION_OPTIMIZER_PROFILE_REFRESH_LOCK = threading.Lock()
+EXECUTION_OPTIMIZER_PROFILE_METRICS: dict[str, object] = {
+    "cache_hit": 0,
+    "cache_miss": 0,
+    "stale_served": 0,
+    "cold_miss": 0,
+    "refresh_count": 0,
+    "refresh_errors": 0,
+    "last_refresh_ms": None,
+    "last_error": None,
+}
+
+
+def _optimizer_profile_ttl_sec() -> float:
+    try:
+        return max(5.0, float(os.getenv("EXECUTION_OPTIMIZER_PROFILE_TTL_SEC", "45")))
+    except ValueError:
+        return 45.0
 ACTIVE_EXECUTION_ORDERS: dict[str, dict[str, object]] = {}
 ACTIVE_EXECUTION_ORDER_TASKS: dict[str, asyncio.Task] = {}
 RECENT_EXECUTION_OPTIMIZER_EVENTS: list[dict[str, object]] = []
@@ -872,13 +891,13 @@ def _live_order_open(status: object) -> bool:
     return normalized in {"open", "partially_filled"}
 
 
-def _load_execution_optimizer_profiles(force: bool = False) -> dict[str, dict[str, object]]:
-    now = time.time()
-    cached_profiles = EXECUTION_OPTIMIZER_PROFILE_CACHE.get("profiles")
-    if not force and now < _to_float(EXECUTION_OPTIMIZER_PROFILE_CACHE.get("expires_at"), 0.0) and isinstance(cached_profiles, dict):
-        return cached_profiles  # type: ignore[return-value]
-
-    rows = fetch_all(
+def _refresh_execution_optimizer_profiles() -> None:
+    # Singleflight : une seule reconstruction à la fois, les appels concurrents servent le last_good.
+    if not EXECUTION_OPTIMIZER_PROFILE_REFRESH_LOCK.acquire(blocking=False):
+        return
+    started = time.perf_counter()
+    try:
+        rows = fetch_all(
         """
                 WITH fill_stats AS (
                     SELECT
@@ -922,19 +941,45 @@ def _load_execution_optimizer_profiles(force: bool = False) -> dict[str, dict[st
                 FULL OUTER JOIN lifecycle_stats ON lifecycle_stats.venue = fill_stats.venue
                 ORDER BY COALESCE(fill_stats.venue, lifecycle_stats.venue)
         """
-    )
-    profiles: dict[str, dict[str, object]] = {}
-    for row in rows:
-        venue = str(row.get("venue") or "unknown")
-        profiles[venue] = calibrate_execution_desk_profile(venue, row)
-    EXECUTION_OPTIMIZER_PROFILE_CACHE.update(
-        {
-            "expires_at": now + 20.0,
-            "profiles": profiles,
-            "updated_at": _now_iso(),
-        }
-    )
-    return profiles
+        )
+        profiles: dict[str, dict[str, object]] = {}
+        for row in rows:
+            venue = str(row.get("venue") or "unknown")
+            profiles[venue] = calibrate_execution_desk_profile(venue, row)
+        EXECUTION_OPTIMIZER_PROFILE_CACHE.update(
+            {
+                "expires_at": time.time() + _optimizer_profile_ttl_sec(),
+                "profiles": profiles,
+                "updated_at": _now_iso(),
+            }
+        )
+        EXECUTION_OPTIMIZER_PROFILE_METRICS["refresh_count"] = int(EXECUTION_OPTIMIZER_PROFILE_METRICS.get("refresh_count") or 0) + 1
+        EXECUTION_OPTIMIZER_PROFILE_METRICS["last_refresh_ms"] = round((time.perf_counter() - started) * 1000.0, 1)
+    except Exception as exc:
+        EXECUTION_OPTIMIZER_PROFILE_METRICS["refresh_errors"] = int(EXECUTION_OPTIMIZER_PROFILE_METRICS.get("refresh_errors") or 0) + 1
+        EXECUTION_OPTIMIZER_PROFILE_METRICS["last_error"] = f"{type(exc).__name__}: {exc}"
+        # Échec : on garde le last_good et on retente au plus tôt dans 10s pour éviter une tempête de refresh.
+        EXECUTION_OPTIMIZER_PROFILE_CACHE["expires_at"] = time.time() + 10.0
+    finally:
+        EXECUTION_OPTIMIZER_PROFILE_REFRESH_LOCK.release()
+
+
+def _load_execution_optimizer_profiles(force: bool = False) -> dict[str, dict[str, object]]:
+    now = time.time()
+    cached_profiles = EXECUTION_OPTIMIZER_PROFILE_CACHE.get("profiles")
+    has_last_good = isinstance(cached_profiles, dict) and EXECUTION_OPTIMIZER_PROFILE_CACHE.get("updated_at") is not None
+    if not force and has_last_good and now < _to_float(EXECUTION_OPTIMIZER_PROFILE_CACHE.get("expires_at"), 0.0):
+        EXECUTION_OPTIMIZER_PROFILE_METRICS["cache_hit"] = int(EXECUTION_OPTIMIZER_PROFILE_METRICS.get("cache_hit") or 0) + 1
+        return cached_profiles  # type: ignore[return-value]
+    EXECUTION_OPTIMIZER_PROFILE_METRICS["cache_miss"] = int(EXECUTION_OPTIMIZER_PROFILE_METRICS.get("cache_miss") or 0) + 1
+    # La reconstruction (requête lourde) part en thread pour ne jamais bloquer l'event loop ;
+    # l'appelant repart immédiatement avec le last_good, ou les profils par défaut à froid.
+    threading.Thread(target=_refresh_execution_optimizer_profiles, name="optimizer-profile-refresh", daemon=True).start()
+    if has_last_good:
+        EXECUTION_OPTIMIZER_PROFILE_METRICS["stale_served"] = int(EXECUTION_OPTIMIZER_PROFILE_METRICS.get("stale_served") or 0) + 1
+        return cached_profiles  # type: ignore[return-value]
+    EXECUTION_OPTIMIZER_PROFILE_METRICS["cold_miss"] = int(EXECUTION_OPTIMIZER_PROFILE_METRICS.get("cold_miss") or 0) + 1
+    return {}
 
 
 def _execution_optimizer_profile_for_venue(venue: str) -> dict[str, object]:
@@ -3420,6 +3465,9 @@ def _simulate_fills(
 async def startup() -> None:
     global OBSERVATION_TASK
     ensure_schema()
+    # Warmup à froid : les premiers ordres routés servent les profils par défaut
+    # pendant que cette reconstruction remplit le cache en arrière-plan.
+    threading.Thread(target=_refresh_execution_optimizer_profiles, name="optimizer-profile-warmup", daemon=True).start()
     if OBSERVATION_TASK is None or OBSERVATION_TASK.done():
         OBSERVATION_TASK = asyncio.create_task(_observation_loop())
 
@@ -3442,6 +3490,11 @@ async def health() -> dict:
         "orders": len(ORDERS),
         "positions": POSITIONS,
         "observation": _observation_snapshot(),
+        "optimizer_profile_metrics": {
+            **EXECUTION_OPTIMIZER_PROFILE_METRICS,
+            "ttl_sec": _optimizer_profile_ttl_sec(),
+            "profiles_updated_at": EXECUTION_OPTIMIZER_PROFILE_CACHE.get("updated_at"),
+        },
     }
 
 
