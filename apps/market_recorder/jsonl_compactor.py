@@ -1,15 +1,27 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 import json
 import os
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-import pyarrow as pa
-import pyarrow.parquet as pq
+# pyarrow est OPTIONNEL : son absence ne doit jamais tuer la rotation/compression.
+# Sans pyarrow, on retombe sur une archive JSONL gzip (stdlib, toujours disponible).
+try:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    PARQUET_AVAILABLE = True
+    PARQUET_UNAVAILABLE_REASON = ""
+except Exception as _pa_exc:  # noqa: BLE001
+    pa = None  # type: ignore[assignment]
+    pq = None  # type: ignore[assignment]
+    PARQUET_AVAILABLE = False
+    PARQUET_UNAVAILABLE_REASON = repr(_pa_exc)
 
 
 JsonMap = dict[str, Any]
@@ -119,6 +131,47 @@ def _manifest_matches(manifest_path: Path, source_path: Path) -> bool:
         return False
 
 
+def _archive_target_path(manifest_path: Path) -> Path:
+    # Même dossier/horodatage que le manifest, en .jsonl.gz (chemin de repli sans Parquet).
+    name = manifest_path.name.removesuffix(".manifest.json")
+    return manifest_path.parent / f"{name}.jsonl.gz"
+
+
+def _write_gzip_archive(source_path: Path, archive_path: Path) -> int:
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = archive_path.with_suffix(archive_path.suffix + ".tmp")
+    try:
+        with source_path.open("rb") as src, gzip.open(tmp_path, "wb", compresslevel=6) as dst:
+            shutil.copyfileobj(src, dst, length=1024 * 1024)
+        os.replace(tmp_path, archive_path)
+    except Exception:
+        if tmp_path.exists():
+            tmp_path.unlink()
+        raise
+    return archive_path.stat().st_size
+
+
+def _rotate_source_to_tail(source_path: Path, keep_lines: int) -> bool:
+    # Tronque la source à ses N dernières lignes (swap atomique). Course possible avec un
+    # writer O_APPEND : au pire 1-2 lignes en vol perdues à l'instant du swap. OPT-IN via config
+    # (rotate_source_keep_lines) — désactivé par défaut, donc aucun effet tant qu'on ne l'active pas.
+    if keep_lines <= 0:
+        return False
+    try:
+        with source_path.open("r", encoding="utf-8", errors="replace") as handle:
+            lines = handle.readlines()
+    except Exception:
+        return False
+    if len(lines) <= keep_lines:
+        return False
+    tail = lines[-keep_lines:]
+    tmp_path = source_path.with_suffix(source_path.suffix + ".rot.tmp")
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        handle.writelines(tail)
+    os.replace(tmp_path, source_path)
+    return True
+
+
 def _write_parquet(rows: list[JsonMap], path: Path, compression: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -172,15 +225,23 @@ def compact_policy(policy: JsonMap, *, dry_run: bool = False) -> JsonMap:
                 result["skipped"].append({"source_path": str(source_path), "reason": "too_fresh"})
                 continue
             parquet_path, manifest_path = _target_paths(policy, source_path)
-            if _manifest_matches(manifest_path, source_path) and parquet_path.exists():
+            # Le manifest (source_size/mtime/sha) suffit à décider du skip, indépendamment
+            # du format d'archive (parquet OU gzip).
+            if _manifest_matches(manifest_path, source_path):
                 result["skipped"].append({"source_path": str(source_path), "reason": "already_compacted"})
                 continue
             rows, bad_lines = _iter_json_lines(source_path, max_bad_lines=max_bad_lines)
             if not rows:
                 result["skipped"].append({"source_path": str(source_path), "reason": "no_json_rows"})
                 continue
+            archive_kind = "parquet" if PARQUET_AVAILABLE else "jsonl_gzip"
+            archive_path = parquet_path if PARQUET_AVAILABLE else _archive_target_path(manifest_path)
             if not dry_run:
-                _write_parquet(rows, parquet_path, compression=compression)
+                if PARQUET_AVAILABLE:
+                    _write_parquet(rows, parquet_path, compression=compression)
+                    archive_size = parquet_path.stat().st_size
+                else:
+                    archive_size = _write_gzip_archive(source_path, archive_path)
                 manifest = {
                     "schema": "txt-jsonl-compaction/v1",
                     "policy": name,
@@ -188,17 +249,28 @@ def compact_policy(policy: JsonMap, *, dry_run: bool = False) -> JsonMap:
                     "source_size": stat.st_size,
                     "source_mtime_ns": stat.st_mtime_ns,
                     "source_sha256": _sha256_file(source_path),
-                    "parquet_path": str(parquet_path),
-                    "parquet_size": parquet_path.stat().st_size,
+                    "archive_kind": archive_kind,
+                    "archive_path": str(archive_path),
+                    "archive_size": archive_size,
+                    "parquet_path": str(parquet_path) if PARQUET_AVAILABLE else None,
+                    "parquet_size": archive_size if PARQUET_AVAILABLE else None,
+                    "parquet_available": PARQUET_AVAILABLE,
+                    "parquet_status": "ok" if PARQUET_AVAILABLE else "skipped_missing_pyarrow",
                     "row_count": len(rows),
                     "bad_line_count": bad_lines,
-                    "compression": compression,
+                    "compression": compression if PARQUET_AVAILABLE else "gzip",
                     "compacted_at": _iso(),
                 }
                 _write_json(manifest_path, manifest)
+                # Rotation source OPT-IN : ne tronque que si la policy le demande explicitement.
+                keep_lines = int(policy.get("rotate_source_keep_lines", 0) or 0)
+                if keep_lines > 0 and _rotate_source_to_tail(source_path, keep_lines):
+                    result["rotated"].append({"source_path": str(source_path), "kept_lines": keep_lines})
             result["compacted"].append({
                 "source_path": str(source_path),
-                "parquet_path": str(parquet_path),
+                "archive_kind": archive_kind,
+                "archive_path": str(archive_path),
+                "parquet_path": str(parquet_path) if PARQUET_AVAILABLE else None,
                 "manifest_path": str(manifest_path),
                 "row_count": len(rows),
                 "bad_line_count": bad_lines,
@@ -239,6 +311,10 @@ def run_compaction(config_path: str, *, policy_names: set[str] | None = None, dr
         "started_at": _iso(),
         "config_path": str(config.get("config_path")),
         "dry_run": dry_run,
+        "parquet_available": PARQUET_AVAILABLE,
+        "parquet_status": "ok" if PARQUET_AVAILABLE else "skipped_missing_pyarrow",
+        "parquet_unavailable_reason": PARQUET_UNAVAILABLE_REASON or None,
+        "archive_format": "parquet" if PARQUET_AVAILABLE else "jsonl_gzip",
         "policies": [compact_policy(policy, dry_run=dry_run) for policy in selected],
     }
     if any(policy.get("errors") for policy in summary["policies"]):
