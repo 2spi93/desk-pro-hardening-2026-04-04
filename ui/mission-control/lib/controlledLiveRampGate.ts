@@ -48,6 +48,16 @@ export type ControlledLiveRampGateReport = {
     current_clean_cycles: number;
     missing_runtime_truth_sources: string[];
     degraded_runtime_truth_sources: string[];
+    // Backend execution-router observation is the authority for the live edge,
+    // not the fragile browser terminal capture. When live_observation is online,
+    // capture-derived degraded sources (NO_EDGE / live_state / decision_quote_coverage)
+    // are reclassified here as non-blocking instead of blocking the gate.
+    observation_source: "execution_router" | "terminal_capture" | "unknown";
+    ui_capture_status: "ok" | "degraded" | "unknown";
+    ui_capture_blocks_live: boolean;
+    ui_capture_degraded_sources: string[];
+    backend_bus_seq: number | null;
+    backend_flags: string[];
     kill_switch: {
       active: boolean | null;
       reason: string | null;
@@ -740,14 +750,33 @@ function networkEntryIsDegraded(value: unknown): boolean {
     || status === "error";
 }
 
-function buildRuntimeTruthSourceDiagnostics(
+export function buildRuntimeTruthSourceDiagnostics(
   context: ControlledLiveRampGateContext,
   runtimeTruth: unknown,
   runtimeTruthGate: ControlledLiveRampGateReport["runtime_truth_gate"],
   settlementTruth: ControlledLiveRampGateReport["settlement_truth"],
-): Pick<ControlledLiveRampGateReport["controlled_live_ramp_gate"], "missing_runtime_truth_sources" | "degraded_runtime_truth_sources"> {
+): Pick<
+  ControlledLiveRampGateReport["controlled_live_ramp_gate"],
+  | "missing_runtime_truth_sources"
+  | "degraded_runtime_truth_sources"
+  | "observation_source"
+  | "ui_capture_status"
+  | "ui_capture_blocks_live"
+  | "ui_capture_degraded_sources"
+  | "backend_bus_seq"
+  | "backend_flags"
+> {
   if (context !== "ops") {
-    return { missing_runtime_truth_sources: [], degraded_runtime_truth_sources: [] };
+    return {
+      missing_runtime_truth_sources: [],
+      degraded_runtime_truth_sources: [],
+      observation_source: "unknown",
+      ui_capture_status: "unknown",
+      ui_capture_blocks_live: false,
+      ui_capture_degraded_sources: [],
+      backend_bus_seq: null,
+      backend_flags: [],
+    };
   }
 
   const runtimeTruthRecord = asRecord(runtimeTruth);
@@ -818,9 +847,70 @@ function buildRuntimeTruthSourceDiagnostics(
     degraded.push("control_plane");
   }
 
+  // --- Backend authority over the fragile browser terminal capture ---
+  // The execution-router observation (surfaced as raw.opportunity_gate) is the
+  // canonical truth for the live edge. A headless browser terminal WebSocket
+  // can be CLOSED/throttled and emit bus_seq=0 / NO_EDGE while the backend bus
+  // is perfectly healthy. So when live_observation is online, capture-derived
+  // degraded sources are reclassified as non-blocking ui_capture_degraded.
+  const rawOpportunityGate = asRecord(raw.opportunity_gate);
+  const opportunityGate = asRecord(rawOpportunityGate.gate || rawOpportunityGate);
+  const opportunityMetrics = asRecord(opportunityGate.metrics);
+  const routing = asRecord(layers.routing);
+  const opportunityStatus = String(opportunityGate.status || routing.status || "").trim().toLowerCase();
+  const opportunityValidObservation = typeof opportunityGate.valid_observation === "boolean"
+    ? Boolean(opportunityGate.valid_observation)
+    : null;
+  const backendBusSeq = Number.isFinite(Number(opportunityMetrics.bus_seq)) ? Number(opportunityMetrics.bus_seq) : null;
+  const backendFlags = asStringArray(opportunityMetrics.flags).map((item) => item.toUpperCase());
+  // Identical predicate to buildBusHealthDiagnostic's liveObservationOnline.
+  const liveObservationOnline = opportunityStatus === "go"
+    && opportunityValidObservation !== false
+    && backendBusSeq !== null
+    && backendBusSeq > 0
+    && !backendFlags.includes("BUS_OFFLINE")
+    && !backendFlags.includes("OBSERVATION_ERROR");
+
+  // Degraded SOURCES that originate from the terminal capture / opportunity-edge
+  // signal (NO_EDGE, live_state, runtime_reliability, controlled_collection).
+  // settlement_truth, control_plane, execution_truth, position/broker truth stay
+  // blocking regardless — they are backend execution truth, not UI capture.
+  const captureOriginSources = new Set([
+    "edge_evidence_truth",
+    "runtime_reliability_live_state",
+    "controlled_collection_truth",
+  ]);
+  const isCaptureReason = (reason: string): boolean =>
+    /no_edge|live_state|runtime_reliability|decision_quote_coverage|controlled_collection|edge/i.test(reason);
+  // runtime_truth_matrix is only capture-origin when ALL of its degraded_reasons
+  // are capture-derived; a genuine non-capture degraded reason keeps it blocking.
+  const hasNonCaptureDegradedReason = runtimeTruthGate.degraded_reasons.some((reason) => !isCaptureReason(reason));
+
+  const uiCaptureDegraded: string[] = [];
+  let blockingDegraded = dedupe(degraded);
+  if (liveObservationOnline) {
+    blockingDegraded = blockingDegraded.filter((source) => {
+      if (captureOriginSources.has(source)) {
+        uiCaptureDegraded.push(source);
+        return false;
+      }
+      if (source === "runtime_truth_matrix" && !hasNonCaptureDegradedReason) {
+        uiCaptureDegraded.push(source);
+        return false;
+      }
+      return true;
+    });
+  }
+
   return {
     missing_runtime_truth_sources: dedupe(missing),
-    degraded_runtime_truth_sources: dedupe(degraded),
+    degraded_runtime_truth_sources: blockingDegraded,
+    observation_source: liveObservationOnline ? "execution_router" : "terminal_capture",
+    ui_capture_status: uiCaptureDegraded.length > 0 ? "degraded" : "ok",
+    ui_capture_blocks_live: false,
+    ui_capture_degraded_sources: dedupe(uiCaptureDegraded),
+    backend_bus_seq: backendBusSeq,
+    backend_flags: backendFlags,
   };
 }
 
@@ -1236,6 +1326,11 @@ function buildRuntimeTruthMatrixDiagnostic(
   context: ControlledLiveRampGateContext,
   runtimeTruthGate: ControlledLiveRampGateReport["runtime_truth_gate"],
   missingRuntimeTruthSources: string[],
+  // True when the backend execution-router observation is online AND the only
+  // reason the runtime-truth verdict is non-READY is capture-derived (NO_EDGE /
+  // decision_quote_coverage from the dead browser terminal). In that case the
+  // matrix must not report degraded — the backend bus is the authority.
+  backendAuthoritativeCaptureOnly = false,
 ): ControlledLiveRampGateReport["runtime_truth_matrix"] {
   if (context !== "ops") {
     return {
@@ -1249,7 +1344,8 @@ function buildRuntimeTruthMatrixDiagnostic(
   const missing = requiredSources.filter((source) => missingRuntimeTruthSources.includes(source));
   const required = requiredSources.length;
   const available = Math.max(0, required - missing.length);
-  const status = !runtimeTruthGate.available ? "missing" : missing.length > 0 || runtimeTruthGate.verdict !== "READY" ? "degraded" : "available";
+  const verdictDegrades = runtimeTruthGate.verdict !== "READY" && !backendAuthoritativeCaptureOnly;
+  const status = !runtimeTruthGate.available ? "missing" : missing.length > 0 || verdictDegrades ? "degraded" : "available";
   return {
     status,
     coverage: { required, available, missing },
@@ -1938,10 +2034,16 @@ export async function buildControlledLiveRampGateReport(input: ControlledLiveRam
   const settlementSourceContextDiff = buildSettlementSourceContextDiff(context, runtimeTruth.snapshot, settlementTruth, settlementTruthResolution.directProbe);
   const opsRunnerContext = buildOpsRunnerContext(context, settlementSourceContextDiff);
   const runtimeTruthSourceDiagnostics = buildRuntimeTruthSourceDiagnostics(context, runtimeTruth.snapshot, runtimeTruthGate, settlementTruth);
+  // Backend authority: when the execution-router observation is online and the
+  // matrix degradation is purely capture-derived, the runtime-truth matrix must
+  // not be treated as degraded for the gate verdict.
+  const backendAuthoritativeCaptureOnly = runtimeTruthSourceDiagnostics.observation_source === "execution_router"
+    && runtimeTruthSourceDiagnostics.ui_capture_degraded_sources.includes("runtime_truth_matrix");
   const runtimeTruthMatrix = buildRuntimeTruthMatrixDiagnostic(
     context,
     runtimeTruthGate,
     runtimeTruthSourceDiagnostics.missing_runtime_truth_sources,
+    backendAuthoritativeCaptureOnly,
   );
   const runtimeSourceDegradationMap = buildRuntimeSourceDegradationMap({
     context,
@@ -2050,6 +2152,12 @@ export async function buildControlledLiveRampGateReport(input: ControlledLiveRam
       current_clean_cycles: currentCleanCycles,
       missing_runtime_truth_sources: runtimeTruthSourceDiagnostics.missing_runtime_truth_sources,
       degraded_runtime_truth_sources: runtimeTruthSourceDiagnostics.degraded_runtime_truth_sources,
+      observation_source: runtimeTruthSourceDiagnostics.observation_source,
+      ui_capture_status: runtimeTruthSourceDiagnostics.ui_capture_status,
+      ui_capture_blocks_live: runtimeTruthSourceDiagnostics.ui_capture_blocks_live,
+      ui_capture_degraded_sources: runtimeTruthSourceDiagnostics.ui_capture_degraded_sources,
+      backend_bus_seq: runtimeTruthSourceDiagnostics.backend_bus_seq,
+      backend_flags: runtimeTruthSourceDiagnostics.backend_flags,
       kill_switch: killSwitch,
       block_reasons: effectiveBlockReasons,
       yellow_flags: yellowFlags,
