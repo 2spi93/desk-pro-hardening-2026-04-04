@@ -1,0 +1,18 @@
+[Unit]
+Description=TXT Docker build-cache guard (autonomous, targeted builder prune + Telegram alerts)
+Wants=network-online.target
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/txt
+# DRY_RUN=0 = garde active : `docker builder prune` ciblé seulement au-delà des seuils.
+# Jamais `docker system prune`, jamais --volumes, jamais image prune -a automatique.
+Environment=TXT_BUILD_CACHE_GUARD_DRY_RUN=0
+ExecStart=/opt/txt/scripts/monitor_txt_docker_build_cache.sh
+StandardOutput=append:/opt/txt/logs/txt-docker-build-cache-guard.log
+StandardError=append:/opt/txt/logs/txt-docker-build-cache-guard.err.log
+
+[Install]
+WantedBy=multi-user.target
