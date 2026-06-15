@@ -1,0 +1,12 @@
+[Unit]
+Description=Run TXT disk & compactor monitor every 5 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Persistent=true
+Unit=txt-disk-compactor-monitor.service
+
+[Install]
+WantedBy=timers.target
