@@ -607,6 +607,24 @@ services:
       retries: 6
       start_period: 10s
 
+  # Isolated, on-demand compactor (C1). Built from Dockerfile.compactor, which
+  # adds pyarrow on top of txt-python:3.11 so Parquet cold archives work without
+  # bloating the 10 trading services. The "tools" profile keeps it OUT of
+  # `docker compose up`; it only runs via the systemd oneshot:
+  #   docker compose run --rm --no-deps txt-jsonl-compactor
+  txt-jsonl-compactor:
+    image: txt-compactor:3.11
+    build:
+      context: .
+      dockerfile: Dockerfile.compactor
+    <<: *txt-runtime-guardrails
+    profiles: ["tools"]
+    working_dir: /workspace
+    volumes:
+      - ./:/workspace
+    command: >
+      python scripts/jsonl_compactor.py --config config/jsonl_compactor.json
+
 networks:
   hermes-net:
     external: true

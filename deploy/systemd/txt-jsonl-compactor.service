@@ -1,0 +1,16 @@
+[Unit]
+Description=TXT JSONL rotation and Parquet compaction
+Wants=docker.service network-online.target
+After=docker.service network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/txt
+Environment=TXT_JSONL_COMPACTOR_CONFIG=config/jsonl_compactor.json
+ExecStart=/usr/bin/docker compose -f /opt/txt/docker-compose.yml run --rm --no-deps -T txt-jsonl-compactor python scripts/jsonl_compactor.py --config ${TXT_JSONL_COMPACTOR_CONFIG}
+StandardOutput=append:/opt/txt/logs/jsonl-compactor.log
+StandardError=append:/opt/txt/logs/jsonl-compactor.err.log
+
+[Install]
+WantedBy=multi-user.target

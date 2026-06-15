@@ -1,0 +1,15 @@
+# Isolated image for the JSONL compactor ONLY (C1).
+#
+# Extends the shared txt-python base with pyarrow so the compactor can write
+# Parquet cold archives — the intended analytical format. pyarrow is confined
+# HERE: the 10 trading services that share txt-python:3.11 (control-plane,
+# execution-router, market-data, risk-gateway, mt5-bridge, market-recorder,
+# broker-adapter, ai-orchestrator, embeddings-service, predictor-v8) stay
+# untouched and are not rebuilt.
+#
+# gzip stays the fallback if this image is ever unavailable — see the
+# PARQUET_AVAILABLE guard in apps/market_recorder/jsonl_compactor.py (C2).
+FROM txt-python:3.11
+
+# pyarrow ships manylinux cp311 wheels, so no build toolchain is needed.
+RUN pip install --no-cache-dir pyarrow==17.0.0

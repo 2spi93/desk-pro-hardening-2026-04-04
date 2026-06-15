@@ -1,0 +1,12 @@
+[Unit]
+Description=Run TXT JSONL compactor on a schedule
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+AccuracySec=1min
+Persistent=true
+Unit=txt-jsonl-compactor.service
+
+[Install]
+WantedBy=timers.target
