@@ -4307,10 +4307,17 @@ export async function getRuntimeDecisionAnalytics(options?: {
   const limit = Math.max(1, Math.min(2_000, Math.round(Number(options?.limit || 1_200))));
   const sinceDays = Math.max(1, Math.min(90, Math.round(Number(options?.sinceDays || 7))));
   const samples = Math.max(1, Math.min(10, Math.round(Number(options?.samples || 3))));
+  // Lecture pour la couverture d'observation : bornée par la fenêtre temporelle (cutoff sinceDays)
+  // + maxBytes côté reader, PAS par le petit `limit` d'affichage. Sans ce découplage, coveredHours
+  // plafonne à ~limit/débit heures (le bug du plateau ~7h vs 24h/72h requis).
+  const observationReadLimit = (() => {
+    const raw = Number(process.env.RUNTIME_DECISION_OBSERVATION_MAX_LINES);
+    return Number.isFinite(raw) ? Math.max(2_000, Math.min(100_000, Math.round(raw))) : 12_000;
+  })();
 
   const [entries, opportunityTelemetry, localTerminalCaptureStore, kpiSnapshotHistory] = await Promise.all([
     withRuntimeDecisionTimeout(
-      readV2RiskJournalEntries({ symbol, timeframe, strategy, limit, sinceDays }).catch(() => []),
+      readV2RiskJournalEntries({ symbol, timeframe, strategy, limit: observationReadLimit, sinceDays }).catch(() => []),
       RUNTIME_DECISION_ANALYTICS_LOAD_TIMEOUT_MS,
       [],
     ),

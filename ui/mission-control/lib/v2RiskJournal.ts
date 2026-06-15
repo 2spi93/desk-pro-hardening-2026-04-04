@@ -1,7 +1,94 @@
 import { createReadStream } from "node:fs";
-import { appendFile, mkdir, readFile, stat } from "node:fs/promises";
+import { appendFile, mkdir, open, readFile, stat, type FileHandle } from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline";
+
+// Runtime Decision Time-Window Reader v1.
+// Le lecteur historique scannait le fichier ENTIER depuis le début et gardait les N
+// dernières lignes (cap dur 2000) — O(taille_fichier), et plafonnait la couverture
+// temporelle à ~quelques heures quel que soit le besoin (24h/72h). Ce lecteur lit
+// depuis la FIN par chunks et s'arrête dès qu'il a couvert la fenêtre temporelle
+// demandée (cutoff) ou atteint une borne de sécurité. Le descripteur est TOUJOURS
+// fermé (finally) — c'est ce qui empêche la fuite de streams qui saturait le pool I/O.
+function _journalEnvInt(name: string, def: number, min: number, max: number): number {
+  const raw = Number(process.env[name]);
+  if (!Number.isFinite(raw)) return def;
+  return Math.max(min, Math.min(max, Math.round(raw)));
+}
+// Cap de lignes (remplace l'ancien cap dur 2000). Configurable.
+const RUNTIME_JOURNAL_MAX_TAIL_LINES = _journalEnvInt("RUNTIME_DECISION_MAX_TAIL_LINES", 50_000, 1_000, 500_000);
+// Borne d'octets lus depuis la fin (sécurité anti-re-bloat). Défaut 128MB ≈ ~40h à 11KB/entrée.
+const RUNTIME_JOURNAL_MAX_TAIL_BYTES = _journalEnvInt("RUNTIME_DECISION_MAX_TAIL_BYTES", 134_217_728, 8_388_608, 1_073_741_824);
+const RUNTIME_JOURNAL_TAIL_CHUNK = 8 * 1024 * 1024; // 8MB
+
+async function readJournalTailFromEnd(input: {
+  symbol: string;
+  timeframe: string;
+  strategy: string;
+  action: string;
+  cutoffMs: number;
+  limit: number;
+}): Promise<V2RiskJournalEntry[]> {
+  const target = filePath();
+  let fh: FileHandle | null = null;
+  try {
+    fh = await open(target, "r");
+    const { size } = await fh.stat();
+    const matched: V2RiskJournalEntry[] = []; // newest -> oldest
+    let position = size;
+    let pending = ""; // fragment de ligne dont le début est dans un chunk plus ancien
+    let bytesRead = 0;
+    let reachedCutoff = false;
+
+    while (
+      position > 0
+      && matched.length < input.limit
+      && bytesRead < RUNTIME_JOURNAL_MAX_TAIL_BYTES
+      && !reachedCutoff
+    ) {
+      const readSize = Math.min(RUNTIME_JOURNAL_TAIL_CHUNK, position);
+      position -= readSize;
+      bytesRead += readSize;
+      const buf = Buffer.alloc(readSize);
+      await fh.read(buf, 0, readSize, position);
+      const text = buf.toString("utf-8") + pending;
+      const lines = text.split("\n");
+      pending = lines.shift() ?? ""; // 1er élément = ligne incomplète (suite dans chunk antérieur)
+      for (let i = lines.length - 1; i >= 0 && matched.length < input.limit; i--) {
+        const line = lines[i];
+        if (!line) continue;
+        let row: V2RiskJournalEntry;
+        try { row = JSON.parse(line) as V2RiskJournalEntry; } catch { continue; }
+        if (input.cutoffMs > 0) {
+          const createdAtMs = Date.parse(String(row.createdAtIso || ""));
+          if (Number.isFinite(createdAtMs) && createdAtMs < input.cutoffMs) {
+            reachedCutoff = true;
+            break;
+          }
+        }
+        if (!matchesJournalEntry(row, input)) continue;
+        matched.push(row);
+      }
+    }
+    // début de fichier atteint : traiter le dernier fragment
+    if (position === 0 && pending && !reachedCutoff && matched.length < input.limit) {
+      try {
+        const row = JSON.parse(pending) as V2RiskJournalEntry;
+        let keep = true;
+        if (input.cutoffMs > 0) {
+          const createdAtMs = Date.parse(String(row.createdAtIso || ""));
+          if (Number.isFinite(createdAtMs) && createdAtMs < input.cutoffMs) keep = false;
+        }
+        if (keep && matchesJournalEntry(row, input)) matched.push(row);
+      } catch { /* ignore */ }
+    }
+    return matched; // newest -> oldest (même ordre que l'ancien queue.reverse())
+  } finally {
+    if (fh) {
+      await fh.close().catch(() => undefined);
+    }
+  }
+}
 
 export type V2RiskJournalEntry = {
   id: string;
@@ -287,14 +374,21 @@ export async function readV2RiskJournalEntries(options?: {
   const symbol = String(options?.symbol || "").trim().toUpperCase();
   const timeframe = String(options?.timeframe || "").trim();
   const strategy = String(options?.strategy || "").trim().toLowerCase();
-  const limit = Math.max(1, Math.min(2_000, Math.round(Number(options?.limit || 40))));
+  // Cap configurable (ancien cap dur 2000 supprimé) : permet de couvrir 24h/72h.
+  const limit = Math.max(1, Math.min(RUNTIME_JOURNAL_MAX_TAIL_LINES, Math.round(Number(options?.limit || 40))));
   const sinceDays = Math.max(0, Math.min(90, Number(options?.sinceDays || 0)));
   const action = String(options?.action || "").trim().toLowerCase();
   const cutoffMs = sinceDays > 0 ? Date.now() - sinceDays * 24 * 60 * 60 * 1000 : 0;
 
   try {
-    return await streamTailMatchingEntries({ symbol, timeframe, strategy, action, cutoffMs, limit });
-  } catch {
-    return [];
+    // Lecture depuis la FIN, bornée par la fenêtre temporelle (cutoff) — O(fenêtre), pas O(fichier).
+    return await readJournalTailFromEnd({ symbol, timeframe, strategy, action, cutoffMs, limit });
+  } catch (error) {
+    // Fichier absent = vide légitime ; toute autre erreur est propagée (pas de [] silencieux qui
+    // ferait conclure faussement coveredHours=0 / BLOCKED_BY_DATA).
+    if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
+      return [];
+    }
+    throw error;
   }
 }
