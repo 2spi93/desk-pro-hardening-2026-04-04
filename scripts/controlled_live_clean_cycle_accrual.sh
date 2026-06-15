@@ -21,7 +21,10 @@ REQUIRED="${CONTROLLED_LIVE_REQUIRED_CLEAN_CYCLES:-3}"
 SKIP_SCAN="${TXT_CLEAN_CYCLE_SKIP_SCAN:-0}"   # 1 = test sur un GATE_REPORT fourni, sans relancer le scan
 HISTORY_MAX=24
 
-# Telegram (réutilise les secrets existants)
+# Telegram (réutilise les secrets existants).
+# TELEGRAM_DRY_RUN=1 → n'envoie rien (logge seulement) : à utiliser dans les tests/fixtures
+# pour ne JAMAIS toucher le vrai bot (le fallback `:-` relit sinon le fichier secret).
+TELEGRAM_DRY_RUN="${TELEGRAM_DRY_RUN:-0}"
 TELEGRAM_API_BASE_URL="${TELEGRAM_API_BASE_URL:-https://api.telegram.org}"
 TELEGRAM_BOT_TOKEN_FILE="${TELEGRAM_BOT_TOKEN_FILE:-$ROOT_DIR/secrets/telegram_bot_token}"
 TELEGRAM_CHAT_ID_FILE="${TELEGRAM_CHAT_ID_FILE:-$ROOT_DIR/secrets/telegram_chat_id}"
@@ -132,6 +135,10 @@ printf 'CONTROLLED_LIVE_GATE_CURRENT_CLEAN_CYCLES=%s\n' "$clean_cycles" > "$ENV_
 # --- alertes Telegram sur transitions significatives uniquement (anti-spam) ---
 notify() {
   local text="$1"
+  if [ "$TELEGRAM_DRY_RUN" = "1" ]; then
+    echo "[clean-accrual] telegram (dry-run, suppressed): $text"
+    return 0
+  fi
   if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
     local payload
     payload="$(python3 -c "import json,sys;print(json.dumps({'chat_id':'$TELEGRAM_CHAT_ID','text':sys.argv[1],'disable_web_page_preview':True}))" "$text")"
