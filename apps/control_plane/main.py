@@ -164,6 +164,14 @@ def _opportunity_gate_thresholds() -> dict[str, float]:
         "max_freshness_ms": max(50.0, min(60000.0, _env_float("OPPORTUNITY_GATE_MAX_FRESHNESS_MS", 2000.0))),
         "kill_consistency_pct": max(0.0, min(100.0, _env_float("OPPORTUNITY_GATE_KILL_CONSISTENCY_PCT", 65.0))),
         "kill_deviation_bps": max(0.1, min(500.0, _env_float("OPPORTUNITY_GATE_KILL_DEVIATION_BPS", 25.0))),
+        # Hysteresis: deviation must exceed kill_deviation_bps for N consecutive
+        # observation cycles (~5s each) before latching the kill switch. The
+        # cross-venue deviation metric is naturally noisy (transient 30-42bps
+        # single-cycle spikes ~daily, all self-resolving), so a single-cycle
+        # hard kill is too trigger-happy and keeps resetting clean_cycles. A
+        # single breach still drops the gate to no-go (deviation_above_threshold);
+        # only a SUSTAINED dislocation kills. Same pattern as kill_on_consecutive_failures.
+        "deviation_kill_consecutive": max(1.0, min(50.0, _env_float("OPPORTUNITY_GATE_DEVIATION_KILL_CONSECUTIVE", 4.0))),
     }
 
 
@@ -310,6 +318,9 @@ def _save_opportunity_gate_state(state: dict[str, Any]) -> None:
 _OBSERVATION_FAILURE_STREAK = 0
 _LAST_GOOD_OBSERVATION: dict[str, Any] | None = None
 _LAST_GOOD_OBSERVATION_AT: datetime | None = None
+# Consecutive observation cycles where deviation_bps exceeded kill_deviation_bps.
+# Drives the deviation-kill hysteresis (see _opportunity_gate_thresholds).
+_DEVIATION_KILL_STREAK = 0
 
 
 def _execution_router_observation_timeout_sec() -> float:
@@ -368,7 +379,7 @@ def _compute_opportunity_health_score(
     return round(_clamp(base_score - penalties, 0.0, 100.0), 2)
 
 
-def _evaluate_opportunity_gate(observation: dict[str, Any], *, last_error: str | None = None) -> dict[str, Any]:
+def _evaluate_opportunity_gate(observation: dict[str, Any], *, last_error: str | None = None, deviation_kill_streak: int = 0) -> dict[str, Any]:
     thresholds = _opportunity_gate_thresholds()
     consistency = _clamp(_to_float(observation.get("consistency"), 0.0), 0.0, 100.0)
     candidate_count = max(0, int(_to_float(observation.get("candidate_count"), 0.0)))
@@ -402,7 +413,14 @@ def _evaluate_opportunity_gate(observation: dict[str, Any], *, last_error: str |
         kill_reasons.extend(sorted(severe_flags.intersection(flags)))
     if valid_observation and consistency < thresholds["kill_consistency_pct"]:
         kill_reasons.append("consistency_kill_threshold")
-    if valid_observation and deviation_bps > thresholds["kill_deviation_bps"]:
+    # Deviation kill with hysteresis: a single-cycle breach is NOT enough (the
+    # cross-venue deviation metric spikes transiently). The breach already forces
+    # no-go via deviation_above_threshold; the kill only latches after the breach
+    # persists for `deviation_kill_consecutive` consecutive valid cycles.
+    deviation_breach = bool(valid_observation and deviation_bps > thresholds["kill_deviation_bps"])
+    deviation_kill_consecutive = max(1, int(thresholds.get("deviation_kill_consecutive", 4)))
+    new_deviation_kill_streak = (deviation_kill_streak + 1) if deviation_breach else 0
+    if deviation_breach and new_deviation_kill_streak >= deviation_kill_consecutive:
         kill_reasons.append("deviation_kill_threshold")
 
     status = "go" if not reasons else "no-go"
@@ -431,7 +449,11 @@ def _evaluate_opportunity_gate(observation: dict[str, Any], *, last_error: str |
             "freshness_ms": round(freshness_ms, 3),
             "bus_seq": bus_seq,
             "failure_blocking": failure_blocking,
+            "deviation_breach": deviation_breach,
+            "deviation_kill_streak": new_deviation_kill_streak,
+            "deviation_kill_consecutive": deviation_kill_consecutive,
         },
+        "deviation_kill_streak": new_deviation_kill_streak,
         "thresholds": thresholds,
         "recommended_mode": recommended_mode,
         "source": "execution-router/health",
@@ -443,13 +465,13 @@ def _evaluate_opportunity_gate(observation: dict[str, Any], *, last_error: str |
 
 
 async def _refresh_opportunity_gate_state() -> dict[str, Any]:
-    global _OBSERVATION_FAILURE_STREAK, _LAST_GOOD_OBSERVATION, _LAST_GOOD_OBSERVATION_AT
+    global _OBSERVATION_FAILURE_STREAK, _LAST_GOOD_OBSERVATION, _LAST_GOOD_OBSERVATION_AT, _DEVIATION_KILL_STREAK
     try:
         observation = await _fetch_execution_router_observation()
         _OBSERVATION_FAILURE_STREAK = 0
         _LAST_GOOD_OBSERVATION = dict(observation)
         _LAST_GOOD_OBSERVATION_AT = _now_utc()
-        state = _evaluate_opportunity_gate(observation)
+        state = _evaluate_opportunity_gate(observation, deviation_kill_streak=_DEVIATION_KILL_STREAK)
     except Exception as exc:
         _OBSERVATION_FAILURE_STREAK += 1
         last_good_age_sec = (
@@ -473,6 +495,7 @@ async def _refresh_opportunity_gate_state() -> dict[str, Any]:
             state = _evaluate_opportunity_gate(
                 degraded_observation,
                 last_error=f"observation_retry_streak_{_OBSERVATION_FAILURE_STREAK}: {exc}",
+                deviation_kill_streak=_DEVIATION_KILL_STREAK,
             )
         else:
             fallback_observation = _default_opportunity_gate_state()["metrics"]
@@ -488,7 +511,14 @@ async def _refresh_opportunity_gate_state() -> dict[str, Any]:
                     "updated_at": None,
                 },
                 last_error=str(exc),
+                deviation_kill_streak=_DEVIATION_KILL_STREAK,
             )
+
+    # Persist the consecutive-deviation-breach counter for the next cycle.
+    try:
+        _DEVIATION_KILL_STREAK = int(state.get("deviation_kill_streak", _DEVIATION_KILL_STREAK))
+    except (TypeError, ValueError):
+        _DEVIATION_KILL_STREAK = 0
 
     if state.get("kill_switch_recommended") and CURRENT_SYSTEM_MODE in {SystemMode.GUARDED_AUTO, SystemMode.MANAGED_LIVE}:
         kill_state = _kill_switch_state()
