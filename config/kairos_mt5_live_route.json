@@ -3,7 +3,7 @@
   "route_key": "default",
   "provider": "mt5",
   "account_id": "541283177",
-  "live_enabled": true,
+  "live_enabled": false,
   "preferred_venue": "mt5",
   "symbol_map": {
     "BTCUSDT": "BTCUSD"

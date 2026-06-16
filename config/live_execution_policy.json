@@ -108,7 +108,7 @@
       }
     },
     "mt5": {
-      "enabled": true,
+      "enabled": false,
       "conditional_live_rules": {
         "BTCUSD": {
           "reason": "ftmo_btc_bridge_symbol_enabled"
