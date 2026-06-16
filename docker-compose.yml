@@ -618,6 +618,13 @@ services:
       context: .
       dockerfile: Dockerfile.compactor
     <<: *txt-runtime-guardrails
+    # pyarrow (C1) materializes whole JSONL files into in-memory Arrow tables to
+    # write Parquet, which spikes well past the file size. The market-data trade
+    # files have grown to 65-90MB each, so the shared 1g runtime guardrail OOM-kills
+    # the compactor (exit 137). Override mem for this batch-only container (it runs
+    # via `docker compose run --rm`, not a persistent service) so Parquet succeeds.
+    mem_limit: "${TXT_COMPACTOR_MEM_LIMIT:-3g}"
+    memswap_limit: "${TXT_COMPACTOR_MEMSWAP_LIMIT:-3g}"
     profiles: ["tools"]
     working_dir: /workspace
     volumes:
