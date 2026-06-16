@@ -2063,6 +2063,14 @@ async def place_live_order(payload: dict) -> dict:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
         sizing_telemetry = getattr(exc, "sizing_telemetry", None)
+        # Observability: surface the upstream venue error (the RuntimeError text
+        # already carries the BingX HTTP status + response body, i.e. retCode/retMsg)
+        # plus the order params, so a live-order rejection is no longer a mute 502.
+        _order_dbg = {
+            key: payload.get(key)
+            for key in ("symbol", "side", "position_side", "order_type", "notional_usd", "quantity")
+        }
+        print(f"[live-order] {provider} live order FAILED: {exc} | request={_order_dbg}", flush=True)
         if isinstance(sizing_telemetry, dict):
             raise HTTPException(
                 status_code=502,
