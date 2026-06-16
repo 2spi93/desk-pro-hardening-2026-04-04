@@ -339,6 +339,18 @@ async def _bingx_signed_request(secret_payload: dict, method: str, path: str, pa
     query_string = urlencode(sorted(query.items()))
     signature = hmac.new(api_secret.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
     url = f"{BINGX_API_BASE_URL}{path}?{query_string}&signature={signature}"
+    # Flag-gated canonical-signature diagnostic. NEVER logs the secret, the full
+    # signature, the full api_key, or auth headers — only the canonical query
+    # shape so a signature mismatch can be compared at the byte/param level.
+    if os.getenv("BINGX_SIGNING_DIAGNOSTICS") == "1":
+        _ts = int(query.get("timestamp", "0") or 0)
+        _age = int(time.time() * 1000) - _ts
+        print(
+            f"[SIGN_DIAG] method={method.upper()} path={path} keys={sorted(query.keys())} "
+            f"cq_len={len(query_string)} cq_sha12={hashlib.sha256(query_string.encode()).hexdigest()[:12]} "
+            f"ts_age_ms={_age} recvWindow={query.get('recvWindow')} key_sfx={api_key[-6:]}",
+            flush=True,
+        )
     try:
         async with httpx.AsyncClient(timeout=20.0) as client:
             response = await client.request(method.upper(), url, headers={"X-BX-APIKEY": api_key})
