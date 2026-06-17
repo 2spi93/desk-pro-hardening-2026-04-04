@@ -35,7 +35,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SCRIPT_DIR/lib/control_plane_helpers.sh"
 txt_source_repo_env
 
-CONTROL_PLANE_URL="${CONTROL_PLANE_URL:-http://127.0.0.1:8000}"
+# Host-side script: txt_source_repo_env loads .env which sets CONTROL_PLANE_URL to
+# the docker-internal name (control-plane:8000) — NOT resolvable from the host.
+# Hard-assign the host-published address (127.0.0.1:8000) like the other operator
+# scripts. Override only via CONTROL_PLANE_URL_HOST if the published port differs.
+CONTROL_PLANE_URL="${CONTROL_PLANE_URL_HOST:-http://127.0.0.1:8000}"
 USERNAME="${USERNAME:-operator}"
 PASSWORD="${PASSWORD:-}"
 ACCOUNT_ID="${ACCOUNT_ID:-29586394}"
@@ -214,7 +218,8 @@ except urllib.error.HTTPError as e:
 " 2>/dev/null | sed -n 's/^J=//p' | tail -1)"
 echo "  $RG_JSON"
 RG_DECISION="$(python3 -c "import json,sys;print(json.loads(sys.argv[1]).get('decision'))" "$RG_JSON" 2>/dev/null || echo error)"
-[ "$RG_DECISION" = "approved" ] || { echo "  STOP: risk-gateway decision=$RG_DECISION"; PRECHECK_OK=0; }
+# risk-gateway emits decision="accept" (approve) / "reject" (deny) — see risk_gateway/main.py:171,186
+[ "$RG_DECISION" = "accept" ] || { echo "  STOP: risk-gateway decision=$RG_DECISION"; PRECHECK_OK=0; }
 fi
 
 # --- broker dry-run (param + protection proof, no BingX) --------------------
