@@ -134,16 +134,20 @@ def _build_bingx_attached_protection_params(
         trigger_price = _to_float(leg.get("trigger_price"), 0.0)
         _validate_leg(request_key, trigger_price)
         order_type = str(leg.get("order_type") or "market").strip().lower()
-        payload: dict[str, str] = {
+        # BingX parses the TP/SL leg JSON with typed fields: stopPrice/price must
+        # be JSON NUMBERS (float64), not quoted strings — a quoted value is
+        # rejected with "Mismatch type float64 with value string". Use _json_number
+        # so json.dumps emits a bare number; type/workingType stay string enums.
+        payload: dict[str, object] = {
             "type": market_type if order_type != "limit" else limit_type,
-            "stopPrice": _format_decimal(trigger_price),
+            "stopPrice": _json_number(trigger_price),
             "workingType": _normalize_bingx_working_type(leg.get("working_type")),
         }
         if order_type == "limit":
             limit_price = _to_float(leg.get("limit_price"), 0.0)
             if limit_price <= 0:
                 raise ValueError(f"{request_key} limit order requires limit_price")
-            payload["price"] = _format_decimal(limit_price)
+            payload["price"] = _json_number(limit_price)
         payloads[param_key] = json.dumps(payload, separators=(",", ":"))
     return payloads
 
@@ -336,8 +340,17 @@ async def _bingx_signed_request(secret_payload: dict, method: str, path: str, pa
     }
     query["timestamp"] = str(int(time.time() * 1000))
     query.setdefault("recvWindow", "60000")
+    # BingX verifies the HMAC over the RAW (url-decoded) sorted "key=value&..."
+    # string — exactly as their official SDK signs it — NOT the percent-encoded
+    # form. For simple values raw == encoded so this is a no-op, but native TP/SL
+    # legs are JSON strings whose `{ } " : ,` get percent-encoded by urlencode
+    # (`%7B%22...`); signing that encoded form diverges from what BingX recomputes
+    # after url-decoding, which it rejects as "signature mismatch". Sign the raw
+    # canonical string; transport the url-encoded values (BingX decodes before
+    # verifying, so the two round-trip back to the same raw payload).
+    signing_payload = "&".join(f"{key}={value}" for key, value in sorted(query.items()))
+    signature = hmac.new(api_secret.encode("utf-8"), signing_payload.encode("utf-8"), hashlib.sha256).hexdigest()
     query_string = urlencode(sorted(query.items()))
-    signature = hmac.new(api_secret.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
     url = f"{BINGX_API_BASE_URL}{path}?{query_string}&signature={signature}"
     # Flag-gated canonical-signature diagnostic. NEVER logs the secret, the full
     # signature, the full api_key, or auth headers — only the canonical query
@@ -347,6 +360,7 @@ async def _bingx_signed_request(secret_payload: dict, method: str, path: str, pa
         _age = int(time.time() * 1000) - _ts
         print(
             f"[SIGN_DIAG] method={method.upper()} path={path} keys={sorted(query.keys())} "
+            f"sp_len={len(signing_payload)} sp_sha12={hashlib.sha256(signing_payload.encode()).hexdigest()[:12]} "
             f"cq_len={len(query_string)} cq_sha12={hashlib.sha256(query_string.encode()).hexdigest()[:12]} "
             f"ts_age_ms={_age} recvWindow={query.get('recvWindow')} key_sfx={api_key[-6:]}",
             flush=True,

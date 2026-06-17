@@ -6482,8 +6482,15 @@ async def _bingx_signed_request(secret_payload: dict, method: str, path: str, pa
     }
     query["timestamp"] = str(int(_now_utc().timestamp() * 1000))
     query.setdefault("recvWindow", "60000")
+    # BingX verifies the HMAC over the RAW (url-decoded) sorted "key=value&..."
+    # string (as its official SDK signs), NOT the percent-encoded form. Simple
+    # values make raw == encoded (no-op here, since control-plane only issues GET
+    # reads), but signing the raw canonical string keeps this identical to the
+    # broker order path and immune to any future JSON-valued param. Transport the
+    # url-encoded values; BingX url-decodes before verifying.
+    signing_payload = "&".join(f"{key}={value}" for key, value in sorted(query.items()))
+    signature = hmac.new(api_secret.encode("utf-8"), signing_payload.encode("utf-8"), hashlib.sha256).hexdigest()
     query_string = urlencode(sorted(query.items()))
-    signature = hmac.new(api_secret.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
     url = f"{BINGX_API_BASE_URL}{path}?{query_string}&signature={signature}"
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
