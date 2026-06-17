@@ -86,3 +86,6 @@ token.txt
 sites/*/.autopublish/
 sites/*/backups/
 sites/*/*.snapshot.*.html
+
+# Operator audit artifacts from marketable-limit harness (sanitized, but operational — not source)
+var/marketable_limit_captures/

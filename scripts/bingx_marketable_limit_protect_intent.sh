@@ -56,6 +56,8 @@ MODE="preview"
 CONFIRM_LIVE=""
 GO="0"
 CURL_INSECURE="${CURL_INSECURE:-0}"
+PRINT_RAW="${PRINT_RAW:-0}"
+CAPTURE_DIR="${CAPTURE_DIR:-/opt/txt/var/marketable_limit_captures}"
 
 usage() { sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; cat <<'EOF'
 
@@ -63,6 +65,10 @@ Usage: bingx_marketable_limit_protect_intent.sh [preview|execute] [options]
   --account-id V   --symbol V   --side buy|sell   --notional-usd V
   --buffer-bps V   --max-buffer-bps V   --observe-seconds V
   --confirm-live MARKETABLE_LIMIT_EXECUTE   --go   (both required for execute)
+  --print-raw            audit capture: sanitized entry request + raw entry
+                         response (legs echo) + post-entry checks -> JSON artifact.
+                         Aliases: --capture-entry-response --capture-protection-echo
+  --capture-dir DIR      where to write the JSON artifact (default /opt/txt/var/...)
   --insecure   -h|--help
 EOF
 }
@@ -81,6 +87,9 @@ while [ "$#" -gt 0 ]; do
     --password) PASSWORD="$2"; shift 2 ;;
     --confirm-live) CONFIRM_LIVE="$2"; shift 2 ;;
     --go) GO="1"; shift 1 ;;
+    # audit capture (no order-behaviour change). aliases all set the same flag.
+    --print-raw|--capture-entry-response|--capture-protection-echo) PRINT_RAW="1"; shift 1 ;;
+    --capture-dir) CAPTURE_DIR="$2"; shift 2 ;;
     --insecure) CURL_INSECURE="1"; shift 1 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage; exit 2 ;;
@@ -99,6 +108,32 @@ if [ "$MODE" = "execute" ]; then
 fi
 
 dex() { docker exec -i "$1" python -c "$2"; }
+
+# --- audit capture setup ----------------------------------------------------
+CAPTURE_FILE=""
+if [ "$PRINT_RAW" = "1" ]; then
+  if ! mkdir -p "$CAPTURE_DIR" 2>/dev/null; then CAPTURE_DIR="/tmp/marketable_limit_captures"; mkdir -p "$CAPTURE_DIR"; fi
+  CAPTURE_FILE="$CAPTURE_DIR/mlp-${MODE}-$(date -u +%Y%m%dT%H%M%SZ).json"
+fi
+# Host-side last-line-of-defence redactor applied to anything written/printed.
+# Primary redaction happens IN-CONTAINER before the data crosses the boundary;
+# this is belt-and-suspenders. Drops any secret/auth/signature-bearing key.
+redact_and_write() {  # $1=output path, $2=raw json (passed via env, NOT stdin —
+                      # stdin is taken by the heredoc program for `python3 -`)
+  RAW_JSON="$2" python3 - "$1" <<'PY'
+import json,os,sys
+REDACT={'api_key','apikey','api_secret','secret','secret_payload','signature','sign',
+        'x-bx-apikey','authorization','cookie','token','access_token','password','signed_url','url'}
+def red(o):
+    if isinstance(o,dict): return {k:('<redacted>' if k.lower() in REDACT else red(v)) for k,v in o.items()}
+    if isinstance(o,list): return [red(x) for x in o]
+    return o
+path=sys.argv[1]
+clean=red(json.loads(os.environ["RAW_JSON"]))
+with open(path,'w',encoding='utf-8') as f: json.dump(clean,f,indent=2,sort_keys=True)
+print(path)
+PY
+}
 
 # --- read-only pre-check (both modes) --------------------------------------
 SWAP="$SYMBOL"; case "$SYMBOL" in *-*) ;; *USDT) SWAP="${SYMBOL%USDT}-USDT";; esac
@@ -226,6 +261,41 @@ cat <<EOF
 EOF
 
 if [ "$MODE" = "preview" ]; then
+  if [ "$PRINT_RAW" = "1" ]; then
+    # Preview capture: the SANITIZED entry request that WOULD be sent (from the
+    # broker dry-run's request_params, which already excludes apiKey/timestamp/
+    # signature), the orderbook snapshot used, and the dry-run protection echo.
+    # No order exists in preview, so entry_response_raw/post_entry_checks=null.
+    CAP_OUT="$(DRY_JSON="$DRY_JSON" SYMBOL="$SYMBOL" SIDE="$SIDE" POSSIDE="$POSSIDE" \
+      PRICE="$PRICE" TP="$TP" SL="$SL" NOTIONAL_USD="$NOTIONAL_USD" \
+      BID="$BID" ASK="$ASK" python3 - <<'PY'
+import json,os,datetime
+dry=json.loads(os.environ["DRY_JSON"])
+rp=(dry.get("dry_run") or {}).get("request_params") or {}
+cap={
+ "mode":"preview","captured_at":datetime.datetime.utcnow().isoformat()+"Z",
+ "entry_request_sanitized":{
+   "symbol":os.environ["SYMBOL"],"side":os.environ["SIDE"],
+   "positionSide":os.environ["POSSIDE"],"type":"LIMIT","timeInForce":"IOC",
+   "price":float(os.environ["PRICE"]),
+   "quantity":rp.get("quantity"),"notional":float(os.environ["NOTIONAL_USD"]),
+   "takeProfit":rp.get("takeProfit"),"stopLoss":rp.get("stopLoss"),
+   "clientOrderId":rp.get("clientOrderId")},
+ "entry_response_raw":None,
+ "dry_run_protection":dry.get("protection"),
+ "dry_run_protection_status":dry.get("protection_status"),
+ "post_entry_checks":None,
+ "orderbook_snapshot_used":{"venue":"bingx-public","bid":float(os.environ["BID"]),
+   "ask":float(os.environ["ASK"]),"source":"real-read-only"}}
+print(json.dumps(cap))
+PY
+)"
+    redact_and_write "$CAPTURE_FILE" "$CAP_OUT" >/dev/null
+    echo
+    echo "=== AUDIT CAPTURE (preview, sanitized) ==="
+    echo "  artifact: $CAPTURE_FILE"
+    echo "$CAP_OUT" | python3 -c "import json,sys;d=json.load(sys.stdin);print('  entry_request_sanitized:',json.dumps(d['entry_request_sanitized']));print('  dry_run_protection_status:',d['dry_run_protection_status']);print('  orderbook_snapshot_used:',json.dumps(d['orderbook_snapshot_used']))"
+  fi
   echo
   echo ">>> preview only — no mode change, no order placed. (PRECHECK_OK=$PRECHECK_OK)"
   exit $([ "$PRECHECK_OK" = 1 ] && echo 0 || echo 1)
@@ -277,10 +347,24 @@ echo "=== ENTER managed_live (order window) ==="
 set_mode managed_live "marketable_limit_protection_v1"
 
 echo "=== SUBMIT marketable LIMIT (ONE order) ==="
-ORDER_JSON="$(dex "$CONTROL_PLANE_CONTAINER" "
+SUBMIT_OUT="$(dex "$CONTROL_PLANE_CONTAINER" "
 import asyncio,json;import apps.control_plane.main as cp, httpx
+PR=${PRINT_RAW}
+REDACT={'api_key','apikey','api_secret','secret','secret_payload','signature','sign','x-bx-apikey','authorization','cookie','token','access_token','password','signed_url','url'}
+def red(o):
+    if isinstance(o,dict): return {k:('<redacted>' if k.lower() in REDACT else red(v)) for k,v in o.items()}
+    if isinstance(o,list): return [red(x) for x in o]
+    return o
+async def usdt_avail(sp):
+    try:
+        bal=await cp._bingx_fetch_futures_balances(sp)
+        items=cp._bingx_extract_dict_items(bal,'balance','balances','data','list')
+        u=next((b for b in items if str(b.get('asset') or '').upper()=='USDT'),{})
+        return u.get('availableMargin')
+    except Exception: return None
 async def m():
     info,sp=cp._bingx_secret_payload_for_account('${ACCOUNT_ID}',require_trade=True)
+    bal_before=await usdt_avail(sp) if PR else None
     body={'provider':'bingx','account_id':'${ACCOUNT_ID}','secret_payload':sp,'symbol':'${SYMBOL}',
       'side':'${SIDE}','position_side':'${POSSIDE}','order_type':'LIMIT','price':${PRICE},
       'notional_usd':${NOTIONAL_USD},'time_in_force':'IOC','client_order_id':'txt-mlp-'+str(int(__import__('time').time())),
@@ -292,8 +376,28 @@ async def m():
         out=r.json() if r.headers.get('content-type','').startswith('application/json') else {'http':r.status_code,'text':r.text[:300]}
     safe={k:out.get(k) for k in ('order_id','status','protection_status','avg_fill_price','filled_notional_usd','fills')}
     print('J='+json.dumps(safe,separators=(',',':')))
+    if PR:
+        # post-entry truth read in the SAME container call (atomic with the entry)
+        try:
+            pos=await cp._bingx_signed_get(sp,'/openApi/swap/v2/user/positions',{'symbol':'${SWAP}'})
+            ptruth=cp._bingx_flattenable_positions(pos,'${ACCOUNT_ID}',symbol='${SYMBOL}')
+            oo=await cp._bingx_signed_get(sp,'/openApi/swap/v2/trade/openOrders',{'symbol':'${SWAP}'})
+            oorders=len(cp._bingx_extract_dict_items(oo,'orders','data','list'))
+        except Exception as e:
+            ptruth=[{'read_error':str(e)[:120]}]; oorders=None
+        ereq={k:v for k,v in body.items() if k!='secret_payload'}  # strip secret pre-redact
+        cap={'mode':'execute',
+             'entry_request_sanitized':red(ereq),
+             'entry_response_raw':red(out),
+             'post_entry_checks':{'protection_status':out.get('protection_status'),
+                 'position_truth':red(ptruth),'open_orders':oorders,
+                 'balance_before':bal_before,'balance_after':None,
+                 'orderbook_snapshot_used':{'venue':'bingx-public','bid':${BID},'ask':${ASK},'source':'real-read-only'}}}
+        print('CAPTURE='+json.dumps(cap,separators=(',',':')))
 asyncio.run(m())
-" 2>/dev/null | sed -n 's/^J=//p' | tail -1)"
+" 2>/dev/null)"
+ORDER_JSON="$(printf '%s\n' "$SUBMIT_OUT" | sed -n 's/^J=//p' | tail -1)"
+CAP_ENTRY="$(printf '%s\n' "$SUBMIT_OUT" | sed -n 's/^CAPTURE=//p' | tail -1)"
 echo "  $ORDER_JSON"
 
 VERDICT="$(python3 - "$ORDER_JSON" <<'PY'
@@ -318,13 +422,47 @@ revert_and_flatten
 trap - EXIT
 
 echo "=== POST-STATE ==="
-dex "$CONTROL_PLANE_CONTAINER" "
+POSTSTATE="$(dex "$CONTROL_PLANE_CONTAINER" "
 import asyncio,json;import apps.control_plane.main as cp
 async def m():
     info,sp=cp._bingx_secret_payload_for_account('${ACCOUNT_ID}',require_trade=False)
     pos=await cp._bingx_signed_get(sp,'/openApi/swap/v2/user/positions',{'symbol':'${SWAP}'})
     flat=cp._bingx_flattenable_positions(pos,'${ACCOUNT_ID}',symbol='${SYMBOL}')
-    print('  open_positions='+str(len(flat)))
+    oo=await cp._bingx_signed_get(sp,'/openApi/swap/v2/trade/openOrders',{'symbol':'${SWAP}'})
+    oorders=len(cp._bingx_extract_dict_items(oo,'orders','data','list'))
+    bal=await cp._bingx_fetch_futures_balances(sp)
+    items=cp._bingx_extract_dict_items(bal,'balance','balances','data','list')
+    u=next((b for b in items if str(b.get('asset') or '').upper()=='USDT'),{})
+    print('J='+json.dumps({'open_positions':len(flat),'open_orders':oorders,'balance_after':u.get('availableMargin')}))
 asyncio.run(m())
-" 2>/dev/null | tail -1
+" 2>/dev/null | sed -n 's/^J=//p' | tail -1)"
+echo "  $POSTSTATE"
 echo "  done. mode restored to guarded_auto."
+
+if [ "$PRINT_RAW" = "1" ] && [ -n "$CAP_ENTRY" ]; then
+  echo "=== AUDIT CAPTURE (execute, sanitized) ==="
+  # JSON passed via env (RAW_JSON/CAP_POSTSTATE); stdin belongs to the heredoc program.
+  RAW_JSON="$CAP_ENTRY" CAP_POSTSTATE="$POSTSTATE" python3 - "$CAPTURE_FILE" <<'PY' && echo "  artifact: $CAPTURE_FILE"
+import json,sys,os,datetime
+REDACT={'api_key','apikey','api_secret','secret','secret_payload','signature','sign',
+        'x-bx-apikey','authorization','cookie','token','access_token','password','signed_url','url'}
+def red(o):
+    if isinstance(o,dict): return {k:('<redacted>' if k.lower() in REDACT else red(v)) for k,v in o.items()}
+    if isinstance(o,list): return [red(x) for x in o]
+    return o
+cap=red(json.loads(os.environ["RAW_JSON"]))
+cap["captured_at"]=datetime.datetime.utcnow().isoformat()+"Z"
+ps=json.loads(os.environ.get("CAP_POSTSTATE") or "{}")
+pec=cap.setdefault("post_entry_checks",{})
+pec["balance_after"]=ps.get("balance_after")
+cap["final_state"]={"open_positions":ps.get("open_positions"),"open_orders":ps.get("open_orders"),
+                    "flat":ps.get("open_positions")==0 and ps.get("open_orders")==0}
+with open(sys.argv[1],"w",encoding="utf-8") as f: json.dump(cap,f,indent=2,sort_keys=True)
+e=cap.get("entry_response_raw") or {}
+print("  order_id:",e.get("order_id"),"status:",e.get("status"),"protection_status:",e.get("protection_status"))
+print("  takeProfit echo:",json.dumps(((e.get("protection") or {}).get("accepted") or {}).get("take_profit")))
+print("  stopLoss  echo:",json.dumps(((e.get("protection") or {}).get("accepted") or {}).get("stop_loss")))
+print("  balance_before:",pec.get("balance_before"),"-> balance_after:",pec.get("balance_after"))
+print("  final flat:",cap["final_state"]["flat"])
+PY
+fi
