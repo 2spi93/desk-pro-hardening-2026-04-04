@@ -10367,6 +10367,12 @@ def _intent_live_execution_context(intent_payload: dict[str, Any]) -> dict[str, 
         "dry_run": _bool_from_any(live.get("dry_run"), False),
         "dry_run_accepted_legs": live.get("dry_run_accepted_legs") if isinstance(live.get("dry_run_accepted_legs"), (list, tuple, set, str)) else None,
         "protection": protection,
+        # D1 autonomous proof-renewal markers must survive into the routed payload so
+        # execution_router forces a MARKET taker (deterministic fill). Without these,
+        # the marker was dropped here and D1 never applied (the cycle fell back to the
+        # execution-AI's non-deterministic choice — sometimes a non-filling LIMIT).
+        "proof_renewal": _bool_from_any(live.get("proof_renewal"), False),
+        "proof_cycle_id": str(live.get("proof_cycle_id") or "").strip() or None,
     }
 
 

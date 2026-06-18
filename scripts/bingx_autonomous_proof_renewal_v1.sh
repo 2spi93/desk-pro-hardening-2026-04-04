@@ -207,10 +207,28 @@ print(intent_not_executed_reason(d) or '')" "$1")"
   echo "  [$2] executed live."
 }
 
+# verify an actual canonical fill persisted (status='executed' is not enough — a
+# placed-but-unfilled LIMIT also reports executed). Abort if no fill.
+assert_fill_persisted() { # $1=decision_id  $2=leg label
+  local got
+  got="$(docker exec -i "$CP_CONTAINER" python -c "
+import time,apps.control_plane.main as cp
+for _ in range(4):
+    if cp.fetch_all('SELECT 1 FROM execution_fill_events WHERE decision_id=%s AND fill_type=%s AND venue=%s LIMIT 1',('$1','live-broker','bingx')): print('FILL'); break
+    time.sleep(1)
+else: print('NOFILL')" 2>/dev/null | tail -1)"
+  if [ "$got" != "FILL" ]; then
+    echo "  ABORT[$2]: no canonical fill persisted (order placed but did not fill) — no retry, trap will flatten + revert" >&2
+    exit 9
+  fi
+  echo "  [$2] canonical fill verified."
+}
+
 echo "=== ENTER managed_live (bounded) ==="; set_mode managed_live "autonomous_proof_renewal"
 echo "=== ENTRY intent (autonomous MARKET taker) ==="
 ENTRY_RESP="$(submit_intent "$ENTRY_DECISION_ID" "$SIDE" "false")"; printf '%s' "$ENTRY_RESP" | tail -c 400; echo
 assert_executed "$ENTRY_RESP" "entry"
+assert_fill_persisted "$ENTRY_DECISION_ID" "entry"
 echo "=== OBSERVE ${OBSERVE_SECONDS}s ==="; sleep "$OBSERVE_SECONDS"
 # hedge-safe close: BUY positionSide=SHORT WITHOUT reduceOnly (BingX hedge mode
 # rejects reduceOnly). In hedge mode the opposite side on the same positionSide
@@ -218,6 +236,7 @@ echo "=== OBSERVE ${OBSERVE_SECONDS}s ==="; sleep "$OBSERVE_SECONDS"
 echo "=== FLATTEN intent (routed, canonical exit fill, hedge-safe no-reduceOnly) ==="
 EXIT_RESP="$(submit_intent "$EXIT_DECISION_ID" "$CLOSE_SIDE" "false")"; printf '%s' "$EXIT_RESP" | tail -c 400; echo
 assert_executed "$EXIT_RESP" "exit"
+assert_fill_persisted "$EXIT_DECISION_ID" "exit"
 
 echo "=== FINALIZE via canonical finalizer (never legacy endpoint) ==="
 docker exec -i "$CP_CONTAINER" python -c "

@@ -103,6 +103,25 @@ def test_runner_generates_reality_gap():
     assert "apply_calibration" in _SRC and "train_brain" in _SRC
 
 
+def test_intent_live_context_forwards_proof_markers():
+    # PORTE 2.5: _intent_live_execution_context whitelists fields; it MUST forward
+    # proof_renewal/proof_cycle_id or D1's MARKET-force never reaches the router.
+    main_src = (_ROOT / "apps" / "control_plane" / "main.py").read_text(encoding="utf-8")
+    import ast
+    tree = ast.parse(main_src)
+    fn = next((n for n in ast.walk(tree)
+               if isinstance(n, ast.FunctionDef) and n.name == "_intent_live_execution_context"), None)
+    assert fn is not None
+    body = ast.get_source_segment(main_src, fn)
+    assert '"proof_renewal"' in body and '"proof_cycle_id"' in body
+
+
+def test_runner_verifies_actual_fill():
+    # PORTE 2.5: 'executed' status is not enough — the runner must verify a fill
+    assert "assert_fill_persisted" in _SRC
+    assert "no canonical fill persisted" in _SRC
+
+
 def test_legacy_endpoint_fenced_for_autonomous_bingx():
     reason = pf.assert_legacy_finalize_not_for_proof_rail(
         "dec-1", {"status": "finalized", "net_result_usd": 5.0},
