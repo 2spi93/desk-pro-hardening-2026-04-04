@@ -1,0 +1,18 @@
+metric,value
+status,"CLOSED / CROSS-SERVICE-COMPRESSION-AUDITED / NO-TXT-IMPACT-OBSERVED"
+date,2026-06-18
+sharedContainer,mission-control-tls
+gtixtConfig,/opt/shared-ingress/gtixt-tls.conf
+txtMissionControlTlsConfig,/opt/txt/docker/mission-control-tls.conf
+txtBridgeTlsConfig,/opt/txt/docker/bridge-tls.conf
+txtGatewayConfig,/opt/txt/docker/mission-control-gateway.conf
+gtixtGzipScope,ISOLATED_SERVER_BLOCK
+globalNginxGzipActive,false
+txtConfigActiveGzip,false
+txtRestAccidentalGzipObserved,false
+txtWebSocketAccidentalGzipObserved,false
+doubleCompressionObserved,false
+actionRequired,false
+gtixtCompressionCanRemainEnabled,true
+txtCompressionChangeNeeded,false
+futureTxtCompressionRequiresSeparateAudit,true

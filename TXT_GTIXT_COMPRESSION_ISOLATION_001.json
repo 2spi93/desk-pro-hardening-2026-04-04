@@ -1,0 +1,105 @@
+{
+  "schema": "txt.gtixt-compression-isolation/v1",
+  "status": "TXT_GTIXT_COMPRESSION_ISOLATION_001",
+  "closedStatus": "CLOSED / CROSS-SERVICE-COMPRESSION-AUDITED / NO-TXT-IMPACT-OBSERVED",
+  "date": "2026-06-18",
+  "scope": {
+    "txtTradingChange": false,
+    "txtBrokerChange": false,
+    "txtExecutionChange": false,
+    "txtMarketDataChange": false,
+    "txtRuntimeChange": false,
+    "gtixtRuntimeChange": false,
+    "compressionConfigChange": false
+  },
+  "ingress": {
+    "sharedContainer": "mission-control-tls",
+    "gtixtConfig": "/opt/shared-ingress/gtixt-tls.conf",
+    "txtMissionControlTlsConfig": "/opt/txt/docker/mission-control-tls.conf",
+    "txtBridgeTlsConfig": "/opt/txt/docker/bridge-tls.conf",
+    "txtGatewayConfig": "/opt/txt/docker/mission-control-gateway.conf"
+  },
+  "findings": {
+    "gtixtGzipScope": "ISOLATED_SERVER_BLOCK",
+    "gtixtServerNames": [
+      "gtixt.com",
+      "admin.gtixt.com",
+      "data.gtixt.com"
+    ],
+    "globalNginxGzipActive": false,
+    "txtConfigActiveGzip": false,
+    "txtRestAccidentalGzipObserved": false,
+    "txtWebSocketAccidentalGzipObserved": false,
+    "doubleCompressionObserved": false,
+    "actionRequired": false
+  },
+  "liveChecks": [
+    {
+      "url": "https://bridge.txt.gtixt.com/healthz",
+      "status": 200,
+      "contentEncoding": null,
+      "verdict": "NO_ACCIDENTAL_GZIP"
+    },
+    {
+      "url": "https://app.txt.gtixt.com/healthz",
+      "status": 200,
+      "contentEncoding": null,
+      "verdict": "NO_ACCIDENTAL_GZIP"
+    },
+    {
+      "url": "https://api.txt.gtixt.com/healthz",
+      "status": 200,
+      "contentEncoding": null,
+      "verdict": "NO_ACCIDENTAL_GZIP"
+    },
+    {
+      "url": "https://txt.gtixt.com/healthz",
+      "status": 308,
+      "contentEncoding": null,
+      "verdict": "NO_ACCIDENTAL_GZIP"
+    },
+    {
+      "url": "https://api.txt.gtixt.com/",
+      "status": 404,
+      "contentEncoding": null,
+      "verdict": "NO_ACCIDENTAL_GZIP"
+    },
+    {
+      "url": "https://bridge.txt.gtixt.com/status",
+      "status": 405,
+      "contentEncoding": null,
+      "verdict": "NO_ACCIDENTAL_GZIP"
+    }
+  ],
+  "webSocketChecks": [
+    {
+      "url": "https://api.txt.gtixt.com/ws/v1/market/quotes",
+      "status": 400,
+      "contentEncoding": null,
+      "verdict": "NO_HTTP_GZIP_INJECTED"
+    },
+    {
+      "url": "https://api.txt.gtixt.com/ws/v1/market/orderbook/depth/EURUSD",
+      "status": 400,
+      "contentEncoding": null,
+      "verdict": "NO_HTTP_GZIP_INJECTED"
+    },
+    {
+      "url": "https://api.txt.gtixt.com/ws/v1/market/trades/EURUSD",
+      "status": 400,
+      "contentEncoding": null,
+      "verdict": "NO_HTTP_GZIP_INJECTED"
+    },
+    {
+      "url": "https://api.txt.gtixt.com/v1/connectors/ws",
+      "status": 400,
+      "contentEncoding": null,
+      "verdict": "NO_HTTP_GZIP_INJECTED"
+    }
+  ],
+  "decision": {
+    "gtixtCompressionCanRemainEnabled": true,
+    "txtCompressionChangeNeeded": false,
+    "futureTxtCompressionRequiresSeparateAudit": true
+  }
+}
