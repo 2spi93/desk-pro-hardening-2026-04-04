@@ -96,10 +96,72 @@ def test_missing_fill_refused():
     assert h.writes == []
 
 
-def test_no_intent_outcome_refused():
+def test_no_outcome_and_no_fills_refused():
+    # no pending row AND no canonical fill -> nothing to finalize
     h = _Harness(outcome=None)
     res = h.run()
-    assert res.action == "refused" and res.reason == "no_intent_outcome"
+    assert res.action == "refused" and res.reason == "no_canonical_fill"
+    assert h.writes == []
+
+
+# ----- D2.3 create-if-missing (no pending decision_outcomes row) --------------
+def test_create_from_fills_when_no_row():
+    h = _Harness(
+        outcome=None,  # autonomous path created no decision_outcomes row
+        fills_by_decision={
+            "dec-1": [_fill("entry-1", side="sell", notional=6.43, fees=0.002)],
+            "exit-1": [_fill("exit-1", side="buy", notional=6.41, fees=0.002)],
+        },
+        reality_gap={"sample_id": "rg-1"},
+    )
+    res = h.run(exit_decision_id="exit-1")
+    assert res.action == "finalized" and res.reason == "created_finalized_from_fills"
+    assert len(h.writes) == 1
+    audit = h.writes[0]["metadata"]["proof_finalization"]
+    assert audit["previous_status"] == "absent" and audit["created_from_fills"] is True
+    assert res.computed["measurement_basis"] == "round_trip"
+
+
+def test_create_refused_without_exit_fill():
+    h = _Harness(outcome=None, fills_by_decision={"dec-1": [_fill("entry-1")]})
+    res = h.run()  # no exit_decision_id
+    assert res.action == "refused" and res.reason == "exit_fill_required"
+    assert h.writes == []
+
+
+def test_create_refused_non_bingx_venue():
+    h = _Harness(outcome=None, fills_by_decision={"dec-1": [_fill("e1", venue="bybit")],
+                                                  "exit-1": [_fill("x1", venue="bybit", side="buy")]})
+    res = h.run(exit_decision_id="exit-1")
+    assert res.action == "refused" and res.reason == "no_canonical_fill"
+    assert h.writes == []
+
+
+def test_create_refused_non_live_broker():
+    h = _Harness(outcome=None, fills_by_decision={"dec-1": [_fill("e1", fill_type="book")],
+                                                  "exit-1": [_fill("x1", fill_type="book", side="buy")]})
+    res = h.run(exit_decision_id="exit-1")
+    assert res.action == "refused" and res.reason == "no_canonical_fill"
+    assert h.writes == []
+
+
+def test_create_refused_qty_mismatch_incoherent():
+    h = _Harness(outcome=None, fills_by_decision={
+        "dec-1": [_fill("entry-1", side="sell", size=0.0001)],
+        "exit-1": [_fill("exit-1", side="buy", size=0.00005)],  # partial close -> not flat
+    })
+    res = h.run(exit_decision_id="exit-1")
+    assert res.action == "refused" and res.reason == "round_trip_incoherent"
+    assert h.writes == []
+
+
+def test_create_refused_same_side_incoherent():
+    h = _Harness(outcome=None, fills_by_decision={
+        "dec-1": [_fill("entry-1", side="sell")],
+        "exit-1": [_fill("exit-1", side="sell")],  # not opposite -> incoherent
+    })
+    res = h.run(exit_decision_id="exit-1")
+    assert res.action == "refused" and res.reason == "round_trip_incoherent"
     assert h.writes == []
 
 
