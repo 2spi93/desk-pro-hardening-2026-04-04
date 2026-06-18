@@ -17013,6 +17013,13 @@ async def startup() -> None:
         CURRENT_SYSTEM_MODE = SystemMode(stored["config_value"]["mode"])
     else:
         persist_system_mode()
+    # Fail-closed: managed_live is a transient, operator-entered window — it must
+    # NEVER survive a restart (a crash mid-cycle, a stale env, or a persisted
+    # managed_live should boot to the safe guarded_auto posture, not the armed one).
+    if CURRENT_SYSTEM_MODE == SystemMode.MANAGED_LIVE:
+        CURRENT_SYSTEM_MODE = SystemMode.GUARDED_AUTO
+        persist_system_mode()
+        append_audit("system_mode_failsafe_downgrade", {"from": "managed_live", "to": "guarded_auto", "reason": "restart_failclose"})
     _upsert_default_regime_thresholds()
     _save_kill_switch_state(_kill_switch_state())
     _save_opportunity_gate_state(_opportunity_gate_state())

@@ -56,6 +56,19 @@ def test_runner_execute_is_gated_by_dedicated_phrase():
     assert "PROOF_RENEWAL_EXECUTE" in _SRC
 
 
+def test_runner_aborts_if_intent_not_executed():
+    # PORTE 2.1: the runner must guard every intent with the execution check
+    assert "intent_not_executed_reason" in _SRC
+    assert "assert_executed" in _SRC
+
+
+def test_runner_slippage_within_risk_policy():
+    # PORTE 2.1 root-cause fix: max_slippage_bps must be <= risk policy (10)
+    import re
+    m = re.search(r'"max_slippage_bps"\s*:\s*(\d+)', _SRC)
+    assert m and int(m.group(1)) <= 10, "runner max_slippage_bps must be <= 10"
+
+
 def test_legacy_endpoint_fenced_for_autonomous_bingx():
     reason = pf.assert_legacy_finalize_not_for_proof_rail(
         "dec-1", {"status": "finalized", "net_result_usd": 5.0},

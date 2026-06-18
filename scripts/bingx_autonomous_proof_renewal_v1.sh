@@ -149,7 +149,7 @@ did,side,reduce=sys.argv[1],sys.argv[2],sys.argv[3]=="true"
 print(json.dumps({"auto_execute":True,"intent":{
   "intent_id":did,"strategy_id":"${STRATEGY_ID}","portfolio_id":"${PORTFOLIO_ID}",
   "venue":"bingx","instrument":"${SYMBOL}","side":side,"reason_code":"${REASON_CODE}",
-  "confidence":0.8,"target_notional_usd":${NOTIONAL_USD},"max_slippage_bps":15,
+  "confidence":0.8,"target_notional_usd":${NOTIONAL_USD},"max_slippage_bps":10,
   "risk_tags":["autonomous-proof-renewal"],
   "explainability":{"live_execution":{"enabled":True,"provider":"bingx",
     "account_id":"${ACCOUNT_ID}","order_type":"MARKET","reduce_only":reduce,
@@ -157,13 +157,33 @@ print(json.dumps({"auto_execute":True,"intent":{
 PY
 )"; }
 
+# abort the cycle (trap flattens + reverts) unless the intent really executed a
+# live order — catches rejected_by_risk / preflight / pending / paper / no-order.
+assert_executed() { # $1=intent json response  $2=leg label
+  local reason
+  reason="$(PYTHONPATH=/opt/txt python3 -c "import json,sys
+from apps.control_plane.proof_intent_guard import intent_not_executed_reason
+try: d=json.loads(sys.argv[1])
+except Exception: print('unparseable_intent_response'); sys.exit(0)
+print(intent_not_executed_reason(d) or '')" "$1")"
+  if [ -n "$reason" ]; then
+    echo "  ABORT[$2]: $reason — no retry, trap will flatten + revert" >&2
+    exit 9
+  fi
+  echo "  [$2] executed live."
+}
+
 echo "=== ENTER managed_live (bounded) ==="; set_mode managed_live "autonomous_proof_renewal"
-echo "=== ENTRY intent (autonomous MARKET taker) ==="; submit_intent "$ENTRY_DECISION_ID" "$SIDE" "false" | tail -c 600; echo
+echo "=== ENTRY intent (autonomous MARKET taker) ==="
+ENTRY_RESP="$(submit_intent "$ENTRY_DECISION_ID" "$SIDE" "false")"; printf '%s' "$ENTRY_RESP" | tail -c 400; echo
+assert_executed "$ENTRY_RESP" "entry"
 echo "=== OBSERVE ${OBSERVE_SECONDS}s ==="; sleep "$OBSERVE_SECONDS"
 # hedge-safe close: BUY positionSide=SHORT WITHOUT reduceOnly (BingX hedge mode
 # rejects reduceOnly). In hedge mode the opposite side on the same positionSide
 # reduces/closes the leg, so reduce_only must stay false.
-echo "=== FLATTEN intent (routed, canonical exit fill, hedge-safe no-reduceOnly) ==="; submit_intent "$EXIT_DECISION_ID" "$CLOSE_SIDE" "false" | tail -c 600; echo
+echo "=== FLATTEN intent (routed, canonical exit fill, hedge-safe no-reduceOnly) ==="
+EXIT_RESP="$(submit_intent "$EXIT_DECISION_ID" "$CLOSE_SIDE" "false")"; printf '%s' "$EXIT_RESP" | tail -c 400; echo
+assert_executed "$EXIT_RESP" "exit"
 
 echo "=== FINALIZE via canonical finalizer (never legacy endpoint) ==="
 docker exec -i "$CP_CONTAINER" python -c "
