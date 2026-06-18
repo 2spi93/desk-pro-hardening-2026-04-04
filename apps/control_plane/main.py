@@ -33,6 +33,7 @@ from apps.control_plane.protection_runtime import (
     build_position_protection_governor,
     detect_protection_status_events,
 )
+from apps.control_plane.proof_finalizer import assert_legacy_finalize_not_for_proof_rail
 from shared.auth import AuthContext, auth_context_from_token, hash_password, issue_access_token, sign_approval_payload, verify_approval_signature, verify_password
 from shared.db import ensure_schema, execute, execute_rowcount, fetch_all, fetch_one, json_dumps
 from shared.models import (
@@ -22733,6 +22734,29 @@ def _compute_connectors_snapshot_blocking(
 
 @app.post("/v1/outcomes/{decision_id}/update")
 async def update_outcome(decision_id: str, payload: dict, auth: AuthContext = Depends(operator_auth)) -> dict:
+    # D2 fence (SPEC_D2_CANONICAL_OUTCOME_FINALIZATION.md): this legacy permissive
+    # path trusts caller-supplied numbers and defaults status='finalized'. It must
+    # NOT be used to finalize the autonomous BingX-native proof rail — that goes
+    # exclusively through proof_finalizer.finalize_autonomous_bingx_outcome, which
+    # derives the outcome from persisted evidence. Legacy/MT5 decisions pass through
+    # unchanged. Fail-closed.
+    _proof_rail_refusal = assert_legacy_finalize_not_for_proof_rail(
+        decision_id,
+        payload,
+        load_outcome=lambda d: fetch_one(
+            "SELECT source, provider, status FROM decision_outcomes WHERE decision_id = %s",
+            (d,),
+        ),
+    )
+    if _proof_rail_refusal:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "legacy_finalize_forbidden_for_autonomous_proof_rail",
+                "reason": _proof_rail_refusal,
+                "use": "proof_finalizer.finalize_autonomous_bingx_outcome",
+            },
+        )
     existing_outcome = fetch_one(
         """
         SELECT metadata, edge_eligibility_state, edge_eligibility_score_pct
