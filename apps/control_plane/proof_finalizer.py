@@ -180,6 +180,7 @@ def finalize_autonomous_bingx_outcome(
     decision_id: str,
     *,
     exit_decision_id: Optional[str] = None,
+    require_round_trip: bool = False,
     load_outcome: Callable[[str], Optional[dict]] = _default_load_outcome,
     load_fills: Callable[[str], list[dict]] = _default_load_fills,
     load_reality_gap: Callable[[str], Optional[dict]] = _default_load_reality_gap,
@@ -213,6 +214,10 @@ def finalize_autonomous_bingx_outcome(
 
     exit_fills = _canonical_bingx_fills(load_fills(exit_decision_id)) if exit_decision_id else []
     computed = derive_measured_outcome(entry_fills, exit_fills)
+    # D3: a proof cycle requires a complete round-trip (entry + exit canonical
+    # fills) before finalizing; an entry-only measurement is incomplete proof.
+    if require_round_trip and computed.get("measurement_basis") != "round_trip":
+        return FinalizeResult("refused", "exit_fill_required", decision_id, computed=computed)
     new_hash = _computed_hash(computed)
 
     rg = load_reality_gap(decision_id) or {}

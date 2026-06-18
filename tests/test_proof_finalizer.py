@@ -162,6 +162,41 @@ def test_caller_supplied_numbers_have_no_entrypoint():
     assert res.computed["net_result_usd"] == round(6.43 - 6.40 - 0.0, 8)  # 999.0 ignored
 
 
+def test_entry_only_basis_when_no_exit_fill():
+    # without an exit fill the measurement is entry_only and net_result is None
+    h = _Harness(outcome=_outcome(), fills_by_decision={"dec-1": [_fill("entry-1")]})
+    res = h.run()  # no exit_decision_id
+    assert res.action == "finalized"
+    assert res.computed["measurement_basis"] == "entry_only"
+    assert res.computed["net_result_usd"] is None
+
+
+def test_require_round_trip_refuses_without_exit_fill():
+    # D3: a proof cycle demands a complete round-trip; entry_only is refused
+    h = _Harness(outcome=_outcome(), fills_by_decision={"dec-1": [_fill("entry-1")]})
+    res = pf.finalize_autonomous_bingx_outcome(
+        "dec-1", require_round_trip=True,
+        load_outcome=h.load_outcome, load_fills=h.load_fills,
+        load_reality_gap=h.load_reality_gap, write_outcome=h.write_outcome,
+    )
+    assert res.action == "refused" and res.reason == "exit_fill_required"
+    assert h.writes == []
+
+
+def test_require_round_trip_accepts_with_exit_fill():
+    h = _Harness(
+        outcome=_outcome(),
+        fills_by_decision={"dec-1": [_fill("entry-1", side="sell", notional=6.43)],
+                           "exit-1": [_fill("exit-1", side="buy", notional=6.40)]},
+    )
+    res = pf.finalize_autonomous_bingx_outcome(
+        "dec-1", exit_decision_id="exit-1", require_round_trip=True,
+        load_outcome=h.load_outcome, load_fills=h.load_fills,
+        load_reality_gap=h.load_reality_gap, write_outcome=h.write_outcome,
+    )
+    assert res.action == "finalized" and res.computed["measurement_basis"] == "round_trip"
+
+
 def test_legacy_fence_blocks_proof_rail_caller_finalize():
     # the fence helper flags legacy magic-endpoint finalize on an autonomous bingx row
     blocked = pf.assert_legacy_finalize_not_for_proof_rail(

@@ -19,6 +19,7 @@ from apps.execution_router.context_v1 import (
     build_execution_context,
     build_market_structure_snapshot,
 )
+from apps.execution_router.proof_order_shape import resolve_proof_renewal_order_shape
 from apps.execution_router.optimizer_v3 import (
     apply_order_management_to_live_context,
     build_execution_optimizer_snapshot,
@@ -3819,7 +3820,18 @@ async def place_routed_order(payload: dict) -> dict:
     best_ask = _to_float(selected.get("best_ask"), 0.0)
     midpoint_price = (best_bid + best_ask) / 2.0 if best_bid > 0 and best_ask > 0 else 0.0
     if bool(effective_live_context.get("enabled")):
-        if execution_ai_action == "market_sweep":
+        # D1 — autonomous proof-renewal: force a MARKET taker so the cycle yields a
+        # real canonical fill; never let it take the passive-LIMIT branch (which can
+        # rest unfilled). Contract validated in proof_order_shape (raises on violation).
+        try:
+            _proof_shape = resolve_proof_renewal_order_shape(payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"proof_renewal: {exc}") from exc
+        if _proof_shape is not None:
+            effective_live_context["order_type"] = "MARKET"
+            effective_live_context.pop("price", None)
+            effective_live_context["proof_cycle_id"] = _proof_shape["proof_cycle_id"]
+        elif execution_ai_action == "market_sweep":
             effective_live_context["order_type"] = "MARKET"
             effective_live_context.pop("price", None)
         elif execution_ai_action in {"join_best_limit", "cancel_replace"}:

@@ -24513,6 +24513,9 @@ async def _handle_signal_webhook(source: str, payload: dict, provided_secret: st
         "symbol": symbol,
         "side": side,
         "estimated_notional_usd": effective_notional,
+        # D1 — forward autonomous proof-renewal markers (inert for normal flow).
+        "proof_renewal": bool(live_execution.get("proof_renewal")),
+        "proof_cycle_id": live_execution.get("proof_cycle_id"),
         "preferred_venue": resolved_preferred_venue,
         "execution_mode": f"{source}-webhook",
         "live_execution": {
@@ -25468,6 +25471,10 @@ async def execute_approved_intent(intent_payload: dict, risk_decision: RiskDecis
             "symbol": str(effective_intent_payload.get("instrument") or "").strip(),
             "side": normalized_side,
             "estimated_notional_usd": effective_live_notional,
+            # D1 — forward autonomous proof-renewal markers so execution_router forces
+            # a MARKET taker (deterministic canonical fill). Inert for normal intents.
+            "proof_renewal": _bool_from_any(live_hint.get("proof_renewal"), False),
+            "proof_cycle_id": live_hint.get("proof_cycle_id"),
             "preferred_venue": str(live_execution.get("execution_venue") or _preferred_execution_venue(str(live_hint.get("provider") or ""), live_enabled=True)).strip(),
             "route_mode_override": applied_overrides.get("route_mode_override"),
             "execution_style": applied_overrides.get("execution_style"),

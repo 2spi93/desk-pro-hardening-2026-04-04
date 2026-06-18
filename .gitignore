@@ -89,3 +89,6 @@ sites/*/*.snapshot.*.html
 
 # Operator audit artifacts from marketable-limit harness (sanitized, but operational — not source)
 var/marketable_limit_captures/
+
+# Autonomous proof-renewal readiness/audit artifacts (operational, not source)
+var/proof_renewal/
