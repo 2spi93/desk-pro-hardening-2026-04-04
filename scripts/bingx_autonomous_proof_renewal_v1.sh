@@ -122,22 +122,55 @@ set_mode() { curl --max-time 20 -sS -o /dev/null \
   --data "{\"mode\":\"$1\",\"source\":\"autonomous_proof_renewal\",\"reason\":\"$2\"}" || true; }
 
 REVERTED=0
+REVERT_HARD_FAIL=0
 revert_and_flatten() {
   [ "$REVERTED" = 1 ] && return; REVERTED=1
-  echo "=== REVERT: flatten residual + restore guarded_auto ==="
+  echo "=== REVERT: cancel orders + hedge-safe flatten + VERIFY (no silent done) ==="
+  local SWAP_Q="${SYMBOL%USDT}-USDT"
+  # 1. cancel all open orders (signed BingX DELETE — not the broker order path).
+  #    Errors are surfaced, NEVER swallowed.
   docker exec -i "$CP_CONTAINER" python -c "
-import asyncio,json;import apps.control_plane.main as cp, httpx
+import asyncio;import apps.control_plane.main as cp
 async def m():
-    info,sp=cp._bingx_secret_payload_for_account('${ACCOUNT_ID}',require_trade=True)
-    pos=await cp._bingx_signed_get(sp,'/openApi/swap/v2/user/positions',{'symbol':'${SYMBOL%USDT}-USDT'})
-    for p in cp._bingx_flattenable_positions(pos,'${ACCOUNT_ID}',symbol='${SYMBOL}'):
-        # residual safety flatten via control-plane connector flatten (NOT a proof fill)
-        async with httpx.AsyncClient(timeout=25.0) as c:
-            await c.post(cp.BROKER_ADAPTER_URL+'/v1/connectors/bingx/flatten',json={'account_id':'${ACCOUNT_ID}','symbol':'${SYMBOL}','confirmation_text':'BINGX_FLATTEN'})
-    print('residual_flatten_done')
+    _,sp=cp._bingx_secret_payload_for_account('${ACCOUNT_ID}',require_trade=True)
+    oo=await cp._bingx_signed_get(sp,'/openApi/swap/v2/trade/openOrders',{'symbol':'${SWAP_Q}'})
+    n=0
+    for o in cp._bingx_extract_dict_items(oo,'orders','data','list'):
+        oid=o.get('orderId') or o.get('orderID')
+        if oid:
+            try: await cp._bingx_signed_request(sp,'DELETE','/openApi/swap/v2/trade/order',{'symbol':'${SWAP_Q}','orderId':str(oid)}); n+=1
+            except Exception as e: print('CANCEL_ERR',str(e)[:100])
+    print('orders_cancelled='+str(n))
 asyncio.run(m())
-" 2>/dev/null | tail -1 || true
+" || echo "  WARN: order-cancel step errored"
+  # 2. reliable hedge-safe close via the sanctioned control-plane flatten endpoint
+  #    (BUY positionSide=SHORT / SELL positionSide=LONG, MARKET, no reduceOnly; it
+  #    re-reads positions_after server-side). Authenticated; errors surfaced.
+  curl --max-time 30 -sS -H "Authorization: Bearer ${TOKEN}" -H 'content-type: application/json' \
+    -X POST "${CONTROL_PLANE_URL}/v1/connectors/bingx/flatten" \
+    --data "{\"account_id\":\"${ACCOUNT_ID}\",\"symbol\":\"${SYMBOL}\",\"confirmation_text\":\"BINGX_FLATTEN\"}" \
+    | python3 -c "import sys,json
+try: d=json.load(sys.stdin); print('  flatten endpoint status=',d.get('status'),'closed=',len(d.get('close_results') or []),'errors=',len(d.get('close_errors') or []))
+except Exception as e: print('  flatten endpoint UNPARSEABLE:',str(e)[:80])" || echo "  WARN: flatten endpoint call errored"
+  # 3. VERIFY ground truth — success ONLY if position=0 AND open_orders=0.
+  local FINAL
+  FINAL="$(docker exec -i "$CP_CONTAINER" python -c "
+import asyncio,json;import apps.control_plane.main as cp
+async def m():
+    _,sp=cp._bingx_secret_payload_for_account('${ACCOUNT_ID}',require_trade=False)
+    pos=await cp._bingx_signed_get(sp,'/openApi/swap/v2/user/positions',{'symbol':'${SWAP_Q}'})
+    oo=await cp._bingx_signed_get(sp,'/openApi/swap/v2/trade/openOrders',{'symbol':'${SWAP_Q}'})
+    print(json.dumps({'positions':len(cp._bingx_flattenable_positions(pos,'${ACCOUNT_ID}',symbol='${SYMBOL}')),'orders':len(cp._bingx_extract_dict_items(oo,'orders','data','list'))}))
+asyncio.run(m())
+" | tail -1)"
+  echo "  post-flatten truth: $FINAL"
   set_mode guarded_auto "autonomous_proof_renewal_revert"
+  if printf '%s' "$FINAL" | grep -q '"positions": 0' && printf '%s' "$FINAL" | grep -q '"orders": 0'; then
+    echo "  FLATTEN VERIFIED: position=0, open_orders=0, guarded_auto restored."
+  else
+    REVERT_HARD_FAIL=1
+    echo "  !!! HARD_FAIL: NOT flat after flatten ($FINAL). OPERATOR MUST INTERVENE. Artifact kept, no retry." >&2
+  fi
 }
 trap revert_and_flatten EXIT
 
@@ -153,7 +186,8 @@ print(json.dumps({"auto_execute":True,"intent":{
   "risk_tags":["autonomous-proof-renewal"],
   "explainability":{"live_execution":{"enabled":True,"provider":"bingx",
     "account_id":"${ACCOUNT_ID}","order_type":"MARKET","reduce_only":reduce,
-    "position_side":"${POSSIDE}","proof_renewal":True,"proof_cycle_id":"${PROOF_CYCLE_ID}"}}}}))
+    "position_side":"${POSSIDE}","proof_renewal":True,"proof_cycle_id":"${PROOF_CYCLE_ID}",
+    "auto_protection":False}}}}))
 PY
 )"; }
 

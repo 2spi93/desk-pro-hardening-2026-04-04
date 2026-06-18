@@ -69,6 +69,32 @@ def test_runner_slippage_within_risk_policy():
     assert m and int(m.group(1)) <= 10, "runner max_slippage_bps must be <= 10"
 
 
+def test_trap_uses_correct_flatten_endpoint():
+    # PORTE 2.2 (A): the old bug posted flatten to BROKER_ADAPTER_URL (404). The
+    # trap must hit the control-plane connector flatten with the operator token.
+    assert "/v1/connectors/bingx/flatten" in _SRC
+    assert 'BROKER_ADAPTER_URL' not in _SRC or "${CONTROL_PLANE_URL}/v1/connectors/bingx/flatten" in _SRC
+
+
+def test_trap_cancels_orders_and_verifies_flat():
+    # PORTE 2.2 (A): cancel orders + verify position=0/orders=0, HARD_FAIL otherwise
+    assert "openOrders" in _SRC and "DELETE" in _SRC
+    assert "HARD_FAIL" in _SRC
+    assert '"positions": 0' in _SRC and '"orders": 0' in _SRC
+
+
+def test_trap_does_not_swallow_errors():
+    # PORTE 2.2 (A): no silent "done" — the old swallow pattern must be gone
+    assert "2>/dev/null | tail -1 || true" not in _SRC
+    assert "residual_flatten_done" not in _SRC
+
+
+def test_proof_order_disables_auto_protection():
+    # PORTE 2.2 (B): proof orders are clean MARKET takers (no auto TP/SL); auto
+    # protection on the close leg was what made the exit return status=unknown.
+    assert "auto_protection" in _SRC
+
+
 def test_legacy_endpoint_fenced_for_autonomous_bingx():
     reason = pf.assert_legacy_finalize_not_for_proof_rail(
         "dec-1", {"status": "finalized", "net_result_usd": 5.0},
