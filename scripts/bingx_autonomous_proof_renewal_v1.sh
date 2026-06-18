@@ -160,7 +160,10 @@ PY
 echo "=== ENTER managed_live (bounded) ==="; set_mode managed_live "autonomous_proof_renewal"
 echo "=== ENTRY intent (autonomous MARKET taker) ==="; submit_intent "$ENTRY_DECISION_ID" "$SIDE" "false" | tail -c 600; echo
 echo "=== OBSERVE ${OBSERVE_SECONDS}s ==="; sleep "$OBSERVE_SECONDS"
-echo "=== FLATTEN intent (routed, canonical exit fill) ==="; submit_intent "$EXIT_DECISION_ID" "$CLOSE_SIDE" "true" | tail -c 600; echo
+# hedge-safe close: BUY positionSide=SHORT WITHOUT reduceOnly (BingX hedge mode
+# rejects reduceOnly). In hedge mode the opposite side on the same positionSide
+# reduces/closes the leg, so reduce_only must stay false.
+echo "=== FLATTEN intent (routed, canonical exit fill, hedge-safe no-reduceOnly) ==="; submit_intent "$EXIT_DECISION_ID" "$CLOSE_SIDE" "false" | tail -c 600; echo
 
 echo "=== FINALIZE via canonical finalizer (never legacy endpoint) ==="
 docker exec -i "$CP_CONTAINER" python -c "
