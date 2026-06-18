@@ -95,6 +95,14 @@ def test_proof_order_disables_auto_protection():
     assert "auto_protection" in _SRC
 
 
+def test_runner_generates_reality_gap():
+    # PORTE 2.4: the cycle triggers the reality_gap replay/ingest (3rd proof stream)
+    assert "/v1/execution/reality-gap/" in _SRC
+    # no calibration/training side effects on a single proof trade (quotes are
+    # backslash-escaped inside the curl --data heredoc, so match loosely)
+    assert "apply_calibration" in _SRC and "train_brain" in _SRC
+
+
 def test_legacy_endpoint_fenced_for_autonomous_bingx():
     reason = pf.assert_legacy_finalize_not_for_proof_rail(
         "dec-1", {"status": "finalized", "net_result_usd": 5.0},

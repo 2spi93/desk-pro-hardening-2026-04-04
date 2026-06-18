@@ -226,6 +226,17 @@ r=finalize_autonomous_bingx_outcome('${ENTRY_DECISION_ID}', exit_decision_id='${
 print('FINALIZE', r.action, r.reason)
 " 2>&1 | tail -2
 
+# REALITY-GAP: generate the third proof stream from the persisted execution replay
+# (overrides give venue/symbol/side; realized metrics come from the fills). No
+# market, no calibration/training side effects (apply_calibration/train_brain=false).
+echo "=== REALITY-GAP ingest (replay-measured, no market) ==="
+curl --max-time 30 -sS -H "Authorization: Bearer ${TOKEN}" -H 'content-type: application/json' \
+  -X POST "${CONTROL_PLANE_URL}/v1/execution/reality-gap/${ENTRY_DECISION_ID}" \
+  --data "{\"symbol\":\"${SYMBOL}\",\"venue\":\"bingx\",\"side\":\"${SIDE}\",\"apply_calibration\":false,\"train_brain\":false}" \
+  | python3 -c "import sys,json
+try: d=json.load(sys.stdin); print('  reality_gap ingest status=',d.get('status','?'))
+except Exception as e: print('  reality_gap ingest unparseable:',str(e)[:80])" || echo "  WARN: reality_gap ingest errored"
+
 revert_and_flatten; trap - EXIT
 echo "=== POST-STATE (expect flat, finalized) — see readiness/audit for verification ==="
 echo "done. mode restored to guarded_auto."
