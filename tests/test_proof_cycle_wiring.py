@@ -136,6 +136,15 @@ def test_control_plane_releases_risk_after_local_lock_only():
     assert "local_execution_lock_active" in readiness_src
 
 
+def test_control_plane_records_structured_execution_router_api_errors():
+    main_src = (_ROOT / "apps" / "control_plane" / "main.py").read_text(encoding="utf-8")
+    assert "api_error_recorded" in main_src
+    assert '"endpoint": execution_endpoint' in main_src
+    assert '"http_status": execution_response.status_code' in main_src
+    assert '"upstream_detail": detail' in main_src
+    assert '"cycle_id": str(live_hint.get("proof_cycle_id") or "")' in main_src
+
+
 def test_runner_verifies_actual_fill():
     # PORTE 2.5: 'executed' status is not enough — the runner must verify a fill
     assert "assert_fill_persisted" in _SRC

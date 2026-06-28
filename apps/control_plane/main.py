@@ -11099,13 +11099,22 @@ def _activate_kill_switch(source: str, reason: str, payload: dict) -> dict:
     return state
 
 
-def _record_api_error(source: str, detail: str) -> None:
+def _record_api_error(source: str, detail: Any) -> None:
     state = _kill_switch_state()
     stats = state.setdefault("stats", {})
     stats["api_errors"] = int(stats.get("api_errors", 0)) + 1
     _save_kill_switch_state(state)
+    detail_payload = detail if isinstance(detail, dict) else {"detail": str(detail)}
+    append_audit(
+        "api_error_recorded",
+        {
+            "source": source,
+            "count": stats["api_errors"],
+            **detail_payload,
+        },
+    )
     if stats["api_errors"] >= _kill_switch_thresholds()["max_api_errors"]:
-        _activate_kill_switch(source, "api_errors_threshold", {"detail": detail, "count": stats["api_errors"]})
+        _activate_kill_switch(source, "api_errors_threshold", {**detail_payload, "count": stats["api_errors"]})
 
 
 def _record_slippage_event(slippage_bps: float, source: str) -> None:
@@ -25651,8 +25660,18 @@ async def execute_approved_intent(intent_payload: dict, risk_decision: RiskDecis
         )
 
         if execution_response.status_code >= 400:
-            _record_api_error("execution-router", "intent_execution_failed")
             detail = _upstream_json_payload(execution_response)
+            _record_api_error(
+                "execution-router",
+                {
+                    "detail": "intent_execution_failed",
+                    "endpoint": execution_endpoint,
+                    "http_status": execution_response.status_code,
+                    "intent_id": str(effective_intent_payload.get("intent_id") or ""),
+                    "cycle_id": str(live_hint.get("proof_cycle_id") or ""),
+                    "upstream_detail": detail,
+                },
+            )
             if live_execution_constraints:
                 detail = _attach_live_execution_constraints(detail, live_execution_constraints)
             raise HTTPException(
