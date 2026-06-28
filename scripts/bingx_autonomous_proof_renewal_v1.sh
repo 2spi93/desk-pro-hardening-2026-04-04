@@ -16,7 +16,7 @@
 # plan, places NO order, changes NO mode). The `execute` mode is the single live
 # boundary (PORTE 2) and is hard-gated behind BOTH:
 #     --confirm-live PROOF_RENEWAL_EXECUTE
-#     --go-phrase "GO renew BingX autonomous proof side=sell"
+#     --go-phrase "GO renew BingX autonomous proof side=<buy|sell>"
 # It must NOT be triggered by ambient pings / clean_cycles / gate=go.
 # =============================================================================
 set -euo pipefail
@@ -39,10 +39,18 @@ STRATEGY_ID="${STRATEGY_ID:-autonomous_proof_renewal}"
 PORTFOLIO_ID="${PORTFOLIO_ID:-ops}"
 REASON_CODE="${REASON_CODE:-autonomous_proof_renewal_cycle_v1}"
 CP_CONTAINER="${CP_CONTAINER:-control-plane}"
-DEDICATED_GO_PHRASE="GO renew BingX autonomous proof side=sell"
 MODE="readiness"
 CONFIRM_LIVE=""
 GO_PHRASE=""
+
+dedicated_go_phrase_for_side() {
+  case "$1" in
+    buy|sell) printf 'GO renew BingX autonomous proof side=%s' "$1" ;;
+    *) return 1 ;;
+  esac
+}
+
+DEDICATED_GO_PHRASE="$(dedicated_go_phrase_for_side "$SIDE")"
 
 usage() { sed -n '2,24p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; cat <<EOF
 
@@ -66,11 +74,17 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+case "$SIDE" in
+  buy|sell) ;;
+  *) echo "invalid_side: expected buy|sell, got '$SIDE'" >&2; exit 2 ;;
+esac
+DEDICATED_GO_PHRASE="$(dedicated_go_phrase_for_side "$SIDE")"
+
 awk "BEGIN{exit !($NOTIONAL_USD <= $NOTIONAL_CAP)}" || { echo "notional_exceeds_cap" >&2; exit 3; }
 
 # ---- readiness (default): read-only, no order, no mode change ----------------
 echo "=== READINESS (read-only) ==="
-bash "$SCRIPT_DIR/bingx_proof_cycle_readiness_check.sh" || true
+SIDE="$SIDE" bash "$SCRIPT_DIR/bingx_proof_cycle_readiness_check.sh" || true
 
 cat <<EOF
 

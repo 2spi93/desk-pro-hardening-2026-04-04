@@ -17,7 +17,7 @@ _spec.loader.exec_module(g)
 
 
 def test_executed_live_with_order_id_is_ok():
-    resp = {"status": "executed_in_live_mode", "order": {"order_id": "2067..."}}
+    resp = {"status": "executed_in_live_mode", "order": {"order_id": "2067...", "status": "filled"}}
     assert g.intent_not_executed_reason(resp) is None
 
 
@@ -49,6 +49,16 @@ def test_paper_mode_aborts():
 
 def test_executed_without_order_id_aborts():
     assert g.intent_not_executed_reason({"status": "executed_in_live_mode", "order": {}}) == "executed_status_without_order_id"
+
+
+def test_executed_live_unknown_order_status_aborts():
+    resp = {"status": "executed_in_live_mode", "order": {"order_id": "2067...", "status": "unknown"}}
+    assert g.intent_not_executed_reason(resp) == "executed_status_without_canonical_fill_status:unknown"
+
+
+def test_executed_live_open_order_status_aborts():
+    resp = {"status": "executed_in_live_mode", "order": {"order_id": "2067...", "status": "open"}}
+    assert g.intent_not_executed_reason(resp) == "executed_status_without_canonical_fill_status:open"
 
 
 def test_unparseable_aborts():

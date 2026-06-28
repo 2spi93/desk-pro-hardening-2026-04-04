@@ -52,8 +52,13 @@ def test_runner_has_no_manual_sql():
 
 
 def test_runner_execute_is_gated_by_dedicated_phrase():
-    assert "GO renew BingX autonomous proof side=sell" in _SRC
+    assert "dedicated_go_phrase_for_side" in _SRC
+    assert "GO renew BingX autonomous proof side=%s" in _SRC
     assert "PROOF_RENEWAL_EXECUTE" in _SRC
+
+
+def test_runner_passes_side_into_readiness_check():
+    assert 'SIDE="$SIDE" bash "$SCRIPT_DIR/bingx_proof_cycle_readiness_check.sh"' in _SRC
 
 
 def test_runner_aborts_if_intent_not_executed():

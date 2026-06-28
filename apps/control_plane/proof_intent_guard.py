@@ -29,4 +29,7 @@ def intent_not_executed_reason(response: Any) -> Optional[str]:
     order_id = str(order.get("order_id") or "").strip()
     if not order_id:
         return "executed_status_without_order_id"
+    order_status = str(order.get("status") or "").strip().lower()
+    if order_status != "filled":
+        return f"executed_status_without_canonical_fill_status:{order_status or 'unknown'}"
     return None

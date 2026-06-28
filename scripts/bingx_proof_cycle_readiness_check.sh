@@ -13,10 +13,15 @@ set -euo pipefail
 
 ACCOUNT_ID="${ACCOUNT_ID:-29586394}"
 SYMBOL="${SYMBOL:-BTCUSDT}"
+SIDE="${SIDE:-sell}"
 NOTIONAL_CAP="${NOTIONAL_CAP:-7.5}"
 CP_CONTAINER="${CP_CONTAINER:-control-plane}"
 OUT_DIR="${OUT_DIR:-/opt/txt/var/proof_renewal}"
-GO_PHRASE="GO renew BingX autonomous proof side=sell"
+case "$SIDE" in
+  buy|sell) ;;
+  *) echo "invalid_side: expected buy|sell, got '$SIDE'" >&2; exit 2 ;;
+esac
+GO_PHRASE="GO renew BingX autonomous proof side=$SIDE"
 
 SWAP="$SYMBOL"; case "$SYMBOL" in *-*) ;; *USDT) SWAP="${SYMBOL%USDT}-USDT";; esac
 mkdir -p "$OUT_DIR" 2>/dev/null || OUT_DIR="/tmp/proof_renewal" && mkdir -p "$OUT_DIR"

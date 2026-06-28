@@ -1099,6 +1099,93 @@ def _bingx_status(raw_status: object) -> str:
     return "unknown"
 
 
+def _bingx_order_trace(payload: object, *, parser_branch: str) -> dict[str, object]:
+    order_payload = payload.get("order") if isinstance(payload, dict) and isinstance(payload.get("order"), dict) else payload
+    if not isinstance(order_payload, dict):
+        order_payload = {}
+    data = payload.get("data") if isinstance(payload, dict) else None
+    return {
+        "parser_branch": parser_branch,
+        "payload_type": type(payload).__name__,
+        "payload_keys": sorted([str(key) for key in payload.keys()]) if isinstance(payload, dict) else [],
+        "data_type": type(data).__name__ if data is not None else None,
+        "order_payload_keys": sorted([str(key) for key in order_payload.keys()]),
+        "bingx_code": payload.get("code") if isinstance(payload, dict) else None,
+        "bingx_msg": payload.get("msg") or payload.get("message") if isinstance(payload, dict) else None,
+        "order_id": str(order_payload.get("orderId") or order_payload.get("orderID") or order_payload.get("id") or "").strip(),
+        "order_id_numeric_seen": order_payload.get("orderId") is not None or order_payload.get("id") is not None,
+        "order_id_string_seen": order_payload.get("orderID") is not None,
+        "client_order_id": str(order_payload.get("clientOrderId") or order_payload.get("clientOrderID") or "").strip(),
+        "raw_status": str(order_payload.get("status") or order_payload.get("orderStatus") or order_payload.get("state") or "").strip(),
+    }
+
+
+def _bingx_extract_items(payload: object, *keys: str) -> list[dict]:
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if not isinstance(payload, dict):
+        return []
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+    for value in payload.values():
+        nested = _bingx_extract_items(value, *keys) if isinstance(value, (dict, list)) else []
+        if nested:
+            return nested
+    return []
+
+
+def _bingx_position_amount(position: dict) -> float:
+    for key in ("positionAmt", "positionAmount", "availableAmt", "holdVolume", "position"):
+        amount = _to_float(position.get(key), 0.0)
+        if abs(amount) > 0:
+            return amount
+    return 0.0
+
+
+async def _bingx_reconcile_flat_truth(secret_payload: dict, symbol: str) -> dict[str, object]:
+    normalized_symbol = _normalize_bingx_symbol(symbol)
+    truth: dict[str, object] = {
+        "status": "indeterminate_hard_fail",
+        "symbol": normalized_symbol,
+        "open_positions": None,
+        "open_orders": None,
+        "errors": [],
+    }
+    try:
+        positions_payload = await _bingx_signed_request(
+            secret_payload,
+            "GET",
+            "/openApi/swap/v2/user/positions",
+            {"symbol": normalized_symbol},
+        )
+        positions = _bingx_extract_items(positions_payload, "positions", "data", "list")
+        open_positions = [
+            item for item in positions
+            if abs(_bingx_position_amount(item)) > 1e-12
+        ]
+        truth["open_positions"] = len(open_positions)
+    except Exception as exc:
+        truth["errors"].append({"stage": "positions", "class": type(exc).__name__, "message": str(exc)[:240]})
+
+    try:
+        orders_payload = await _bingx_signed_request(
+            secret_payload,
+            "GET",
+            "/openApi/swap/v2/trade/openOrders",
+            {"symbol": normalized_symbol},
+        )
+        open_orders = _bingx_extract_items(orders_payload, "orders", "data", "list")
+        truth["open_orders"] = len(open_orders)
+    except Exception as exc:
+        truth["errors"].append({"stage": "open_orders", "class": type(exc).__name__, "message": str(exc)[:240]})
+
+    if truth.get("open_positions") == 0 and truth.get("open_orders") == 0:
+        truth["status"] = "no_order_found_confirmed_flat"
+    return truth
+
+
 def _bingx_order_snapshot(
     payload: dict,
     *,
@@ -1119,6 +1206,7 @@ def _bingx_order_snapshot(
     client_order_id = str(order_payload.get("clientOrderId") or order_payload.get("clientOrderID") or "").strip()
     raw_status = str(order_payload.get("status") or order_payload.get("orderStatus") or order_payload.get("state") or "").strip()
     normalized_status = _bingx_status(raw_status)
+    parser_branch = "order_wrapped" if isinstance(payload.get("order"), dict) else "direct_payload"
     fills: list[dict] = []
     if executed_qty > 0 and avg_fill_price > 0:
         fills.append(
@@ -1164,6 +1252,10 @@ def _bingx_order_snapshot(
         "protection": protection_state,
         "fills": fills,
         "raw_order": payload,
+        "reconciliation": {
+            "final_classification": normalized_status,
+            "trace": _bingx_order_trace(payload, parser_branch=parser_branch),
+        },
     }
 
 
@@ -1436,6 +1528,16 @@ async def _bingx_place_live_order(payload: dict) -> dict:
         requested_protection,
     )
     result = queried or snapshot
+    if result.get("status") == "unknown" and not result.get("fills"):
+        flat_truth = await _bingx_reconcile_flat_truth(secret_payload, symbol)
+        reconciliation = result.get("reconciliation") if isinstance(result.get("reconciliation"), dict) else {}
+        reconciliation["flat_truth"] = flat_truth
+        if flat_truth.get("status") == "no_order_found_confirmed_flat":
+            result["status"] = "no_order_found_confirmed_flat"
+        else:
+            result["status"] = "indeterminate_hard_fail"
+        reconciliation["final_classification"] = result["status"]
+        result["reconciliation"] = reconciliation
     result["sizing"] = sizing_telemetry
     return result
 
