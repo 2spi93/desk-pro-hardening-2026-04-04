@@ -73,6 +73,23 @@ class RiskGatewayMt5DryRunTests(unittest.TestCase):
         self.assertEqual(self.risk_gateway.STATE["daily_notional_used_usd"], 0.0)
         self.assertEqual(self.risk_gateway.STATE["exposure_by_instrument"], {})
 
+    def test_pre_trade_release_restores_budget_and_exposure(self) -> None:
+        with patch.object(self.risk_gateway, "load_policy", return_value=self._policy()):
+            asyncio.run(self.risk_gateway.mt5_order_check(self._request(dry_run=False)))
+            result = asyncio.run(
+                self.risk_gateway.pre_trade_release(
+                    self.risk_gateway.RiskReleaseRequest(
+                        symbol="BTCUSD",
+                        side="buy",
+                        estimated_notional_usd=5.0,
+                    )
+                )
+            )
+
+        self.assertEqual(result["status"], "released")
+        self.assertEqual(self.risk_gateway.STATE["daily_notional_used_usd"], 0.0)
+        self.assertEqual(self.risk_gateway.STATE["exposure_by_instrument"], {})
+
 
 if __name__ == "__main__":
     unittest.main()

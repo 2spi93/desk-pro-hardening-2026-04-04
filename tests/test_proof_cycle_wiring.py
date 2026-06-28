@@ -121,6 +121,14 @@ def test_intent_live_context_forwards_proof_markers():
     assert '"proof_renewal"' in body and '"proof_cycle_id"' in body
 
 
+def test_control_plane_releases_risk_after_local_lock_only():
+    main_src = (_ROOT / "apps" / "control_plane" / "main.py").read_text(encoding="utf-8")
+    assert "_release_intent_risk_budget" in main_src
+    assert "/v1/checks/pre-trade/release" in main_src
+    assert "if exc.status_code == 423" in main_src
+    assert "intent_risk_budget_released_after_local_lock" in main_src
+
+
 def test_runner_verifies_actual_fill():
     # PORTE 2.5: 'executed' status is not enough — the runner must verify a fill
     assert "assert_fill_persisted" in _SRC

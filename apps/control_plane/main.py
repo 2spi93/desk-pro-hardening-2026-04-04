@@ -25365,6 +25365,28 @@ async def fetch_policy() -> dict:
         return response.json()
 
 
+async def _release_intent_risk_budget(intent_payload: dict) -> dict[str, Any]:
+    release_payload = {
+        "symbol": str(intent_payload.get("instrument") or ""),
+        "side": str(intent_payload.get("side") or "buy"),
+        "estimated_notional_usd": _to_float(intent_payload.get("target_notional_usd"), 0.0),
+    }
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        try:
+            response = await client.post(f"{RISK_GATEWAY_URL}/v1/checks/pre-trade/release", json=release_payload)
+        except httpx.RequestError as exc:
+            return {"status": "release_failed", "reason": "risk_gateway_unavailable", "error": str(exc)[:500]}
+        if response.status_code >= 400:
+            return {
+                "status": "release_failed",
+                "reason": "risk_gateway_error",
+                "upstream_status": response.status_code,
+                "upstream_detail": _upstream_json_payload(response),
+            }
+        payload = response.json()
+        return payload if isinstance(payload, dict) else {"status": "release_unknown"}
+
+
 async def execute_approved_intent(intent_payload: dict, risk_decision: RiskDecision) -> OrderResult:
     _assert_kill_switch_allows_execution()
     effective_intent_payload = dict(intent_payload)
@@ -25783,6 +25805,19 @@ async def submit_intent(request: IntentSubmissionRequest, auth: AuthContext = De
         try:
             order = await execute_approved_intent(effective_intent_payload, risk_decision)
         except HTTPException as exc:
+            # A local 423 lock happens before router/broker submission, but after
+            # risk has accepted and reserved notional. Release that reservation
+            # without doing this for ambiguous downstream failures.
+            if exc.status_code == 423:
+                release_result = await _release_intent_risk_budget(effective_intent_payload)
+                append_audit(
+                    "intent_risk_budget_released_after_local_lock",
+                    {
+                        "intent_id": request.intent.intent_id,
+                        "status_code": exc.status_code,
+                        "release": release_result,
+                    },
+                )
             raise HTTPException(
                 status_code=exc.status_code,
                 detail=_attach_live_execution_constraints(exc.detail, live_execution_constraints),

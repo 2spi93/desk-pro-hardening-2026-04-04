@@ -36,6 +36,12 @@ class Mt5OrderRiskReleaseRequest(BaseModel):
     estimated_notional_usd: float = Field(gt=0)
 
 
+class RiskReleaseRequest(BaseModel):
+    symbol: str
+    side: str = Field(pattern="^(buy|sell)$")
+    estimated_notional_usd: float = Field(gt=0)
+
+
 def load_policy() -> dict:
     return json.loads(POLICY_PATH.read_text())
 
@@ -255,8 +261,7 @@ async def mt5_order_check(request: Mt5OrderRiskRequest) -> dict:
     }
 
 
-@app.post("/v1/checks/mt5-order/release")
-async def mt5_order_release(request: Mt5OrderRiskReleaseRequest) -> dict:
+def _release_reserved_risk(request: RiskReleaseRequest) -> dict:
     notional = float(request.estimated_notional_usd)
     STATE["daily_notional_used_usd"] = max(0.0, float(STATE["daily_notional_used_usd"]) - notional)
     current = float(STATE["exposure_by_instrument"].get(request.symbol, 0.0))
@@ -274,3 +279,19 @@ async def mt5_order_release(request: Mt5OrderRiskReleaseRequest) -> dict:
             "exposure_by_instrument": STATE["exposure_by_instrument"],
         },
     }
+
+
+@app.post("/v1/checks/pre-trade/release")
+async def pre_trade_release(request: RiskReleaseRequest) -> dict:
+    return _release_reserved_risk(request)
+
+
+@app.post("/v1/checks/mt5-order/release")
+async def mt5_order_release(request: Mt5OrderRiskReleaseRequest) -> dict:
+    return _release_reserved_risk(
+        RiskReleaseRequest(
+            symbol=request.symbol,
+            side=request.side,
+            estimated_notional_usd=request.estimated_notional_usd,
+        )
+    )
