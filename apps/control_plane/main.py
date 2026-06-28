@@ -3065,6 +3065,24 @@ def _activated_kill_switch_state_payload(state: dict, source: str, reason: str, 
     return next_state
 
 
+def _latest_kill_switch_activation_event(reason: str | None = None) -> dict[str, Any]:
+    try:
+        row = fetch_one(
+            """
+            SELECT source, reason, payload, created_at
+            FROM kill_switch_events
+            WHERE active = TRUE
+              AND (%s::text IS NULL OR reason = %s)
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (reason, reason),
+        )
+    except Exception:
+        return {}
+    return dict(row) if isinstance(row, dict) else {}
+
+
 def _load_connector_accounts() -> list[dict]:
     row = fetch_one("SELECT config_value FROM system_config WHERE config_key = 'connector_linked_accounts'")
     if not row:
@@ -11133,6 +11151,26 @@ def _local_execution_lock_snapshot(
     guardian = state.get("constitutional_guardian") if isinstance(state.get("constitutional_guardian"), dict) else {}
     activation = state.get("activation") if isinstance(state.get("activation"), dict) else {}
     lock_active = bool(state.get("active"))
+    if lock_active and not activation:
+        latest_activation = _latest_kill_switch_activation_event(str(state.get("reason") or "") or None)
+        if latest_activation:
+            activation = {
+                "source": latest_activation.get("source"),
+                "reason": latest_activation.get("reason"),
+                "payload": latest_activation.get("payload") if isinstance(latest_activation.get("payload"), dict) else {},
+                "created_at": latest_activation.get("created_at").isoformat() if hasattr(latest_activation.get("created_at"), "isoformat") else latest_activation.get("created_at"),
+                "source_table": "kill_switch_events",
+            }
+    guardian_current = (
+        bool(guardian)
+        and str(guardian.get("reason") or "") == str(state.get("reason") or "")
+        and (
+            not state.get("activated_at")
+            or not guardian.get("triggered_at")
+            or str(state.get("activated_at")) == str(guardian.get("triggered_at"))
+        )
+    )
+    effective_guardian = guardian if guardian_current else {}
     timeline = guardian.get("timeline") if isinstance(guardian.get("timeline"), list) else []
     acquired_at = state.get("activated_at") or guardian.get("triggered_at")
     if not acquired_at and timeline and isinstance(timeline[0], dict):
@@ -11144,9 +11182,9 @@ def _local_execution_lock_snapshot(
         "market_action": False,
         "lock_active": lock_active,
         "lock_name": "kill_switch_state",
-        "lock_scope": str(guardian.get("scope") or "global"),
-        "lock_owner": str(activation.get("source") or guardian.get("owner") or "kill_switch"),
-        "lock_reason": str(activation.get("reason") or state.get("reason") or guardian.get("reason") or "unknown"),
+        "lock_scope": str(effective_guardian.get("scope") or "global"),
+        "lock_owner": str(activation.get("source") or effective_guardian.get("owner") or "kill_switch"),
+        "lock_reason": str(activation.get("reason") or state.get("reason") or effective_guardian.get("reason") or "unknown"),
         "acquired_at": acquired_at,
         "expires_at": None,
         "remaining_ttl_ms": None,
@@ -11156,8 +11194,9 @@ def _local_execution_lock_snapshot(
         "order_submission_attempted": False,
         "risk_reserved": False,
         "risk_released": False,
-        "incident_ticket_key": state.get("incident_ticket_key") or guardian.get("incident_ticket_key"),
-        "freeze_event_id": state.get("freeze_event_id") or guardian.get("freeze_event_id"),
+        "incident_ticket_key": (state.get("incident_ticket_key") or effective_guardian.get("incident_ticket_key")) if guardian_current else None,
+        "freeze_event_id": (state.get("freeze_event_id") or effective_guardian.get("freeze_event_id")) if guardian_current else None,
+        "stale_guardian_ignored": bool(guardian and not guardian_current),
         "activation": activation,
         "kill_switch": state,
     }

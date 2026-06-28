@@ -142,6 +142,39 @@ class ControlPlaneLiveCapabilityTests(unittest.TestCase):
         self.assertNotIn("constitutional_guardian", activated)
         self.assertNotIn("incident_ticket_key", activated)
 
+    def test_local_execution_lock_ignores_stale_guardian_and_uses_latest_event(self) -> None:
+        state = {
+            "active": True,
+            "reason": "api_errors_threshold",
+            "activated_at": "2026-06-18T20:38:24Z",
+            "stats": {"api_errors": 5},
+            "constitutional_guardian": {
+                "owner": "constitutional_runtime_guardian",
+                "reason": "deviation_kill_threshold",
+                "triggered_at": "2026-05-22T04:42:40Z",
+                "incident_ticket_key": "INC-old",
+                "freeze_event_id": 40,
+            },
+            "incident_ticket_key": "INC-old",
+            "freeze_event_id": 40,
+        }
+
+        with patch.object(control_plane, "_kill_switch_state", return_value=state), \
+             patch.object(control_plane, "_latest_kill_switch_activation_event", return_value={
+                 "source": "execution-router",
+                 "reason": "api_errors_threshold",
+                 "payload": {"detail": "intent_execution_failed", "count": 5},
+                 "created_at": "2026-06-18T20:38:24Z",
+             }):
+            lock = control_plane._local_execution_lock_snapshot(execution_phase="test")
+
+        self.assertTrue(lock["lock_active"])
+        self.assertEqual(lock["lock_owner"], "execution-router")
+        self.assertEqual(lock["lock_reason"], "api_errors_threshold")
+        self.assertTrue(lock["stale_guardian_ignored"])
+        self.assertIsNone(lock["incident_ticket_key"])
+        self.assertIsNone(lock["freeze_event_id"])
+
     def test_unknown_provider_is_fail_closed(self) -> None:
         result = self._resolve("mystery")
 
