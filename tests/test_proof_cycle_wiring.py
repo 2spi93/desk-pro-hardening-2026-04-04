@@ -123,10 +123,17 @@ def test_intent_live_context_forwards_proof_markers():
 
 def test_control_plane_releases_risk_after_local_lock_only():
     main_src = (_ROOT / "apps" / "control_plane" / "main.py").read_text(encoding="utf-8")
+    readiness_src = (_ROOT / "scripts" / "bingx_proof_cycle_readiness_check.sh").read_text(encoding="utf-8")
+    assert "_local_execution_lock_snapshot" in main_src
+    assert "blocked_by_local_lock" in main_src
     assert "_release_intent_risk_budget" in main_src
     assert "/v1/checks/pre-trade/release" in main_src
+    assert "pre_risk_lock" in main_src
     assert "if exc.status_code == 423" in main_src
+    assert "intent_blocked_by_local_lock" in main_src
     assert "intent_risk_budget_released_after_local_lock" in main_src
+    assert "local_execution_lock" in readiness_src
+    assert "local_execution_lock_active" in readiness_src
 
 
 def test_runner_verifies_actual_fill():

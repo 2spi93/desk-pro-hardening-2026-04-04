@@ -11093,9 +11093,47 @@ def _recompute_drawdown_guard() -> None:
 
 
 def _assert_kill_switch_allows_execution() -> None:
+    lock = _local_execution_lock_snapshot()
+    if lock.get("lock_active"):
+        raise HTTPException(status_code=423, detail=lock)
+
+
+def _local_execution_lock_snapshot(
+    *,
+    cycle_id: str | None = None,
+    intent_id: str | None = None,
+    execution_phase: str | None = None,
+) -> dict[str, Any]:
     state = _kill_switch_state()
-    if state.get("active"):
-        raise HTTPException(status_code=423, detail={"kill_switch": state})
+    guardian = state.get("constitutional_guardian") if isinstance(state.get("constitutional_guardian"), dict) else {}
+    lock_active = bool(state.get("active"))
+    timeline = guardian.get("timeline") if isinstance(guardian.get("timeline"), list) else []
+    acquired_at = state.get("activated_at") or guardian.get("triggered_at")
+    if not acquired_at and timeline and isinstance(timeline[0], dict):
+        acquired_at = timeline[0].get("at")
+    return {
+        "status": "blocked_by_local_lock" if lock_active else "local_lock_clear",
+        "classification": "blocked_by_local_lock" if lock_active else "local_lock_clear",
+        "retryable": False,
+        "market_action": False,
+        "lock_active": lock_active,
+        "lock_name": "kill_switch_state",
+        "lock_scope": str(guardian.get("scope") or "global"),
+        "lock_owner": str(guardian.get("owner") or "kill_switch"),
+        "lock_reason": str(state.get("reason") or guardian.get("reason") or "unknown"),
+        "acquired_at": acquired_at,
+        "expires_at": None,
+        "remaining_ttl_ms": None,
+        "cycle_id": cycle_id,
+        "intent_id": intent_id,
+        "execution_phase": execution_phase,
+        "order_submission_attempted": False,
+        "risk_reserved": False,
+        "risk_released": False,
+        "incident_ticket_key": state.get("incident_ticket_key") or guardian.get("incident_ticket_key"),
+        "freeze_event_id": state.get("freeze_event_id") or guardian.get("freeze_event_id"),
+        "kill_switch": state,
+    }
 
 
 def _to_float(value: object, default: float = 0.0) -> float:
@@ -25709,6 +25747,37 @@ async def submit_intent(request: IntentSubmissionRequest, auth: AuthContext = De
         "intent_received",
         {"intent_id": request.intent.intent_id, "strategy_id": request.intent.strategy_id},
     )
+    pre_risk_lock = _local_execution_lock_snapshot(
+        cycle_id=str(live_hint.get("proof_cycle_id") or ""),
+        intent_id=request.intent.intent_id,
+        execution_phase="pre_risk",
+    )
+    if request.auto_execute and bool(pre_risk_lock.get("lock_active")):
+        risk_decision = RiskDecision(
+            decision="reject",
+            reasons=["blocked_by_local_lock"],
+            policy_version="local-execution-lock",
+            approved_notional_usd=0.0,
+            risk_snapshot={
+                "risk_reserved": False,
+                "lock": pre_risk_lock,
+            },
+        )
+        append_audit(
+            "intent_blocked_by_local_lock",
+            {
+                "intent_id": request.intent.intent_id,
+                "lock": pre_risk_lock,
+                "risk_reserved": False,
+            },
+        )
+        return IntentSubmissionResponse(
+            intent_id=request.intent.intent_id,
+            system_mode=CURRENT_SYSTEM_MODE,
+            status="blocked_by_local_lock",
+            risk_decision=risk_decision,
+            live_execution_constraints=_attach_live_execution_constraints(pre_risk_lock, live_execution_constraints),
+        )
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         risk_response = await client.post(
@@ -25810,13 +25879,34 @@ async def submit_intent(request: IntentSubmissionRequest, auth: AuthContext = De
             # without doing this for ambiguous downstream failures.
             if exc.status_code == 423:
                 release_result = await _release_intent_risk_budget(effective_intent_payload)
+                detail = exc.detail if isinstance(exc.detail, dict) else {"status": "blocked_by_local_lock", "detail": exc.detail}
+                detail = {
+                    **detail,
+                    "status": "blocked_by_local_lock",
+                    "classification": "blocked_by_local_lock",
+                    "intent_id": request.intent.intent_id,
+                    "cycle_id": str(live_hint.get("proof_cycle_id") or ""),
+                    "execution_phase": str(detail.get("execution_phase") or "post_risk_pre_order"),
+                    "order_submission_attempted": False,
+                    "risk_reserved": True,
+                    "risk_released": release_result.get("status") == "released",
+                    "risk_release": release_result,
+                }
                 append_audit(
                     "intent_risk_budget_released_after_local_lock",
                     {
                         "intent_id": request.intent.intent_id,
                         "status_code": exc.status_code,
+                        "lock": detail,
                         "release": release_result,
                     },
+                )
+                return IntentSubmissionResponse(
+                    intent_id=request.intent.intent_id,
+                    system_mode=CURRENT_SYSTEM_MODE,
+                    status="blocked_by_local_lock",
+                    risk_decision=risk_decision,
+                    live_execution_constraints=_attach_live_execution_constraints(detail, live_execution_constraints),
                 )
             raise HTTPException(
                 status_code=exc.status_code,

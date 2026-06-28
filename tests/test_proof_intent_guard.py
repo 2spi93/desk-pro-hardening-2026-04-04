@@ -47,6 +47,13 @@ def test_paper_mode_aborts():
         {"status": "executed_in_paper_mode", "order": {"order_id": "x"}})
 
 
+def test_blocked_by_local_lock_aborts_explicitly():
+    reason = g.intent_not_executed_reason(
+        {"status": "blocked_by_local_lock", "risk_decision": {"reasons": ["blocked_by_local_lock"]}}
+    )
+    assert reason and "blocked_by_local_lock" in reason
+
+
 def test_executed_without_order_id_aborts():
     assert g.intent_not_executed_reason({"status": "executed_in_live_mode", "order": {}}) == "executed_status_without_order_id"
 

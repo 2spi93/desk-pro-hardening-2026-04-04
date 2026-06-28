@@ -42,6 +42,7 @@ async def amain():
     out["system_mode"] = h.get("system_mode")
     out["gate"] = g.get("status")
     out["kill"] = g.get("kill_switch_recommended")
+    out["local_execution_lock"] = cp._local_execution_lock_snapshot(execution_phase="readiness")
     # service health
     for name, url in (("execution_router", "http://execution-router:8002/health"),
                       ("market_data_plane", "http://market-data:8003/health")):
@@ -85,6 +86,7 @@ def need(cond, why):
 need(d.get("system_mode") == "guarded_auto", "system_mode!=guarded_auto")
 need(d.get("gate") == "go", "opportunity_gate!=go")
 need(d.get("kill") in (False, None), "kill_switch_recommended")
+need(not bool((d.get("local_execution_lock") or {}).get("lock_active")), "local_execution_lock_active")
 need(d.get("open_positions") == 0, "not_flat")
 need(d.get("open_orders") == 0, "open_orders_present")
 need(d.get("execution_router") == "ok", "execution_router_unhealthy")
