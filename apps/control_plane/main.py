@@ -3038,6 +3038,33 @@ def _save_kill_switch_state(state: dict) -> None:
     )
 
 
+def _reset_kill_switch_state_payload(state: dict, *, by: str) -> dict:
+    next_state = dict(state)
+    next_state["active"] = False
+    next_state["reason"] = "manual_reset"
+    next_state["activated_at"] = None
+    next_state["stats"] = {"api_errors": 0, "high_slippage_events": 0, "drawdown_intraday_usd": 0.0}
+    for key in ("constitutional_guardian", "freeze_event_id", "freeze_timeline", "incident_ticket_key", "decision_ids"):
+        next_state.pop(key, None)
+    next_state["last_reset"] = {"by": by, "at": _now_utc().isoformat()}
+    return next_state
+
+
+def _activated_kill_switch_state_payload(state: dict, source: str, reason: str, payload: dict) -> dict:
+    next_state = dict(state)
+    next_state["active"] = True
+    next_state["reason"] = reason
+    next_state["activated_at"] = _now_utc().isoformat()
+    for key in ("constitutional_guardian", "freeze_event_id", "freeze_timeline", "incident_ticket_key", "decision_ids"):
+        next_state.pop(key, None)
+    next_state["activation"] = {
+        "source": source,
+        "reason": reason,
+        "payload": payload,
+    }
+    return next_state
+
+
 def _load_connector_accounts() -> list[dict]:
     row = fetch_one("SELECT config_value FROM system_config WHERE config_key = 'connector_linked_accounts'")
     if not row:
@@ -11044,9 +11071,7 @@ def _activate_kill_switch(source: str, reason: str, payload: dict) -> dict:
     state = _kill_switch_state()
     if state.get("active"):
         return state
-    state["active"] = True
-    state["reason"] = reason
-    state["activated_at"] = _now_utc().isoformat()
+    state = _activated_kill_switch_state_payload(state, source, reason, payload)
     _save_kill_switch_state(state)
     execute(
         "INSERT INTO kill_switch_events (source, reason, payload, active) VALUES (%s, %s, %s::jsonb, TRUE)",
@@ -11106,6 +11131,7 @@ def _local_execution_lock_snapshot(
 ) -> dict[str, Any]:
     state = _kill_switch_state()
     guardian = state.get("constitutional_guardian") if isinstance(state.get("constitutional_guardian"), dict) else {}
+    activation = state.get("activation") if isinstance(state.get("activation"), dict) else {}
     lock_active = bool(state.get("active"))
     timeline = guardian.get("timeline") if isinstance(guardian.get("timeline"), list) else []
     acquired_at = state.get("activated_at") or guardian.get("triggered_at")
@@ -11119,8 +11145,8 @@ def _local_execution_lock_snapshot(
         "lock_active": lock_active,
         "lock_name": "kill_switch_state",
         "lock_scope": str(guardian.get("scope") or "global"),
-        "lock_owner": str(guardian.get("owner") or "kill_switch"),
-        "lock_reason": str(state.get("reason") or guardian.get("reason") or "unknown"),
+        "lock_owner": str(activation.get("source") or guardian.get("owner") or "kill_switch"),
+        "lock_reason": str(activation.get("reason") or state.get("reason") or guardian.get("reason") or "unknown"),
         "acquired_at": acquired_at,
         "expires_at": None,
         "remaining_ttl_ms": None,
@@ -11132,6 +11158,7 @@ def _local_execution_lock_snapshot(
         "risk_released": False,
         "incident_ticket_key": state.get("incident_ticket_key") or guardian.get("incident_ticket_key"),
         "freeze_event_id": state.get("freeze_event_id") or guardian.get("freeze_event_id"),
+        "activation": activation,
         "kill_switch": state,
     }
 
@@ -17306,11 +17333,7 @@ async def activate_kill_switch(payload: dict | None = None, auth: AuthContext = 
 
 @app.post("/v1/system/kill-switch/reset")
 async def reset_kill_switch(auth: AuthContext = Depends(admin_auth)) -> dict:
-    state = _kill_switch_state()
-    state["active"] = False
-    state["reason"] = "manual_reset"
-    state["activated_at"] = None
-    state["stats"] = {"api_errors": 0, "high_slippage_events": 0, "drawdown_intraday_usd": 0.0}
+    state = _reset_kill_switch_state_payload(_kill_switch_state(), by=auth.username)
     _save_kill_switch_state(state)
     execute(
         "INSERT INTO kill_switch_events (source, reason, payload, active) VALUES (%s, %s, %s::jsonb, FALSE)",

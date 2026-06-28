@@ -98,6 +98,50 @@ class ControlPlaneLiveCapabilityTests(unittest.TestCase):
         self.assertEqual(bingx.get("execution_venue"), "bingx")
         self.assertFalse(bingx.get("api_key_requires_passphrase"))
 
+    def test_kill_switch_reset_clears_stale_guardian_provenance(self) -> None:
+        state = {
+            "active": True,
+            "reason": "api_errors_threshold",
+            "activated_at": "2026-06-18T20:38:24Z",
+            "stats": {"api_errors": 5},
+            "constitutional_guardian": {"owner": "constitutional_runtime_guardian"},
+            "freeze_event_id": 40,
+            "freeze_timeline": [{"phase": "freeze_activated"}],
+            "incident_ticket_key": "INC-old",
+            "decision_ids": ["old"],
+        }
+
+        reset = control_plane._reset_kill_switch_state_payload(state, by="admin")
+
+        self.assertFalse(reset["active"])
+        self.assertEqual(reset["reason"], "manual_reset")
+        self.assertEqual(reset["stats"]["api_errors"], 0)
+        self.assertNotIn("constitutional_guardian", reset)
+        self.assertNotIn("freeze_event_id", reset)
+        self.assertNotIn("incident_ticket_key", reset)
+
+    def test_kill_switch_activation_sets_current_provenance(self) -> None:
+        state = {
+            "active": False,
+            "reason": "manual_reset",
+            "constitutional_guardian": {"owner": "stale"},
+            "incident_ticket_key": "INC-old",
+        }
+
+        activated = control_plane._activated_kill_switch_state_payload(
+            state,
+            "execution-router",
+            "api_errors_threshold",
+            {"detail": "intent_execution_failed", "count": 5},
+        )
+
+        self.assertTrue(activated["active"])
+        self.assertEqual(activated["reason"], "api_errors_threshold")
+        self.assertEqual(activated["activation"]["source"], "execution-router")
+        self.assertEqual(activated["activation"]["reason"], "api_errors_threshold")
+        self.assertNotIn("constitutional_guardian", activated)
+        self.assertNotIn("incident_ticket_key", activated)
+
     def test_unknown_provider_is_fail_closed(self) -> None:
         result = self._resolve("mystery")
 
