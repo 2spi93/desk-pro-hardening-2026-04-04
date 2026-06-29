@@ -107,6 +107,25 @@ class TxtCertifiedOutcomesIncidentReviewTests(unittest.TestCase):
         self.assertEqual(review["verdict"], mod.READY_TO_CLOSE)
         self.assertFalse(review["answers"]["blocker_reproducible"])
 
+    def test_threshold_not_reached_when_projection_certifies_three_of_hundred(self) -> None:
+        mod = _load_module()
+        report = {
+            "findings": [{"code": "certified_outcomes_below_gate"}],
+            "certified_outcomes": {"certified_total": 0, "required_total": 100},
+            "runtime_context": {"base_outcome_total": 0, "source_tree_certification": {"cap_pct": 0}},
+        }
+
+        review = mod.build_review(
+            incident=_incident(),
+            scanner_report=report,
+            promotion_review=_promotion(),
+            projection_report={"candidate_total": 3, "certified_total": 3, "rejected_total": 0, "blockers": []},
+        )
+
+        self.assertEqual(review["verdict"], mod.THRESHOLD_NOT_REACHED)
+        self.assertTrue(review["answers"]["threshold_not_reached"])
+        self.assertTrue(review["answers"]["blocker_reproducible"])
+
 
 if __name__ == "__main__":
     unittest.main()

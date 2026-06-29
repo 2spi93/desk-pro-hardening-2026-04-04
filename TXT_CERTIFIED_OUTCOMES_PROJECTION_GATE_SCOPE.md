@@ -72,11 +72,11 @@ With the current scanner state:
 
 ```text
 candidates=3
-certified=0
-blockers=replay_truth_divergence,source_tree_cap_zero
-lineage_valid=0
-replay_aligned=0
+certified=3
+blockers=none
+lineage_valid=3
+replay_aligned=3
 ```
 
-So `INC-444A3CCAFA` remains active, but the diagnosis is no longer opaque
-`base_outcome_total=0`.
+So `INC-444A3CCAFA` remains active only because the constitutional threshold is
+still `100`, not because the three proof cycles are invisible or uncertifiable.

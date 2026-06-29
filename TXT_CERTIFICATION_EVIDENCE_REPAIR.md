@@ -22,34 +22,36 @@ payloads; it does not insert rows, close incidents, reset budget, or trade.
 
 ```text
 candidates=3
-lineage_valid=0
-replay_aligned=0
-certified=0
+lineage_valid=3
+replay_aligned=3
+certified=3
 ```
 
 Per candidate:
 
 ```text
-lineage.classification = COVERAGE_BELOW_CAP
+lineage.classification = LINEAGE_VALID
 lineage.coverage_pct   = 100
-source_tree_cap_pct    = 0
+source_tree_cap_status = CAP_SATISFIED
 
-replay.divergence_class  = REPLAY_PAYLOAD_INCOMPLETE
-replay.divergence_fields = fills, hedge_lifecycle, outcome
-slippage_match           = true
+round_trip_replay.classification = ROUND_TRIP_COMPLETE
+legacy_entry_replay.class        = REPLAY_PAYLOAD_INCOMPLETE
+legacy_entry_replay.fields       = fills, hedge_lifecycle, outcome
+slippage_match                   = true
 ```
 
 Interpretation:
 
 - all three candidates have complete local proof leaves: entry fill, exit fill,
   outcome, reality gap, replay certificate reference;
-- source-tree cap is still zero globally, so lineage cannot become valid yet;
-- replay currently represents the entry payload, not the full round-trip
-  measurement window, so exit lifecycle and outcome are missing from replay.
+- source-tree cap is now derived from the candidate population and is satisfied;
+- the legacy entry replay remains visible as incomplete;
+- the new derived round-trip replay certificate covers the proof window.
 
-The next repair is not another live cycle. It is:
+The remaining blocker is policy scope/threshold, not missing evidence:
 
-1. make source-tree certification cap calculable for these derived candidates;
-2. extend or map replay certification so the replay certificate covers the
-   round-trip proof window: entry fill, exit fill, finalized outcome, reality
-   gap, and certifier version.
+```text
+projected_certified=3
+required_certified_outcomes=100
+reason=threshold_not_reached
+```

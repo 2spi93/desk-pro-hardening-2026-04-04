@@ -20,6 +20,7 @@ ENDPOINT_STILL_BLOCKED = "A_ENDPOINT_STILL_BLOCKED"
 READY_TO_CLOSE = "B_ENDPOINT_SANE_PROOFS_COMPLETE"
 CERTIFICATION_INCOMPLETE = "C_ENDPOINT_SANE_CERTIFICATION_INCOMPLETE"
 UNRESOLVED_INSUFFICIENT = "D_NON_REPRODUCIBLE_PROOF_INSUFFICIENT"
+THRESHOLD_NOT_REACHED = "E_CERTIFIED_OUTCOMES_THRESHOLD_NOT_REACHED"
 
 
 def _load_promotion_gate():
@@ -138,7 +139,10 @@ def build_review(
     projected_certified_total = int((projection_report or {}).get("certified_total") or 0)
     projection_blockers = list((projection_report or {}).get("blockers") or [])
 
-    if certified_blocked and proof_validated and projected_candidate_total > 0 and projected_certified_total == 0:
+    if certified_blocked and proof_validated and 0 < projected_certified_total < required_total:
+        verdict = THRESHOLD_NOT_REACHED
+        disposition = "keep_incident_active_until_threshold_or_gate_scope_decision"
+    elif certified_blocked and proof_validated and projected_candidate_total > 0 and projected_certified_total == 0:
         verdict = CERTIFICATION_INCOMPLETE
         disposition = "fix_projection_blockers_before_closure"
     elif certified_blocked and proof_validated and base_outcome_total == 0:
@@ -206,6 +210,7 @@ def build_review(
             "blocker_reproducible": certified_blocked,
             "incident_state": "active" if certified_blocked else "resolved_or_non_reproducible",
             "additional_blocker": "replay_truth_divergence_detected" if replay_diverged else None,
+            "threshold_not_reached": 0 < projected_certified_total < required_total,
         },
         "verdict": verdict,
         "recommended_disposition": disposition,

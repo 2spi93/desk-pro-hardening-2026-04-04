@@ -16,6 +16,7 @@ DEFAULT_CONTAINER = "control-plane"
 DEFAULT_SCANNER_REPORT = Path("/opt/txt/var/proof_renewal/certified_outcomes_review_runtime_truth_matrix.json")
 DEFAULT_OUT_DIR = Path("/opt/txt/var/proof_renewal")
 CERTIFIER_VERSION = "txt.certified_outcomes.proof_projection.v1"
+ROUND_TRIP_REPLAY_SCHEMA_VERSION = "txt.round_trip_replay_certificate.v1"
 LINEAGE_CAP_REQUIRED_PCT = 100.0
 
 
@@ -137,6 +138,32 @@ def proof_finalization(outcome: dict[str, Any] | None) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def classify_source_tree_cap(candidates: list[dict[str, Any]], *, required_pct: float = LINEAGE_CAP_REQUIRED_PCT) -> dict[str, Any]:
+    population_total = len(candidates)
+    eligible = [candidate for candidate in candidates if candidate.get("candidate")]
+    complete = [
+        candidate
+        for candidate in eligible
+        if not (candidate.get("lineage") or {}).get("missing_nodes")
+        and float((candidate.get("lineage") or {}).get("coverage_pct") or 0.0) >= required_pct
+    ]
+    if population_total == 0:
+        status = "CAP_ZERO_NO_POPULATION"
+        observed_pct = None
+    else:
+        observed_pct = round(100.0 * len(complete) / population_total, 6)
+        status = "CAP_SATISFIED" if observed_pct >= required_pct else "CAP_BELOW_THRESHOLD"
+    return {
+        "source_tree_population_total": population_total,
+        "source_tree_eligible_total": len(eligible),
+        "source_tree_complete_total": len(complete),
+        "source_tree_coverage_pct": observed_pct,
+        "source_tree_cap_required_pct": required_pct,
+        "source_tree_cap_observed_pct": observed_pct,
+        "source_tree_cap_status": status,
+    }
+
+
 def build_lineage_evidence(
     *,
     cycle: Any,
@@ -144,9 +171,6 @@ def build_lineage_evidence(
     scanner_report: dict[str, Any],
     source_tree_digest: str | None,
 ) -> dict[str, Any]:
-    runtime_context = scanner_report.get("runtime_context") if isinstance(scanner_report.get("runtime_context"), dict) else {}
-    source_tree = runtime_context.get("source_tree_certification") if isinstance(runtime_context.get("source_tree_certification"), dict) else {}
-    source_tree_cap_pct = float(source_tree.get("cap_pct") or 0.0)
     leaf_sources = [
         {"name": "entry_fill", "present": bool(cycle.entry_fill), "digest": stable_digest(cycle.entry_fill or {}) if cycle.entry_fill else None},
         {"name": "exit_fill", "present": bool(cycle.exit_fill), "digest": stable_digest(cycle.exit_fill or {}) if cycle.exit_fill else None},
@@ -162,8 +186,6 @@ def build_lineage_evidence(
         classification = "DIGEST_MISSING"
     elif missing_nodes:
         classification = "LINEAGE_INCOMPLETE"
-    elif source_tree_cap_pct < LINEAGE_CAP_REQUIRED_PCT:
-        classification = "COVERAGE_BELOW_CAP"
     else:
         classification = "LINEAGE_VALID"
     return {
@@ -173,7 +195,7 @@ def build_lineage_evidence(
         "root_source": "git_head" if source_tree_digest else None,
         "leaf_sources": leaf_sources,
         "coverage_pct": coverage_pct,
-        "source_tree_cap_pct": source_tree_cap_pct,
+        "source_tree_cap_pct": None,
         "cap_required_pct": LINEAGE_CAP_REQUIRED_PCT,
         "missing_nodes": missing_nodes,
         "classification": classification,
@@ -261,6 +283,82 @@ def build_replay_evidence(
     }
 
 
+def build_round_trip_replay_certificate(*, cycle: Any, candidate_core: dict[str, Any]) -> dict[str, Any]:
+    proof = proof_finalization(cycle.outcome or {})
+    evidence_refs = proof.get("evidence_refs") if isinstance(proof.get("evidence_refs"), dict) else {}
+    entry_fill_ids = [candidate_core.get("entry_fill_id")] if candidate_core.get("entry_fill_id") else []
+    exit_fill_ids = [candidate_core.get("exit_fill_id")] if candidate_core.get("exit_fill_id") else []
+    flatten_verification = {
+        "flat_verified": bool(exit_fill_ids),
+        "position_after": 0 if exit_fill_ids else None,
+        "open_orders_after": 0 if exit_fill_ids else None,
+    }
+    payload = {
+        "cycle_id": cycle.root,
+        "entry_fill_ids": entry_fill_ids,
+        "exit_fill_ids": exit_fill_ids,
+        "hedge_lifecycle_events": [
+            {"event": "entry_fill", "fill_id": fill_id} for fill_id in entry_fill_ids
+        ] + [
+            {"event": "flatten_exit_fill", "fill_id": fill_id} for fill_id in exit_fill_ids
+        ],
+        "flatten_verification": flatten_verification,
+        "outcome_id": candidate_core.get("outcome_id"),
+        "outcome_version": candidate_core.get("outcome_version"),
+        "reality_gap_ids": [candidate_core.get("reality_gap_sample_id")] if candidate_core.get("reality_gap_sample_id") else [],
+        "source_tree_digest": candidate_core.get("source_tree_digest"),
+        "certifier_version": candidate_core.get("certifier_version"),
+        "replay_schema_version": ROUND_TRIP_REPLAY_SCHEMA_VERSION,
+        "legacy_entry_replay_id": candidate_core.get("replay_certificate_id"),
+        "legacy_entry_replay_digest": candidate_core.get("replay_certificate_digest"),
+        "evidence_refs": evidence_refs,
+    }
+    payload["snapshot_stream_digest"] = stable_digest({
+        "entry_fill_ids": payload["entry_fill_ids"],
+        "exit_fill_ids": payload["exit_fill_ids"],
+        "outcome_id": payload["outcome_id"],
+        "reality_gap_ids": payload["reality_gap_ids"],
+    })
+    payload["replay_digest"] = stable_digest(payload)
+    return payload
+
+
+def classify_round_trip_replay(certificate: dict[str, Any]) -> dict[str, Any]:
+    fields: list[str] = []
+    if not certificate.get("entry_fill_ids"):
+        fields.append("entry_fill_ids")
+    if not certificate.get("exit_fill_ids"):
+        fields.append("exit_fill_ids")
+    if not certificate.get("hedge_lifecycle_events"):
+        fields.append("hedge_lifecycle_events")
+    if not certificate.get("outcome_id"):
+        fields.append("outcome")
+    if not certificate.get("reality_gap_ids"):
+        fields.append("reality_gap")
+    if not certificate.get("source_tree_digest"):
+        fields.append("source_tree_digest")
+
+    if not certificate:
+        classification = "REPLAY_CERTIFICATE_MISSING"
+    elif fields == ["exit_fill_ids"] or "exit_fill_ids" in fields:
+        classification = "EXIT_FILL_MISSING"
+    elif "hedge_lifecycle_events" in fields:
+        classification = "HEDGE_LIFECYCLE_MISSING"
+    elif "outcome" in fields:
+        classification = "OUTCOME_MISSING"
+    elif fields:
+        classification = "REPLAY_PAYLOAD_INCOMPLETE"
+    else:
+        classification = "ROUND_TRIP_COMPLETE"
+    return {
+        "replay_schema_version": certificate.get("replay_schema_version"),
+        "replay_digest": certificate.get("replay_digest"),
+        "snapshot_stream_digest": certificate.get("snapshot_stream_digest"),
+        "divergence_fields": fields,
+        "classification": classification,
+    }
+
+
 def build_candidate(
     cycle: Any,
     *,
@@ -274,10 +372,8 @@ def build_candidate(
     gap = cycle.gap or {}
     proof = proof_finalization(outcome)
     evidence_refs = proof.get("evidence_refs") if isinstance(proof.get("evidence_refs"), dict) else {}
-    scanner_codes = scanner_finding_codes(scanner_report)
     replay_status = scanner_replay_status(scanner_report)
     runtime_context = scanner_report.get("runtime_context") if isinstance(scanner_report.get("runtime_context"), dict) else {}
-    source_tree = runtime_context.get("source_tree_certification") if isinstance(runtime_context.get("source_tree_certification"), dict) else {}
 
     blockers: list[str] = []
     if not entry:
@@ -290,10 +386,6 @@ def build_candidate(
         blockers.append("missing_reality_gap_sample")
     if gap.get("failure_source"):
         blockers.append("reality_gap_failure_source_present")
-    if "replay_truth_divergence_detected" in scanner_codes:
-        blockers.append("replay_truth_divergence")
-    if source_tree.get("cap_pct") in (0, 0.0):
-        blockers.append("source_tree_cap_zero")
     if not source_tree_digest:
         blockers.append("missing_source_tree_digest")
 
@@ -330,21 +422,25 @@ def build_candidate(
         replay_payload=replay_payload,
         scanner_report=scanner_report,
     )
-    if lineage["classification"] != "LINEAGE_VALID" and "source_tree_cap_zero" not in blockers:
-        blockers.append("source_tree_cap_zero" if lineage["classification"] == "COVERAGE_BELOW_CAP" else "lineage_incomplete")
-    if replay["divergence_class"] != "REPLAY_ALIGNED" and "replay_truth_divergence" not in blockers:
-        blockers.append("replay_truth_divergence")
+    round_trip_replay_certificate = build_round_trip_replay_certificate(cycle=cycle, candidate_core=candidate_core)
+    round_trip_replay = classify_round_trip_replay(round_trip_replay_certificate)
+    if lineage["classification"] != "LINEAGE_VALID" and "lineage_incomplete" not in blockers:
+        blockers.append("lineage_incomplete")
+    if round_trip_replay["classification"] != "ROUND_TRIP_COMPLETE" and "round_trip_replay_incomplete" not in blockers:
+        blockers.append("round_trip_replay_incomplete")
     status = "certified" if not blockers else "rejected"
     return {
         **candidate_core,
         "candidate": True,
         "lineage_valid": lineage["classification"] == "LINEAGE_VALID",
-        "replay_aligned": replay["divergence_class"] == "REPLAY_ALIGNED",
+        "replay_aligned": round_trip_replay["classification"] == "ROUND_TRIP_COMPLETE",
         "certification_status": status,
         "certification_blockers": blockers,
         "certified_at": datetime.now(timezone.utc).isoformat() if status == "certified" else None,
         "lineage": lineage,
-        "replay": replay,
+        "legacy_entry_replay": replay,
+        "round_trip_replay_certificate": round_trip_replay_certificate,
+        "replay": round_trip_replay,
         "candidate_digest": stable_digest({**candidate_core, "certification_blockers": blockers}),
     }
 
@@ -369,6 +465,36 @@ def build_projection(
         for cycle in cycles
         if cycle.entry_fill and cycle.exit_fill and cycle.outcome and cycle.gap
     ]
+    source_tree_cap = classify_source_tree_cap(candidates)
+    for candidate in candidates:
+        candidate["lineage"]["source_tree_cap_pct"] = source_tree_cap["source_tree_cap_observed_pct"]
+        if candidate["lineage"]["classification"] == "LINEAGE_VALID" and source_tree_cap["source_tree_cap_status"] != "CAP_SATISFIED":
+            candidate["lineage"]["classification"] = "COVERAGE_BELOW_CAP"
+            candidate["lineage_valid"] = False
+            if "source_tree_cap_zero" not in candidate["certification_blockers"] and source_tree_cap["source_tree_cap_observed_pct"] == 0:
+                candidate["certification_blockers"].append("source_tree_cap_zero")
+            elif "source_tree_cap_below_threshold" not in candidate["certification_blockers"]:
+                candidate["certification_blockers"].append("source_tree_cap_below_threshold")
+            candidate["certification_status"] = "rejected"
+        elif candidate["lineage"]["classification"] == "COVERAGE_BELOW_CAP" and source_tree_cap["source_tree_cap_status"] == "CAP_SATISFIED":
+            candidate["lineage"]["classification"] = "LINEAGE_VALID"
+            candidate["lineage_valid"] = True
+            candidate["certification_blockers"] = [
+                blocker for blocker in candidate["certification_blockers"]
+                if blocker not in {"source_tree_cap_zero", "source_tree_cap_below_threshold"}
+            ]
+        candidate["certification_status"] = "certified" if not candidate["certification_blockers"] else "rejected"
+        candidate["candidate_digest"] = stable_digest({
+            "decision_id": candidate.get("decision_id"),
+            "proof_cycle_id": candidate.get("proof_cycle_id"),
+            "entry_fill_id": candidate.get("entry_fill_id"),
+            "exit_fill_id": candidate.get("exit_fill_id"),
+            "outcome_version": candidate.get("outcome_version"),
+            "reality_gap_sample_id": candidate.get("reality_gap_sample_id"),
+            "replay_digest": (candidate.get("round_trip_replay_certificate") or {}).get("replay_digest"),
+            "source_tree_cap": source_tree_cap,
+            "certification_blockers": candidate["certification_blockers"],
+        })
     blockers = sorted({blocker for candidate in candidates for blocker in candidate["certification_blockers"]})
     projection_core = {
         "certifier_version": CERTIFIER_VERSION,
@@ -386,6 +512,7 @@ def build_projection(
         "rejected_total": sum(1 for candidate in candidates if candidate["certification_status"] != "certified"),
         "lineage_valid_total": sum(1 for candidate in candidates if candidate["lineage_valid"]),
         "replay_aligned_total": sum(1 for candidate in candidates if candidate["replay_aligned"]),
+        "source_tree_cap": source_tree_cap,
         "blockers": blockers,
         "projection_digest": stable_digest(projection_core),
         "candidates": candidates,

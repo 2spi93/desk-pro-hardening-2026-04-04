@@ -117,7 +117,7 @@ def _scanner(diverged: bool = True, source_tree_cap: int = 0) -> dict:
 
 
 class TxtCertifiedOutcomesProjectionTests(unittest.TestCase):
-    def test_projection_surfaces_three_rejected_candidates_when_replay_diverges(self) -> None:
+    def test_projection_certifies_three_candidates_with_derived_round_trip_replay(self) -> None:
         mod = _load_module()
 
         with patch.object(mod, "git_head", return_value="abc123"):
@@ -125,20 +125,20 @@ class TxtCertifiedOutcomesProjectionTests(unittest.TestCase):
 
         self.assertEqual(report["candidate_total"], 3)
         self.assertEqual(report["base_outcome_total"], 3)
-        self.assertEqual(report["certified_total"], 0)
-        self.assertEqual(report["rejected_total"], 3)
-        self.assertIn("replay_truth_divergence", report["blockers"])
-        self.assertIn("source_tree_cap_zero", report["blockers"])
+        self.assertEqual(report["certified_total"], 3)
+        self.assertEqual(report["rejected_total"], 0)
         self.assertTrue(all(item["candidate"] for item in report["candidates"]))
-        self.assertEqual(report["lineage_valid_total"], 0)
-        self.assertEqual(report["replay_aligned_total"], 0)
+        self.assertEqual(report["lineage_valid_total"], 3)
+        self.assertEqual(report["replay_aligned_total"], 3)
+        self.assertEqual(report["source_tree_cap"]["source_tree_complete_total"], 3)
+        self.assertEqual(report["source_tree_cap"]["source_tree_cap_status"], "CAP_SATISFIED")
         self.assertEqual(
             {item["lineage"]["classification"] for item in report["candidates"]},
-            {"COVERAGE_BELOW_CAP"},
+            {"LINEAGE_VALID"},
         )
         self.assertEqual(
-            {item["replay"]["divergence_class"] for item in report["candidates"]},
-            {"REPLAY_CERTIFICATE_MISSING"},
+            {item["replay"]["classification"] for item in report["candidates"]},
+            {"ROUND_TRIP_COMPLETE"},
         )
 
     def test_projection_digest_is_deterministic_for_same_inputs(self) -> None:
@@ -182,9 +182,33 @@ class TxtCertifiedOutcomesProjectionTests(unittest.TestCase):
 
         first = next(item for item in report["candidates"] if item["proof_cycle_id"] == "proofcyc-1")
         self.assertEqual(first["lineage"]["classification"], "LINEAGE_VALID")
-        self.assertEqual(first["replay"]["divergence_class"], "REPLAY_PAYLOAD_INCOMPLETE")
-        self.assertIn("outcome", first["replay"]["divergence_fields"])
-        self.assertIn("hedge_lifecycle", first["replay"]["divergence_fields"])
+        self.assertEqual(first["legacy_entry_replay"]["divergence_class"], "REPLAY_PAYLOAD_INCOMPLETE")
+        self.assertIn("outcome", first["legacy_entry_replay"]["divergence_fields"])
+        self.assertIn("hedge_lifecycle", first["legacy_entry_replay"]["divergence_fields"])
+        self.assertEqual(first["replay"]["classification"], "ROUND_TRIP_COMPLETE")
+
+    def test_source_tree_cap_no_population_is_explicit(self) -> None:
+        mod = _load_module()
+
+        cap = mod.classify_source_tree_cap([])
+
+        self.assertEqual(cap["source_tree_population_total"], 0)
+        self.assertEqual(cap["source_tree_cap_observed_pct"], None)
+        self.assertEqual(cap["source_tree_cap_status"], "CAP_ZERO_NO_POPULATION")
+
+    def test_source_tree_cap_partial_population_exposes_observed_pct(self) -> None:
+        mod = _load_module()
+        candidates = [
+            {"candidate": True, "lineage": {"missing_nodes": [], "coverage_pct": 100}},
+            {"candidate": True, "lineage": {"missing_nodes": ["outcome"], "coverage_pct": 80}},
+        ]
+
+        cap = mod.classify_source_tree_cap(candidates)
+
+        self.assertEqual(cap["source_tree_population_total"], 2)
+        self.assertEqual(cap["source_tree_complete_total"], 1)
+        self.assertEqual(cap["source_tree_cap_observed_pct"], 50.0)
+        self.assertEqual(cap["source_tree_cap_status"], "CAP_BELOW_THRESHOLD")
 
 
 if __name__ == "__main__":
