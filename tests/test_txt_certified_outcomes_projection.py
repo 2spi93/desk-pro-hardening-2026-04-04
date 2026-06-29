@@ -124,6 +124,7 @@ class TxtCertifiedOutcomesProjectionTests(unittest.TestCase):
             report = mod.build_projection(_payload(), scanner_report=_scanner(), repo_root=ROOT)
 
         self.assertEqual(report["candidate_total"], 3)
+        self.assertEqual(report["certifier_version"], mod.CERTIFIER_VERSION)
         self.assertEqual(report["base_outcome_total"], 3)
         self.assertEqual(report["certified_total"], 3)
         self.assertEqual(report["rejected_total"], 0)
@@ -132,6 +133,8 @@ class TxtCertifiedOutcomesProjectionTests(unittest.TestCase):
         self.assertEqual(report["replay_aligned_total"], 3)
         self.assertEqual(report["source_tree_cap"]["source_tree_complete_total"], 3)
         self.assertEqual(report["source_tree_cap"]["source_tree_cap_status"], "CAP_SATISFIED")
+        self.assertEqual(len(report["candidate_digests"]), 3)
+        self.assertTrue(all(item["certification_digest"] == item["candidate_digest"] for item in report["candidates"]))
         self.assertEqual(
             {item["lineage"]["classification"] for item in report["candidates"]},
             {"LINEAGE_VALID"},

@@ -180,6 +180,7 @@ def build_review(
                 "selected_replay_decision_id": runtime_context.get("selected_replay_decision_id"),
                 "collection_failures": runtime_context.get("collection_failures"),
                 "source_tree_certification": source_tree,
+                "certified_outcomes_counter": runtime_context.get("certified_outcomes_counter"),
             },
             "replay_truth": route_status(scanner_report, "/api/execution/replay/[decisionId]"),
         },

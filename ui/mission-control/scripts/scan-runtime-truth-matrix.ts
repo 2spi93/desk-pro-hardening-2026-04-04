@@ -45,6 +45,16 @@ type DispatchCandidate = {
   divergence_pct: number;
 };
 
+type CertifiedOutcomesProjection = {
+  schema_version: string;
+  certifier_version: string;
+  candidate_total: number;
+  certified_total: number;
+  projection_digest: string;
+  candidate_digests: string[];
+  candidates: JsonMap[];
+};
+
 function asRecord(value: unknown): JsonMap {
   return value && typeof value === "object" && !Array.isArray(value) ? value as JsonMap : {};
 }
@@ -402,6 +412,57 @@ function buildCertifiedOutcomeRoutes(params: {
   }));
 }
 
+function countCertifiedOutcomeRoutes(outcomes: CertifiedOutcomeRoute[]): number {
+  return outcomes.filter((item) => item.replay_certified && item.position_aligned && item.execution_aligned && item.settlement_aligned).length;
+}
+
+async function readCertifiedOutcomesProjection(projectionPath: string): Promise<CertifiedOutcomesProjection | null> {
+  try {
+    const payload = JSON.parse(await fs.readFile(projectionPath, "utf8"));
+    const record = asRecord(payload);
+    const candidates = asArray<JsonMap>(record.candidates);
+    const candidateDigests = asArray<unknown>(record.candidate_digests).map((item) => String(item || "").trim()).filter(Boolean);
+    if (String(record.schema_version || "") !== "txt-certified-outcomes-projection/v1") {
+      return null;
+    }
+    return {
+      schema_version: String(record.schema_version || ""),
+      certifier_version: String(record.certifier_version || ""),
+      candidate_total: Math.max(0, Math.round(toNumber(record.candidate_total, candidates.length))),
+      certified_total: Math.max(0, Math.round(toNumber(record.certified_total, 0))),
+      projection_digest: String(record.projection_digest || "").trim(),
+      candidate_digests: candidateDigests,
+      candidates,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function buildCertifiedOutcomeRoutesFromProjection(projection: CertifiedOutcomesProjection): CertifiedOutcomeRoute[] {
+  const seenKeys = new Set<string>();
+  const routes: CertifiedOutcomeRoute[] = [];
+  for (const candidate of projection.candidates) {
+    const proofCycleId = String(candidate.proof_cycle_id || "").trim();
+    const certifierVersion = String(candidate.certifier_version || projection.certifier_version || "").trim();
+    const candidateDigest = String(candidate.certification_digest || candidate.candidate_digest || "").trim();
+    const uniqueKey = `${proofCycleId}:${certifierVersion}:${candidateDigest}`;
+    if (!proofCycleId || !certifierVersion || !candidateDigest || seenKeys.has(uniqueKey)) {
+      continue;
+    }
+    seenKeys.add(uniqueKey);
+    const certified = String(candidate.certification_status || "").trim().toLowerCase() === "certified";
+    routes.push({
+      outcome_id: uniqueKey,
+      replay_certified: certified,
+      position_aligned: certified,
+      execution_aligned: certified,
+      settlement_aligned: certified,
+    });
+  }
+  return routes;
+}
+
 function buildDispatchCandidates(report: CriticalRouteScannerReport): DispatchCandidate[] {
   const candidates = new Map<string, DispatchCandidate>();
   for (const incident of report.incidents) {
@@ -529,6 +590,8 @@ async function main(): Promise<void> {
   const failures: RuntimeCollectionFailures = {};
   const reportPath = process.env.CONSTITUTIONAL_REPORT_PATH || path.resolve(process.cwd(), "artifacts/constitutional-truth-matrix.report.json");
   const requiredTotal = Math.max(1, Math.round(Number(process.env.CONSTITUTIONAL_REQUIRED_CERTIFIED_TOTAL || 100)));
+  const certifiedOutcomesProjectionPath = process.env.CERTIFIED_OUTCOMES_PROJECTION_PATH
+    || "/opt/txt/var/proof_renewal/certified_outcomes_projection_for_scanner.json";
   const openIncidentsEnabled = toBoolean(process.env.CONSTITUTIONAL_OPEN_INCIDENTS, true);
   const requestedAccountId = String(process.env.CONSTITUTIONAL_RUNTIME_ACCOUNT_ID || "").trim() || null;
   const requestedDecisionId = String(process.env.CONSTITUTIONAL_REPLAY_DECISION_ID || "").trim() || null;
@@ -681,7 +744,7 @@ async function main(): Promise<void> {
     ),
   );
   const routeAligned = new Map(preliminaryReport.route_matrix.map((row) => [row.truth, row.aligned]));
-  const certifiedOutcomes = buildCertifiedOutcomeRoutes({
+  const legacyCertifiedOutcomes = buildCertifiedOutcomeRoutes({
     requiredTotal,
     baseOutcomeTotal,
     replayCertifiedTotal: Math.floor(baseOutcomeTotal * (routeAligned.get("Replay Truth") ? certifiedTriPct : 0) / 100),
@@ -689,6 +752,14 @@ async function main(): Promise<void> {
     executionAlignedTotal: Math.floor(baseOutcomeTotal * (routeAligned.get("Execution Truth") ? certifiedTriPct : 0) / 100),
     settlementAlignedTotal: Math.floor(baseOutcomeTotal * (routeAligned.get("Settlement Truth") ? certifiedJourneyCompletionPct : 0) / 100),
   });
+  const canonicalCertifiedOutcomesProjection = await readCertifiedOutcomesProjection(certifiedOutcomesProjectionPath);
+  const projectedCertifiedOutcomes = canonicalCertifiedOutcomesProjection
+    ? buildCertifiedOutcomeRoutesFromProjection(canonicalCertifiedOutcomesProjection)
+    : null;
+  const certifiedOutcomes = projectedCertifiedOutcomes || legacyCertifiedOutcomes;
+  const legacyScannerTotal = countCertifiedOutcomeRoutes(legacyCertifiedOutcomes);
+  const effectiveCertifiedTotal = countCertifiedOutcomeRoutes(certifiedOutcomes);
+  const canonicalProjectionTotal = canonicalCertifiedOutcomesProjection?.certified_total ?? null;
 
   const report = scanCriticalRouteDivergence({
     ...routeInputs,
@@ -713,6 +784,23 @@ async function main(): Promise<void> {
       requested_replay_decision_id: requestedDecisionId,
       selected_replay_decision_id: replayDecisionId,
       base_outcome_total: baseOutcomeTotal,
+      certified_outcomes_counter: {
+        certified_outcomes_projection_version: canonicalCertifiedOutcomesProjection?.schema_version || null,
+        certifier_version: canonicalCertifiedOutcomesProjection?.certifier_version || null,
+        candidate_population_total: canonicalCertifiedOutcomesProjection?.candidate_total ?? baseOutcomeTotal,
+        projected_certified_total: canonicalProjectionTotal,
+        scanner_certified_total: effectiveCertifiedTotal,
+        counter_delta: canonicalProjectionTotal === null ? null : effectiveCertifiedTotal - canonicalProjectionTotal,
+        candidate_digests: canonicalCertifiedOutcomesProjection?.candidate_digests || [],
+        projection_digest: canonicalCertifiedOutcomesProjection?.projection_digest || null,
+        scanner_source: canonicalCertifiedOutcomesProjection ? "canonical_certified_outcomes_projection" : "legacy_runtime_truth_counter",
+        scanner_status: canonicalCertifiedOutcomesProjection ? "CONVERGED" : "LEGACY_COUNTER_ACTIVE",
+        legacy_scanner_total: legacyScannerTotal,
+        canonical_projection_total: canonicalProjectionTotal,
+        effective_certified_total: effectiveCertifiedTotal,
+        migration_state: canonicalCertifiedOutcomesProjection ? "legacy_counter_superseded" : "legacy_counter_active",
+        unique_key_basis: "proof_cycle_id+certifier_version+certification_digest",
+      },
       source_tree_certification: {
         cap_pct: round1(sourceTreeCapPct),
         certified_tri_pct: round1(certifiedTriPct),

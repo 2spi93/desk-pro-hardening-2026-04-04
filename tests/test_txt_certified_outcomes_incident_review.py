@@ -111,8 +111,18 @@ class TxtCertifiedOutcomesIncidentReviewTests(unittest.TestCase):
         mod = _load_module()
         report = {
             "findings": [{"code": "certified_outcomes_below_gate"}],
-            "certified_outcomes": {"certified_total": 0, "required_total": 100},
-            "runtime_context": {"base_outcome_total": 0, "source_tree_certification": {"cap_pct": 0}},
+            "certified_outcomes": {"certified_total": 3, "required_total": 100},
+            "runtime_context": {
+                "base_outcome_total": 0,
+                "source_tree_certification": {"cap_pct": 0},
+                "certified_outcomes_counter": {
+                    "legacy_scanner_total": 0,
+                    "canonical_projection_total": 3,
+                    "effective_certified_total": 3,
+                    "counter_delta": 0,
+                    "migration_state": "legacy_counter_superseded",
+                },
+            },
         }
 
         review = mod.build_review(
@@ -123,6 +133,11 @@ class TxtCertifiedOutcomesIncidentReviewTests(unittest.TestCase):
         )
 
         self.assertEqual(review["verdict"], mod.THRESHOLD_NOT_REACHED)
+        self.assertEqual(review["scanner"]["certified_outcomes"]["certified_total"], 3)
+        self.assertEqual(
+            review["scanner"]["runtime_context"]["certified_outcomes_counter"]["counter_delta"],
+            0,
+        )
         self.assertTrue(review["answers"]["threshold_not_reached"])
         self.assertTrue(review["answers"]["blocker_reproducible"])
 

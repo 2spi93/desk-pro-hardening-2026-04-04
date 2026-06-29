@@ -15,6 +15,7 @@ from typing import Any
 DEFAULT_CONTAINER = "control-plane"
 DEFAULT_SCANNER_REPORT = Path("/opt/txt/var/proof_renewal/certified_outcomes_review_runtime_truth_matrix.json")
 DEFAULT_OUT_DIR = Path("/opt/txt/var/proof_renewal")
+DEFAULT_OUTPUT = Path("/opt/txt/var/proof_renewal/certified_outcomes_projection_for_scanner.json")
 CERTIFIER_VERSION = "txt.certified_outcomes.proof_projection.v1"
 ROUND_TRIP_REPLAY_SCHEMA_VERSION = "txt.round_trip_replay_certificate.v1"
 LINEAGE_CAP_REQUIRED_PCT = 100.0
@@ -495,6 +496,7 @@ def build_projection(
             "source_tree_cap": source_tree_cap,
             "certification_blockers": candidate["certification_blockers"],
         })
+        candidate["certification_digest"] = candidate["candidate_digest"]
     blockers = sorted({blocker for candidate in candidates for blocker in candidate["certification_blockers"]})
     projection_core = {
         "certifier_version": CERTIFIER_VERSION,
@@ -504,6 +506,7 @@ def build_projection(
     }
     return {
         "schema_version": "txt-certified-outcomes-projection/v1",
+        "certifier_version": CERTIFIER_VERSION,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "mode": "read_only_derived_projection",
         "base_outcome_total": len(candidates),
@@ -514,6 +517,7 @@ def build_projection(
         "replay_aligned_total": sum(1 for candidate in candidates if candidate["replay_aligned"]),
         "source_tree_cap": source_tree_cap,
         "blockers": blockers,
+        "candidate_digests": projection_core["candidate_digests"],
         "projection_digest": stable_digest(projection_core),
         "candidates": candidates,
         "notes": [
@@ -540,6 +544,7 @@ def main() -> int:
     parser.add_argument("--docker-container", default=DEFAULT_CONTAINER)
     parser.add_argument("--scanner-report", default=str(DEFAULT_SCANNER_REPORT))
     parser.add_argument("--out-dir", default=str(DEFAULT_OUT_DIR))
+    parser.add_argument("--output", default=str(DEFAULT_OUTPUT))
     parser.add_argument("--repo-root", default="/opt/txt")
     parser.add_argument("--no-write", action="store_true")
     parser.add_argument("--text", action="store_true")
@@ -558,10 +563,15 @@ def main() -> int:
     if not args.no_write:
         out_dir = Path(args.out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         path = out_dir / f"certified_outcomes_projection_{stamp}.json"
-        path.write_text(json.dumps(report, indent=2, sort_keys=True, default=str), encoding="utf-8")
+        body = json.dumps(report, indent=2, sort_keys=True, default=str)
+        path.write_text(body, encoding="utf-8")
+        output_path.write_text(body, encoding="utf-8")
         report["report_path"] = str(path)
+        report["latest_report_path"] = str(output_path)
 
     if args.text:
         print(format_text(report))
