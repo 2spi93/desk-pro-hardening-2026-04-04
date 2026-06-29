@@ -43,7 +43,7 @@ operational surface to be clean now:
 - readiness is read-only and green
 - rail separation `PASS`
 - risk budget available
-- no active incident tickets
+- no promotion-relevant active incident blockers
 
 Clearing this gate authorizes a human promotion review only. It does not
 authorize continuous trading, notional increase, or another cycle.
@@ -58,5 +58,5 @@ PROMOTABLE_TO_MICRO_LIVE=false
 ```
 
 The proof layer is validated, including both SELL/SHORT and BUY/LONG paths.
-Promotion remains blocked while the daily risk budget is exhausted or active
-incident tickets are still open.
+Promotion remains blocked while the daily risk budget is exhausted or
+promotion-relevant incident tickets are still active or insufficiently resolved.

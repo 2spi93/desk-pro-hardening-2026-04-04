@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import subprocess
+import sys
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -15,6 +17,19 @@ DEFAULT_CONTAINER = "control-plane"
 DEFAULT_OUT_DIR = Path("/opt/txt/var/proof_renewal")
 DEFAULT_MIN_CYCLES = 3
 DEFAULT_FRESH_HOURS = 72.0
+
+
+def _load_incident_adjudicator():
+    path = Path(__file__).resolve().with_name("txt_incident_adjudication.py")
+    if not path.exists():
+        return None
+    spec = importlib.util.spec_from_file_location("txt_incident_adjudication", path)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def parse_time(value: Any) -> datetime | None:
@@ -371,8 +386,15 @@ def build_review(
         blockers.append("rail_separation_not_pass")
 
     incidents = payload.get("incidents", [])
+    incident_adjudication = None
     if incidents:
-        blockers.append("active_incidents_present")
+        adjudicator = _load_incident_adjudicator()
+        if adjudicator is None:
+            blockers.append("incident_adjudication_unavailable")
+        else:
+            incident_adjudication = adjudicator.build_report({"runtime": runtime, "incidents": incidents}, now=current)
+            if int(incident_adjudication.get("promotion_relevant_blockers") or 0) > 0:
+                blockers.append("promotion_relevant_incidents_present")
 
     proof_validated = len(clean) >= min_cycles and {"buy", "sell"} <= set(clean_sides)
     promotable = proof_validated and not blockers
@@ -404,6 +426,11 @@ def build_review(
             "clean_buy": sum(1 for row in clean if row["side"] == "buy"),
             "clean_sell": sum(1 for row in clean if row["side"] == "sell"),
             "active_incidents": len(incidents),
+            "promotion_relevant_incident_blockers": (
+                int(incident_adjudication.get("promotion_relevant_blockers") or 0)
+                if isinstance(incident_adjudication, dict)
+                else None
+            ),
         },
         "clean_sides": clean_sides,
         "cycles": assessed,
@@ -416,6 +443,11 @@ def build_review(
         },
         "rail_separation": rail.get("rail_separation"),
         "incidents": incidents[:20],
+        "incident_adjudication": {
+            "summary": incident_adjudication.get("summary"),
+            "promotion_relevant_blockers": incident_adjudication.get("promotion_relevant_blockers"),
+            "promotion_incident_block_clear": incident_adjudication.get("PROMOTION_INCIDENT_BLOCK_CLEAR"),
+        } if isinstance(incident_adjudication, dict) else None,
         "notes": [
             "This is a cold review only; it does not place orders, reset budget, or authorize continuous live trading.",
             "PROMOTABLE_TO_MICRO_LIVE=true would authorize a human promotion review only, not automatic trading.",

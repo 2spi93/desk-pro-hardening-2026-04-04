@@ -154,6 +154,66 @@ class BingxProofPromotionGateReviewTests(unittest.TestCase):
         self.assertFalse(review["PROMOTABLE_TO_MICRO_LIVE"])
         self.assertIn("buy_and_sell_not_both_covered", review["BLOCKERS"])
 
+    def test_only_promotion_relevant_incidents_block_promotion(self) -> None:
+        mod = _load_module()
+        payload = _payload()
+        payload["incidents"] = [
+            {
+                "ticket_key": "INC-old-terminal-1",
+                "severity": "critical",
+                "status": "open",
+                "source": "ops-chatbot",
+                "title": "Terminal local hard fail BTCUSDT 1h",
+                "payload": {},
+                "created_at": "2026-05-20T10:00:00+00:00",
+            },
+            {
+                "ticket_key": "INC-old-terminal-2",
+                "severity": "critical",
+                "status": "open",
+                "source": "ops-chatbot",
+                "title": "Terminal local hard fail BTCUSDT 5m",
+                "payload": {},
+                "created_at": "2026-05-20T10:00:00+00:00",
+            },
+        ]
+
+        review = mod.build_review(
+            payload,
+            runtime=_runtime(),
+            readiness=_readiness(),
+            rail={"rail_separation": "PASS"},
+            now=mod.parse_time("2026-06-29T10:00:00+00:00"),
+        )
+
+        self.assertTrue(review["PROMOTABLE_TO_MICRO_LIVE"])
+        self.assertNotIn("promotion_relevant_incidents_present", review["BLOCKERS"])
+        self.assertEqual(review["counts"]["promotion_relevant_incident_blockers"], 0)
+
+        payload["incidents"].append(
+            {
+                "ticket_key": "INC-constitutional",
+                "severity": "critical",
+                "status": "open",
+                "source": "ops-chatbot",
+                "title": "[Constitutional] Certified Outcomes Gate blocked",
+                "payload": {"detail": "live promotion remains blocked"},
+                "created_at": "2026-06-29T09:00:00+00:00",
+            }
+        )
+
+        blocked = mod.build_review(
+            payload,
+            runtime=_runtime(),
+            readiness=_readiness(),
+            rail={"rail_separation": "PASS"},
+            now=mod.parse_time("2026-06-29T10:00:00+00:00"),
+        )
+
+        self.assertFalse(blocked["PROMOTABLE_TO_MICRO_LIVE"])
+        self.assertIn("promotion_relevant_incidents_present", blocked["BLOCKERS"])
+        self.assertEqual(blocked["counts"]["promotion_relevant_incident_blockers"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
