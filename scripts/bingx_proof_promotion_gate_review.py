@@ -141,7 +141,8 @@ with psycopg.connect(db_url()) as conn:
                 cur,
                 """
                 SELECT decision_id, fill_id, venue, instrument, side, price,
-                       size_base, notional_usd, fill_type, filled_at, created_at
+                       size_base, notional_usd, fill_type, slippage_bps,
+                       fill_latency_ms, filled_at, created_at
                 FROM execution_fill_events
                 WHERE decision_id LIKE %s
                 ORDER BY filled_at DESC, created_at DESC

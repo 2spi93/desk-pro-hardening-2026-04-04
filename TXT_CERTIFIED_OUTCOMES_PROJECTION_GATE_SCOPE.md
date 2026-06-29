@@ -74,6 +74,8 @@ With the current scanner state:
 candidates=3
 certified=0
 blockers=replay_truth_divergence,source_tree_cap_zero
+lineage_valid=0
+replay_aligned=0
 ```
 
 So `INC-444A3CCAFA` remains active, but the diagnosis is no longer opaque

@@ -82,6 +82,22 @@ def _payload() -> dict:
     return {"fills": fills, "outcomes": outcomes, "gaps": gaps, "incidents": []}
 
 
+def _payload_with_aligned_replays() -> dict:
+    payload = _payload()
+    replays = {}
+    for root in ("proofcyc-1", "proofcyc-2", "proofcyc-3"):
+        replays[f"{root}-entry"] = {
+            "decision_id": f"{root}-entry",
+            "fills": [
+                {"fill_id": f"{root}-entry-fill", "slippage_bps": None},
+                {"fill_id": f"{root}-exit-fill", "slippage_bps": None},
+            ],
+            "outcome": {"decision_id": f"{root}-entry"},
+        }
+    payload["replays"] = replays
+    return payload
+
+
 def _scanner(diverged: bool = True, source_tree_cap: int = 0) -> dict:
     return {
         "generated_at_iso": "2026-06-29T10:00:00Z",
@@ -114,6 +130,16 @@ class TxtCertifiedOutcomesProjectionTests(unittest.TestCase):
         self.assertIn("replay_truth_divergence", report["blockers"])
         self.assertIn("source_tree_cap_zero", report["blockers"])
         self.assertTrue(all(item["candidate"] for item in report["candidates"]))
+        self.assertEqual(report["lineage_valid_total"], 0)
+        self.assertEqual(report["replay_aligned_total"], 0)
+        self.assertEqual(
+            {item["lineage"]["classification"] for item in report["candidates"]},
+            {"COVERAGE_BELOW_CAP"},
+        )
+        self.assertEqual(
+            {item["replay"]["divergence_class"] for item in report["candidates"]},
+            {"REPLAY_CERTIFICATE_MISSING"},
+        )
 
     def test_projection_digest_is_deterministic_for_same_inputs(self) -> None:
         mod = _load_module()
@@ -132,12 +158,33 @@ class TxtCertifiedOutcomesProjectionTests(unittest.TestCase):
         mod = _load_module()
 
         with patch.object(mod, "git_head", return_value="abc123"):
-            report = mod.build_projection(_payload(), scanner_report=_scanner(diverged=False, source_tree_cap=100), repo_root=ROOT)
+            report = mod.build_projection(_payload_with_aligned_replays(), scanner_report=_scanner(diverged=False, source_tree_cap=100), repo_root=ROOT)
 
         self.assertEqual(report["candidate_total"], 3)
         self.assertEqual(report["certified_total"], 3)
         self.assertEqual(report["rejected_total"], 0)
+        self.assertEqual(report["lineage_valid_total"], 3)
+        self.assertEqual(report["replay_aligned_total"], 3)
         self.assertEqual(report["blockers"], [])
+
+    def test_replay_payload_incomplete_is_reported_per_candidate(self) -> None:
+        mod = _load_module()
+        payload = _payload()
+        payload["replays"] = {
+            "proofcyc-1-entry": {
+                "decision_id": "proofcyc-1-entry",
+                "fills": [{"fill_id": "proofcyc-1-entry-fill", "slippage_bps": None}],
+            }
+        }
+
+        with patch.object(mod, "git_head", return_value="abc123"):
+            report = mod.build_projection(payload, scanner_report=_scanner(diverged=True, source_tree_cap=100), repo_root=ROOT)
+
+        first = next(item for item in report["candidates"] if item["proof_cycle_id"] == "proofcyc-1")
+        self.assertEqual(first["lineage"]["classification"], "LINEAGE_VALID")
+        self.assertEqual(first["replay"]["divergence_class"], "REPLAY_PAYLOAD_INCOMPLETE")
+        self.assertIn("outcome", first["replay"]["divergence_fields"])
+        self.assertIn("hedge_lifecycle", first["replay"]["divergence_fields"])
 
 
 if __name__ == "__main__":
