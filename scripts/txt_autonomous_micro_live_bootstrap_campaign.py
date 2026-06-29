@@ -130,6 +130,7 @@ def collect_cold_reports() -> dict[str, Any]:
         "certified_outcomes": run_json_command(["python3", "scripts/txt_certified_outcomes_incident_review.py", "--no-write"]),
         "bootstrap_policy": run_json_command(["python3", "scripts/txt_bootstrap_policy_review.py", "--no-write"]),
         "opportunity_gate": run_json_command(["python3", "scripts/txt_opportunity_gate_readiness_review.py", "--no-write"]),
+        "incident_adjudication": run_json_command(["python3", "scripts/txt_incident_adjudication.py", "--no-write"]),
     }
 
 
@@ -257,6 +258,7 @@ def build_review(
     certified_review = reports.get("certified_outcomes") if isinstance(reports.get("certified_outcomes"), dict) else {}
     bootstrap_policy = reports.get("bootstrap_policy") if isinstance(reports.get("bootstrap_policy"), dict) else {}
     opportunity_gate = reports.get("opportunity_gate") if isinstance(reports.get("opportunity_gate"), dict) else {}
+    incident_adjudication = reports.get("incident_adjudication") if isinstance(reports.get("incident_adjudication"), dict) else {}
     signal_eval = evaluate_strategy_signal(
         strategy_signal or {},
         symbol=contract.symbol,
@@ -301,7 +303,15 @@ def build_review(
     ]
     if hard_stop_blockers:
         blockers.extend(f"promotion_gate_{item}" for item in hard_stop_blockers)
-    if "promotion_relevant_incidents_present" in promotion_blockers:
+    threshold_only_incident = (
+        certified_review.get("verdict") == "E_CERTIFIED_OUTCOMES_THRESHOLD_NOT_REACHED"
+        and bool((bootstrap_policy.get("bootstrap_analysis") or {}).get("proof_gate_usable_before_threshold"))
+        and not bool((opportunity_gate.get("incident_adjudication") or {}).get("promotion_relevant_incident_clear") is False)
+    )
+    unresolved_promotion_blockers = int(incident_adjudication.get("promotion_relevant_blockers") or 0)
+    if "promotion_relevant_incidents_present" in promotion_blockers and not threshold_only_incident:
+        blockers.append("promotion_relevant_incident")
+    elif "promotion_relevant_incidents_present" in promotion_blockers and threshold_only_incident and unresolved_promotion_blockers > 1:
         blockers.append("promotion_relevant_incident")
 
     capacity = remaining_cycle_capacity(contract, promotion_gate)
@@ -330,6 +340,10 @@ def build_review(
             "ready": opportunity_gate.get("OPPORTUNITY_GATE_READY") if opportunity_gate else None,
             "lock": opportunity_gate.get("lock") if isinstance(opportunity_gate.get("lock"), dict) else None,
             "recommended_disposition": opportunity_gate.get("recommended_disposition") if opportunity_gate else None,
+        },
+        "incident_readiness": {
+            "promotion_relevant_blockers": unresolved_promotion_blockers,
+            "certified_outcomes_threshold_only": threshold_only_incident,
         },
         "stop_conditions": STOP_CONDITIONS,
         "current_state": {

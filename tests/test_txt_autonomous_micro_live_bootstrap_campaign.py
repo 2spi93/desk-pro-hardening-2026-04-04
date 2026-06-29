@@ -42,6 +42,10 @@ def _reports(*, used: float = 0.0, incident_blocker: bool = False) -> dict:
         "opportunity_gate": {
             "OPPORTUNITY_GATE_READY": True,
             "lock": {"active": False},
+            "incident_adjudication": {"promotion_relevant_incident_clear": True},
+        },
+        "incident_adjudication": {
+            "promotion_relevant_blockers": 0,
         },
     }
 
@@ -177,6 +181,46 @@ class TxtAutonomousMicroLiveBootstrapCampaignTests(unittest.TestCase):
         report = mod.build_review(
             contract=contract,
             reports=_reports(used=0.0, incident_blocker=True),
+            strategy_signal=_signal(),
+            now=datetime(2026, 6, 29, 12, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertFalse(report["AUTONOMOUS_MICRO_BOOTSTRAP_AUTHORIZED"])
+        self.assertIn("promotion_relevant_incident", report["BLOCKERS"])
+
+    def test_certified_outcomes_threshold_incident_does_not_block_bootstrap(self) -> None:
+        mod = _load_module()
+        contract = mod.CampaignContract(
+            campaign_expiry="2026-06-30T00:00:00Z",
+            operator_authorization=mod.CAMPAIGN_AUTH_TOKEN,
+        )
+        reports = _reports(used=0.0, incident_blocker=True)
+        reports["certified_outcomes"]["verdict"] = "E_CERTIFIED_OUTCOMES_THRESHOLD_NOT_REACHED"
+        reports["incident_adjudication"] = {"promotion_relevant_blockers": 1}
+
+        report = mod.build_review(
+            contract=contract,
+            reports=reports,
+            strategy_signal=_signal(),
+            now=datetime(2026, 6, 29, 12, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertTrue(report["AUTONOMOUS_MICRO_BOOTSTRAP_AUTHORIZED"])
+        self.assertNotIn("promotion_relevant_incident", report["BLOCKERS"])
+
+    def test_additional_promotion_incident_still_blocks_bootstrap(self) -> None:
+        mod = _load_module()
+        contract = mod.CampaignContract(
+            campaign_expiry="2026-06-30T00:00:00Z",
+            operator_authorization=mod.CAMPAIGN_AUTH_TOKEN,
+        )
+        reports = _reports(used=0.0, incident_blocker=True)
+        reports["certified_outcomes"]["verdict"] = "E_CERTIFIED_OUTCOMES_THRESHOLD_NOT_REACHED"
+        reports["incident_adjudication"] = {"promotion_relevant_blockers": 2}
+
+        report = mod.build_review(
+            contract=contract,
+            reports=reports,
             strategy_signal=_signal(),
             now=datetime(2026, 6, 29, 12, 0, tzinfo=timezone.utc),
         )
