@@ -34,15 +34,27 @@ The controller refuses to run without a strategy signal file proving that the ne
 
 ```json
 {
+  "schema_version": "txt.strategy-signal.v1",
   "signal_id": "sig-example",
-  "admissible": true,
+  "strategy_id": "bootstrap-edge-smoke",
+  "strategy_version": "v1",
   "symbol": "BTCUSDT",
   "side": "buy",
-  "edge_score": 0.12
+  "generated_at": "2026-06-29T11:55:00Z",
+  "expires_at": "2026-06-29T12:05:00Z",
+  "confidence": 0.72,
+  "market_regime": "liquid_micro",
+  "entry_reason": "positive_micro_edge_after_costs",
+  "invalidation_reason": "spread_or_consistency_degrades",
+  "expected_edge_bps": 4.0,
+  "estimated_fees_bps": 1.2,
+  "estimated_slippage_bps": 1.0,
+  "net_expected_edge_bps": 1.8,
+  "consumed": false
 }
 ```
 
-The signal must match BTCUSDT, provide `buy` or `sell`, be marked admissible, and carry a positive edge score.
+The signal must be fresh, unconsumed, match BTCUSDT, provide `buy` or `sell`, and carry a positive `net_expected_edge_bps` after estimated fees and slippage.
 
 ## Execution Boundary
 
@@ -100,4 +112,3 @@ campaign default action     stop
 ```
 
 The campaign controller is ready as a bounded mechanism, but current runtime state still blocks execution while budget and promotion-relevant incidents remain active.
-

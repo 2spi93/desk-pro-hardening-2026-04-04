@@ -21,6 +21,7 @@ DEFAULT_DAILY_BUDGET = 30.0
 DEFAULT_MAX_CYCLES_PER_DAY = 2
 CAMPAIGN_AUTH_TOKEN = "TXT_BOOTSTRAP_MICRO_LIVE_EXECUTE"
 RUNNER_CONFIRM_TOKEN = "PROOF_RENEWAL_EXECUTE"
+STRATEGY_SIGNAL_SCHEMA_VERSION = "txt.strategy-signal.v1"
 
 
 STOP_CONDITIONS = [
@@ -128,6 +129,7 @@ def collect_cold_reports() -> dict[str, Any]:
         "promotion_gate": run_json_command(["python3", "scripts/bingx_proof_promotion_gate_review.py", "--no-write"]),
         "certified_outcomes": run_json_command(["python3", "scripts/txt_certified_outcomes_incident_review.py", "--no-write"]),
         "bootstrap_policy": run_json_command(["python3", "scripts/txt_bootstrap_policy_review.py", "--no-write"]),
+        "opportunity_gate": run_json_command(["python3", "scripts/txt_opportunity_gate_readiness_review.py", "--no-write"]),
     }
 
 
@@ -136,7 +138,22 @@ def normalize_side(value: Any) -> str:
     return side if side in {"buy", "sell"} else ""
 
 
-def evaluate_strategy_signal(signal: dict[str, Any], *, symbol: str) -> dict[str, Any]:
+def to_float(value: Any, fallback: float = 0.0) -> float:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return fallback
+    return numeric if numeric == numeric else fallback
+
+
+def evaluate_strategy_signal(
+    signal: dict[str, Any],
+    *,
+    symbol: str,
+    now: datetime | None = None,
+    consumed_signal_ids: set[str] | None = None,
+) -> dict[str, Any]:
+    current = now or datetime.now(timezone.utc)
     if not signal:
         return {
             "admissible": False,
@@ -151,21 +168,70 @@ def evaluate_strategy_signal(signal: dict[str, Any], *, symbol: str) -> dict[str
             "detail": signal,
         }
     side = normalize_side(signal.get("side"))
+    signal_id = str(signal.get("signal_id") or "").strip()
+    generated_at = parse_time(signal.get("generated_at"))
+    expires_at = parse_time(signal.get("expires_at"))
+    expected_edge_bps = to_float(signal.get("expected_edge_bps"))
+    estimated_fees_bps = to_float(signal.get("estimated_fees_bps"))
+    estimated_slippage_bps = to_float(signal.get("estimated_slippage_bps"))
+    net_expected_edge_bps = to_float(
+        signal.get("net_expected_edge_bps"),
+        expected_edge_bps - estimated_fees_bps - estimated_slippage_bps,
+    )
     reasons: list[str] = []
-    if not bool(signal.get("admissible")):
-        reasons.append("strategy_signal_not_admissible")
+    if str(signal.get("schema_version") or "") != STRATEGY_SIGNAL_SCHEMA_VERSION:
+        reasons.append("strategy_signal_schema_invalid")
+    for required in (
+        "signal_id",
+        "strategy_id",
+        "strategy_version",
+        "generated_at",
+        "expires_at",
+        "confidence",
+        "market_regime",
+        "entry_reason",
+        "invalidation_reason",
+        "expected_edge_bps",
+        "estimated_fees_bps",
+        "estimated_slippage_bps",
+        "net_expected_edge_bps",
+    ):
+        if signal.get(required) in (None, ""):
+            reasons.append(f"{required}_missing")
     if str(signal.get("symbol") or "").strip().upper() != symbol:
         reasons.append("strategy_signal_symbol_mismatch")
     if not side:
         reasons.append("strategy_signal_side_invalid")
-    if float(signal.get("edge_score", 0.0) or 0.0) <= 0:
-        reasons.append("strategy_signal_edge_not_positive")
+    if generated_at is None:
+        reasons.append("strategy_signal_generated_at_invalid")
+    if expires_at is None:
+        reasons.append("strategy_signal_expires_at_invalid")
+    elif expires_at <= current:
+        reasons.append("strategy_signal_expired")
+    if bool(signal.get("consumed")):
+        reasons.append("strategy_signal_already_consumed")
+    if signal_id and consumed_signal_ids and signal_id in consumed_signal_ids:
+        reasons.append("strategy_signal_already_consumed")
+    if to_float(signal.get("confidence")) <= 0:
+        reasons.append("strategy_signal_confidence_invalid")
+    if net_expected_edge_bps <= 0:
+        reasons.append("strategy_signal_net_edge_not_positive")
     return {
         "admissible": not reasons,
         "side": side or None,
         "reason": ",".join(reasons) if reasons else "strategy_signal_admissible",
-        "signal_id": signal.get("signal_id"),
-        "edge_score": signal.get("edge_score"),
+        "schema_version": signal.get("schema_version"),
+        "signal_id": signal_id or None,
+        "strategy_id": signal.get("strategy_id"),
+        "strategy_version": signal.get("strategy_version"),
+        "generated_at": signal.get("generated_at"),
+        "expires_at": signal.get("expires_at"),
+        "confidence": signal.get("confidence"),
+        "market_regime": signal.get("market_regime"),
+        "expected_edge_bps": expected_edge_bps,
+        "estimated_fees_bps": estimated_fees_bps,
+        "estimated_slippage_bps": estimated_slippage_bps,
+        "net_expected_edge_bps": net_expected_edge_bps,
     }
 
 
@@ -184,12 +250,19 @@ def build_review(
     reports: dict[str, Any],
     strategy_signal: dict[str, Any] | None = None,
     now: datetime | None = None,
+    consumed_signal_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     current = now or datetime.now(timezone.utc)
     promotion_gate = reports.get("promotion_gate") if isinstance(reports.get("promotion_gate"), dict) else {}
     certified_review = reports.get("certified_outcomes") if isinstance(reports.get("certified_outcomes"), dict) else {}
     bootstrap_policy = reports.get("bootstrap_policy") if isinstance(reports.get("bootstrap_policy"), dict) else {}
-    signal_eval = evaluate_strategy_signal(strategy_signal or {}, symbol=contract.symbol)
+    opportunity_gate = reports.get("opportunity_gate") if isinstance(reports.get("opportunity_gate"), dict) else {}
+    signal_eval = evaluate_strategy_signal(
+        strategy_signal or {},
+        symbol=contract.symbol,
+        now=current,
+        consumed_signal_ids=consumed_signal_ids,
+    )
     expiry = parse_time(contract.campaign_expiry)
 
     blockers: list[str] = []
@@ -215,6 +288,8 @@ def build_review(
         blockers.append("proof_layer_not_validated")
     if not bool((bootstrap_policy.get("bootstrap_analysis") or {}).get("proof_gate_usable_before_threshold")):
         blockers.append("bootstrap_scope_not_separated")
+    if opportunity_gate and not bool(opportunity_gate.get("OPPORTUNITY_GATE_READY")):
+        blockers.append("opportunity_gate_not_ready")
     if not bool(signal_eval.get("admissible")):
         blockers.append(str(signal_eval.get("reason") or "strategy_signal_blocked"))
 
@@ -238,14 +313,24 @@ def build_review(
     certified_total = int(certified.get("certified_total") or projected.get("certified_total") or 0)
     required_total = int(certified.get("required_total") or 100)
 
+    operator_only_blockers = {"campaign_expiry_required", "operator_authorization_missing"}
+    technical_blockers = sorted(set(blockers) - operator_only_blockers)
     authorized = not blockers
     next_side = signal_eval.get("side") if authorized else None
+    next_action = "execute_one_micro_cycle" if authorized else (
+        "await_operator_authorization" if not technical_blockers else "stop"
+    )
     return {
         "schema_version": "txt-autonomous-micro-live-bootstrap-campaign/v1",
         "generated_at": current.isoformat(),
         "mode": "read_only_campaign_review",
         "campaign_contract": contract.as_dict(),
         "strategy_signal": signal_eval,
+        "opportunity_gate_readiness": {
+            "ready": opportunity_gate.get("OPPORTUNITY_GATE_READY") if opportunity_gate else None,
+            "lock": opportunity_gate.get("lock") if isinstance(opportunity_gate.get("lock"), dict) else None,
+            "recommended_disposition": opportunity_gate.get("recommended_disposition") if opportunity_gate else None,
+        },
         "stop_conditions": STOP_CONDITIONS,
         "current_state": {
             "certified_outcomes": certified_total,
@@ -256,7 +341,7 @@ def build_review(
             "continuous_autonomous_blocked": certified_total < required_total,
         },
         "AUTONOMOUS_MICRO_BOOTSTRAP_AUTHORIZED": authorized,
-        "NEXT_ACTION": "execute_one_micro_cycle" if authorized else "stop",
+        "NEXT_ACTION": next_action,
         "NEXT_SIDE": next_side,
         "BLOCKERS": sorted(set(blockers)),
         "non_actions": [
@@ -300,9 +385,9 @@ def execute_one_cycle(report: dict[str, Any], *, observe_seconds: int) -> int:
     post_report = build_review(
         contract=CampaignContract(**(report.get("campaign_contract") or {})),
         reports=post,
-        strategy_signal={"admissible": False, "symbol": DEFAULT_SYMBOL, "side": side, "edge_score": 0, "signal_id": "post-cycle-stop"},
+        strategy_signal={},
     )
-    if post_report["BLOCKERS"] and "strategy_signal_not_admissible,strategy_signal_edge_not_positive" not in post_report["BLOCKERS"]:
+    if post_report["BLOCKERS"] and "strategy_signal_missing" not in post_report["BLOCKERS"]:
         print(json.dumps({"status": "post_cycle_blocked", "blockers": post_report["BLOCKERS"]}, sort_keys=True))
     return 0
 

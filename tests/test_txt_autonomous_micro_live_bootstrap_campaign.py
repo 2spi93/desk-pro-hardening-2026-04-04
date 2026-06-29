@@ -39,16 +39,32 @@ def _reports(*, used: float = 0.0, incident_blocker: bool = False) -> dict:
         "bootstrap_policy": {
             "bootstrap_analysis": {"proof_gate_usable_before_threshold": True},
         },
+        "opportunity_gate": {
+            "OPPORTUNITY_GATE_READY": True,
+            "lock": {"active": False},
+        },
     }
 
 
 def _signal(side: str = "buy") -> dict:
     return {
+        "schema_version": "txt.strategy-signal.v1",
         "signal_id": "sig-1",
-        "admissible": True,
+        "strategy_id": "bootstrap-edge-smoke",
+        "strategy_version": "v1",
         "symbol": "BTCUSDT",
         "side": side,
-        "edge_score": 0.12,
+        "generated_at": "2026-06-29T11:55:00Z",
+        "expires_at": "2026-06-29T12:05:00Z",
+        "confidence": 0.72,
+        "market_regime": "liquid_micro",
+        "entry_reason": "positive_micro_edge_after_costs",
+        "invalidation_reason": "spread_or_consistency_degrades",
+        "expected_edge_bps": 4.0,
+        "estimated_fees_bps": 1.2,
+        "estimated_slippage_bps": 1.0,
+        "net_expected_edge_bps": 1.8,
+        "consumed": False,
     }
 
 
@@ -84,6 +100,7 @@ class TxtAutonomousMicroLiveBootstrapCampaignTests(unittest.TestCase):
         )
 
         self.assertFalse(report["AUTONOMOUS_MICRO_BOOTSTRAP_AUTHORIZED"])
+        self.assertEqual(report["NEXT_ACTION"], "await_operator_authorization")
         self.assertIn("campaign_expiry_required", report["BLOCKERS"])
         self.assertIn("operator_authorization_missing", report["BLOCKERS"])
 
@@ -105,13 +122,14 @@ class TxtAutonomousMicroLiveBootstrapCampaignTests(unittest.TestCase):
         self.assertIn("budget_exhausted", report["BLOCKERS"])
         self.assertTrue(report["current_state"]["proof_layer_validated"])
 
-    def test_strategy_signal_must_be_admissible_real_edge(self) -> None:
+    def test_strategy_signal_must_have_positive_net_edge_after_costs(self) -> None:
         mod = _load_module()
         contract = mod.CampaignContract(
             campaign_expiry="2026-06-30T00:00:00Z",
             operator_authorization=mod.CAMPAIGN_AUTH_TOKEN,
         )
-        signal = {"admissible": True, "symbol": "BTCUSDT", "side": "buy", "edge_score": 0}
+        signal = _signal()
+        signal["net_expected_edge_bps"] = 0
 
         report = mod.build_review(
             contract=contract,
@@ -121,7 +139,33 @@ class TxtAutonomousMicroLiveBootstrapCampaignTests(unittest.TestCase):
         )
 
         self.assertFalse(report["AUTONOMOUS_MICRO_BOOTSTRAP_AUTHORIZED"])
-        self.assertIn("strategy_signal_edge_not_positive", ",".join(report["BLOCKERS"]))
+        self.assertIn("strategy_signal_net_edge_not_positive", ",".join(report["BLOCKERS"]))
+
+    def test_strategy_signal_expires_and_cannot_be_reused(self) -> None:
+        mod = _load_module()
+        contract = mod.CampaignContract(
+            campaign_expiry="2026-06-30T00:00:00Z",
+            operator_authorization=mod.CAMPAIGN_AUTH_TOKEN,
+        )
+
+        expired = _signal()
+        expired["expires_at"] = "2026-06-29T11:59:00Z"
+        expired_report = mod.build_review(
+            contract=contract,
+            reports=_reports(used=0.0),
+            strategy_signal=expired,
+            now=datetime(2026, 6, 29, 12, 0, tzinfo=timezone.utc),
+        )
+        self.assertIn("strategy_signal_expired", ",".join(expired_report["BLOCKERS"]))
+
+        reused_report = mod.build_review(
+            contract=contract,
+            reports=_reports(used=0.0),
+            strategy_signal=_signal(),
+            now=datetime(2026, 6, 29, 12, 0, tzinfo=timezone.utc),
+            consumed_signal_ids={"sig-1"},
+        )
+        self.assertIn("strategy_signal_already_consumed", ",".join(reused_report["BLOCKERS"]))
 
     def test_promotion_relevant_incident_blocks_campaign(self) -> None:
         mod = _load_module()
@@ -139,6 +183,28 @@ class TxtAutonomousMicroLiveBootstrapCampaignTests(unittest.TestCase):
 
         self.assertFalse(report["AUTONOMOUS_MICRO_BOOTSTRAP_AUTHORIZED"])
         self.assertIn("promotion_relevant_incident", report["BLOCKERS"])
+
+    def test_opportunity_gate_review_blocks_campaign_when_not_ready(self) -> None:
+        mod = _load_module()
+        contract = mod.CampaignContract(
+            campaign_expiry="2026-06-30T00:00:00Z",
+            operator_authorization=mod.CAMPAIGN_AUTH_TOKEN,
+        )
+        reports = _reports(used=0.0)
+        reports["opportunity_gate"] = {
+            "OPPORTUNITY_GATE_READY": False,
+            "lock": {"active": True, "owner": "opportunity_gate", "reason": "consistency_kill_threshold"},
+        }
+
+        report = mod.build_review(
+            contract=contract,
+            reports=reports,
+            strategy_signal=_signal(),
+            now=datetime(2026, 6, 29, 12, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertFalse(report["AUTONOMOUS_MICRO_BOOTSTRAP_AUTHORIZED"])
+        self.assertIn("opportunity_gate_not_ready", report["BLOCKERS"])
 
 
 if __name__ == "__main__":
