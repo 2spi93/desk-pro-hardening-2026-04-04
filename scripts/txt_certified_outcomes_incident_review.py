@@ -33,6 +33,17 @@ def _load_promotion_gate():
     return module
 
 
+def _load_projection():
+    path = Path(__file__).resolve().with_name("txt_certified_outcomes_projection.py")
+    spec = importlib.util.spec_from_file_location("txt_certified_outcomes_projection", path)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def fetch_incident(container: str, incident_id: str) -> dict[str, Any] | None:
     code = r'''
 import json
@@ -107,6 +118,7 @@ def build_review(
     incident: dict[str, Any] | None,
     scanner_report: dict[str, Any],
     promotion_review: dict[str, Any],
+    projection_report: dict[str, Any] | None = None,
     generated_at: datetime | None = None,
 ) -> dict[str, Any]:
     now = generated_at or datetime.now(timezone.utc)
@@ -122,8 +134,14 @@ def build_review(
     certified_total = int(certified.get("certified_total") or 0)
     required_total = int(certified.get("required_total") or 100)
     base_outcome_total = int(runtime_context.get("base_outcome_total") or 0)
+    projected_candidate_total = int((projection_report or {}).get("candidate_total") or 0)
+    projected_certified_total = int((projection_report or {}).get("certified_total") or 0)
+    projection_blockers = list((projection_report or {}).get("blockers") or [])
 
-    if certified_blocked and proof_validated and base_outcome_total == 0:
+    if certified_blocked and proof_validated and projected_candidate_total > 0 and projected_certified_total == 0:
+        verdict = CERTIFICATION_INCOMPLETE
+        disposition = "fix_projection_blockers_before_closure"
+    elif certified_blocked and proof_validated and base_outcome_total == 0:
         verdict = CERTIFICATION_INCOMPLETE
         disposition = "fix_projection_or_certification_mapping_before_closure"
     elif certified_blocked:
@@ -161,6 +179,15 @@ def build_review(
             },
             "replay_truth": route_status(scanner_report, "/api/execution/replay/[decisionId]"),
         },
+        "projection": {
+            "schema_version": (projection_report or {}).get("schema_version"),
+            "base_outcome_total": (projection_report or {}).get("base_outcome_total"),
+            "candidate_total": projected_candidate_total,
+            "certified_total": projected_certified_total,
+            "rejected_total": (projection_report or {}).get("rejected_total"),
+            "blockers": projection_blockers,
+            "projection_digest": (projection_report or {}).get("projection_digest"),
+        },
         "proof_layer": {
             "validated": proof_validated,
             "clean_cycles": clean_cycles,
@@ -170,10 +197,11 @@ def build_review(
         "answers": {
             "endpoint_responds_currently": "not_applicable_scanner_virtual_gate",
             "precise_blocking_check": (
-                f"certified_outcomes {certified_total}/{required_total}; base_outcome_total={base_outcome_total}; "
-                f"source_tree_cap_pct={source_tree.get('cap_pct')}"
+                f"certified_outcomes {certified_total}/{required_total}; scanner_base_outcome_total={base_outcome_total}; "
+                f"projected_candidates={projected_candidate_total}; projected_certified={projected_certified_total}; "
+                f"projection_blockers={','.join(projection_blockers) or 'none'}; source_tree_cap_pct={source_tree.get('cap_pct')}"
             ),
-            "three_clean_cycles_in_certified_outcomes": clean_cycles >= 3 and certified_total >= 3,
+            "three_clean_cycles_in_certified_outcomes": clean_cycles >= 3 and projected_candidate_total >= 3,
             "fills_outcomes_reality_gap_aligned_for_proof_cycles": proof_validated,
             "blocker_reproducible": certified_blocked,
             "incident_state": "active" if certified_blocked else "resolved_or_non_reproducible",
@@ -188,10 +216,13 @@ def build_review(
 def format_text(review: dict[str, Any]) -> str:
     certified = review["scanner"]["certified_outcomes"]
     answers = review["answers"]
+    projection = review.get("projection") or {}
     return (
         f"CERTIFIED_OUTCOMES_REVIEW verdict={review['verdict']} "
         f"incident_state={answers['incident_state']} "
         f"certified={certified.get('certified_total')}/{certified.get('required_total')} "
+        f"candidates={projection.get('candidate_total')} "
+        f"projected_certified={projection.get('certified_total')} "
         f"proof_validated={review['proof_layer']['validated']} "
         f"blocker_reproducible={answers['blocker_reproducible']} "
         f"additional_blocker={answers['additional_blocker'] or 'none'}"
@@ -209,11 +240,18 @@ def main() -> int:
     args = parser.parse_args()
 
     gate = _load_promotion_gate()
+    projector = _load_projection()
     payload = gate.fetch_db_payload(args.docker_container, limit=100)
     promotion_review = gate.build_review(payload, runtime={}, readiness={}, rail={}, fresh_hours=72.0)
     incident = fetch_incident(args.docker_container, args.incident_id)
     scanner_report = load_json(Path(args.scanner_report))
-    review = build_review(incident=incident, scanner_report=scanner_report, promotion_review=promotion_review)
+    projection_report = projector.build_projection(payload, scanner_report=scanner_report, repo_root=Path("/opt/txt")) if projector else None
+    review = build_review(
+        incident=incident,
+        scanner_report=scanner_report,
+        promotion_review=promotion_review,
+        projection_report=projection_report,
+    )
 
     if not args.no_write:
         out_dir = Path(args.out_dir)

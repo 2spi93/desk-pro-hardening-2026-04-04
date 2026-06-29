@@ -37,6 +37,8 @@ The review is read-only:
 verdict=C_ENDPOINT_SANE_CERTIFICATION_INCOMPLETE
 incident_state=active
 certified=0/100
+projected candidates=3
+projected certified=0
 proof_validated=true
 blocker_reproducible=true
 additional_blocker=replay_truth_divergence_detected
@@ -46,8 +48,8 @@ Interpretation:
 
 - the BingX proof layer is valid: 3 clean cycles, BUY and SELL covered;
 - the constitutional certified-outcomes gate is still blocked;
-- the scanner computes `base_outcome_total=0`, so the proof cycles are not yet
-  represented in the certified-outcomes population;
+- the derived projection surfaces the proof cycles as candidates, but rejects
+  them while replay/source-tree blockers remain;
 - `Replay Truth` also diverges on the selected proof decision.
 
 This is not eligible for closure. The next cold fix is the projection or

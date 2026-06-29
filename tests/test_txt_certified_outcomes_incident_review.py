@@ -48,11 +48,29 @@ class TxtCertifiedOutcomesIncidentReviewTests(unittest.TestCase):
             "runtime_context": {"base_outcome_total": 0, "source_tree_certification": {"cap_pct": 0}},
         }
 
-        review = mod.build_review(incident=_incident(), scanner_report=report, promotion_review=_promotion())
+        projection = {
+            "schema_version": "txt-certified-outcomes-projection/v1",
+            "candidate_total": 3,
+            "certified_total": 0,
+            "rejected_total": 3,
+            "base_outcome_total": 3,
+            "blockers": ["replay_truth_divergence"],
+            "projection_digest": "digest-1",
+        }
+
+        review = mod.build_review(
+            incident=_incident(),
+            scanner_report=report,
+            promotion_review=_promotion(),
+            projection_report=projection,
+        )
 
         self.assertEqual(review["verdict"], mod.CERTIFICATION_INCOMPLETE)
         self.assertTrue(review["answers"]["blocker_reproducible"])
         self.assertTrue(review["proof_layer"]["validated"])
+        self.assertEqual(review["projection"]["candidate_total"], 3)
+        self.assertEqual(review["projection"]["certified_total"], 0)
+        self.assertTrue(review["answers"]["three_clean_cycles_in_certified_outcomes"])
 
     def test_endpoint_still_blocked_when_certified_gate_fails_without_validated_proof(self) -> None:
         mod = _load_module()
@@ -62,7 +80,12 @@ class TxtCertifiedOutcomesIncidentReviewTests(unittest.TestCase):
             "runtime_context": {"base_outcome_total": 7, "source_tree_certification": {"cap_pct": 50}},
         }
 
-        review = mod.build_review(incident=_incident(), scanner_report=report, promotion_review=_promotion(False))
+        review = mod.build_review(
+            incident=_incident(),
+            scanner_report=report,
+            promotion_review=_promotion(False),
+            projection_report={"candidate_total": 0, "certified_total": 0, "blockers": []},
+        )
 
         self.assertEqual(review["verdict"], mod.ENDPOINT_STILL_BLOCKED)
 
@@ -74,7 +97,12 @@ class TxtCertifiedOutcomesIncidentReviewTests(unittest.TestCase):
             "runtime_context": {"base_outcome_total": 100, "source_tree_certification": {"cap_pct": 100}},
         }
 
-        review = mod.build_review(incident=_incident(), scanner_report=report, promotion_review=_promotion())
+        review = mod.build_review(
+            incident=_incident(),
+            scanner_report=report,
+            promotion_review=_promotion(),
+            projection_report={"candidate_total": 100, "certified_total": 100, "blockers": []},
+        )
 
         self.assertEqual(review["verdict"], mod.READY_TO_CLOSE)
         self.assertFalse(review["answers"]["blocker_reproducible"])
