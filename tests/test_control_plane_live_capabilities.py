@@ -487,7 +487,9 @@ class ControlPlaneLiveCapabilityTests(unittest.TestCase):
              patch.object(control_plane, "_kill_switch_thresholds", return_value={"max_drawdown_intraday": 100.0}), \
              patch.object(control_plane, "_recent_pending_live_approval_count", return_value=0), \
              patch.object(control_plane, "_load_live_execution_policy", return_value=control_plane._default_live_execution_policy()), \
+             patch.object(control_plane, "_resolve_provider_micro_live", return_value={"enabled": False, "current_stage": "", "current_stage_config": {}}), \
              patch.object(control_plane, "_drawdown_velocity_snapshot", return_value={"lookback_minutes": 90, "recent_loss_usd": 0.0, "recent_net_result_usd": 0.0, "sample_count": 0}), \
+             patch.object(control_plane, "_oracle_stability_snapshot", return_value={"enabled": True, "score": 1.0, "state": "stable", "sample_count": 5, "transition_count": 0, "confidence_span": 0.01}), \
              patch.object(control_plane, "append_audit"):
             result = control_plane._evaluate_go_live_hardening(
                 source="signal-webhook",
@@ -521,6 +523,7 @@ class ControlPlaneLiveCapabilityTests(unittest.TestCase):
              patch.object(control_plane, "_kill_switch_thresholds", return_value={"max_drawdown_intraday": 100.0}), \
              patch.object(control_plane, "_recent_pending_live_approval_count", return_value=0), \
              patch.object(control_plane, "_load_live_execution_policy", return_value=policy), \
+             patch.object(control_plane, "_resolve_provider_micro_live", return_value={"enabled": False, "current_stage": "", "current_stage_config": {}}), \
              patch.object(control_plane, "_drawdown_velocity_snapshot", return_value={"lookback_minutes": 90, "recent_loss_usd": 0.0, "recent_net_result_usd": 0.0, "sample_count": 0}), \
              patch.object(control_plane, "append_audit") as append_audit:
             result = control_plane._evaluate_go_live_hardening(
@@ -634,6 +637,7 @@ class ControlPlaneLiveCapabilityTests(unittest.TestCase):
              patch.object(control_plane, "_kill_switch_thresholds", return_value={"max_drawdown_intraday": 100.0}), \
              patch.object(control_plane, "_recent_pending_live_approval_count", return_value=0), \
              patch.object(control_plane, "_load_live_execution_policy", return_value=control_plane._default_live_execution_policy()), \
+             patch.object(control_plane, "_resolve_provider_micro_live", return_value={"enabled": False, "current_stage": "", "current_stage_config": {}}), \
              patch.object(control_plane, "_drawdown_velocity_snapshot", return_value={"lookback_minutes": 90, "recent_loss_usd": 0.0, "recent_net_result_usd": 0.0, "sample_count": 0}), \
              patch.object(control_plane, "_oracle_stability_snapshot", return_value={"enabled": True, "score": 0.5, "state": "critical", "sample_count": 5, "transition_count": 3, "confidence_span": 0.22}), \
              patch.object(control_plane, "append_audit"):
@@ -680,6 +684,7 @@ class ControlPlaneLiveCapabilityTests(unittest.TestCase):
              patch.object(control_plane, "_kill_switch_thresholds", return_value={"max_drawdown_intraday": 1500.0}), \
              patch.object(control_plane, "_recent_pending_live_approval_count", return_value=0), \
              patch.object(control_plane, "_drawdown_velocity_snapshot", return_value={"lookback_minutes": 90, "recent_loss_usd": 55.0, "recent_net_result_usd": -55.0, "sample_count": 2}), \
+             patch.object(control_plane, "_oracle_stability_snapshot", return_value={"enabled": True, "score": 1.0, "state": "stable", "sample_count": 5, "transition_count": 0, "confidence_span": 0.01}), \
              patch.object(control_plane, "append_audit"):
             result = control_plane._evaluate_go_live_hardening(
                 source="signal-webhook",
