@@ -3046,8 +3046,80 @@ def _reset_kill_switch_state_payload(state: dict, *, by: str) -> dict:
     next_state["stats"] = {"api_errors": 0, "high_slippage_events": 0, "drawdown_intraday_usd": 0.0}
     for key in ("constitutional_guardian", "freeze_event_id", "freeze_timeline", "incident_ticket_key", "decision_ids"):
         next_state.pop(key, None)
-    next_state["last_reset"] = {"by": by, "at": _now_utc().isoformat()}
+    next_state["last_reset"] = {"by": by, "at": _now_utc().isoformat(), "event_id": f"reset-{uuid4().hex}"}
     return next_state
+
+
+def _coerce_utc_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _opportunity_gate_trigger_precedence(state: dict, source: str, reason: str, payload: dict) -> dict[str, Any]:
+    gate = payload.get("gate") if isinstance(payload.get("gate"), dict) else {}
+    metrics = gate.get("metrics") if isinstance(gate.get("metrics"), dict) else {}
+    thresholds = gate.get("thresholds") if isinstance(gate.get("thresholds"), dict) else {}
+    reset = state.get("last_reset") if isinstance(state.get("last_reset"), dict) else {}
+    reset_at = _coerce_utc_datetime(reset.get("at"))
+    observed_at = (
+        _coerce_utc_datetime(gate.get("evaluated_at"))
+        or _coerce_utc_datetime(gate.get("updated_at"))
+        or _now_utc()
+    )
+    metric_observed = _to_float(metrics.get("consistency"), 0.0)
+    threshold = _to_float(thresholds.get("kill_consistency_pct"), _opportunity_gate_thresholds()["kill_consistency_pct"])
+    source_event_id = str(gate.get("source_event_id") or metrics.get("bus_seq") or "")
+    if not source_event_id:
+        source_event_id = hashlib.sha256(
+            json_dumps(
+                {
+                    "source": source,
+                    "reason": reason,
+                    "observed_at": observed_at.isoformat(),
+                    "metric_observed": metric_observed,
+                    "threshold": threshold,
+                }
+            ).encode("utf-8")
+        ).hexdigest()[:16]
+
+    classification = "NEW_TRIGGER_ACCEPTED"
+    allowed = True
+    if reset_at and observed_at <= reset_at:
+        classification = "STALE_TRIGGER_IGNORED"
+        allowed = False
+    elif metric_observed >= threshold:
+        classification = "HEALTHY_TRIGGER_IGNORED"
+        allowed = False
+
+    return {
+        "allowed": allowed,
+        "classification": classification,
+        "writer": source,
+        "producer_id": str(gate.get("source") or payload.get("producer_id") or source),
+        "trigger_observed_at": observed_at.isoformat(),
+        "metric_observed": metric_observed,
+        "threshold": threshold,
+        "reset_event_id": reset.get("event_id") or reset.get("reset_event_id"),
+        "reset_completed_at": reset.get("at"),
+        "source_event_id": source_event_id,
+        "source_event_created_at": gate.get("updated_at") or gate.get("evaluated_at"),
+    }
+
+
+def _kill_switch_activation_precedence(state: dict, source: str, reason: str, payload: dict) -> dict[str, Any]:
+    if source == "opportunity_gate" and "consistency_kill_threshold" in reason:
+        return _opportunity_gate_trigger_precedence(state, source, reason, payload)
+    return {"allowed": True, "classification": "NOT_APPLICABLE", "writer": source}
 
 
 def _activated_kill_switch_state_payload(state: dict, source: str, reason: str, payload: dict) -> dict:
@@ -3069,7 +3141,7 @@ def _latest_kill_switch_activation_event(reason: str | None = None) -> dict[str,
     try:
         row = fetch_one(
             """
-            SELECT source, reason, payload, created_at
+            SELECT id, source, reason, payload, created_at
             FROM kill_switch_events
             WHERE active = TRUE
               AND (%s::text IS NULL OR reason = %s)
@@ -11089,6 +11161,24 @@ def _activate_kill_switch(source: str, reason: str, payload: dict) -> dict:
     state = _kill_switch_state()
     if state.get("active"):
         return state
+    precedence = _kill_switch_activation_precedence(state, source, reason, payload)
+    if not precedence.get("allowed", True):
+        ignored_payload = {
+            "source": source,
+            "reason": reason,
+            "payload": payload,
+            "precedence": precedence,
+        }
+        append_audit("kill_switch_trigger_ignored", ignored_payload)
+        try:
+            execute(
+                "INSERT INTO kill_switch_events (source, reason, payload, active) VALUES (%s, %s, %s::jsonb, FALSE)",
+                (source, f"{reason}_ignored", json_dumps(ignored_payload)),
+            )
+        except Exception:
+            pass
+        return state
+    payload = {**payload, "trigger_precedence": precedence}
     state = _activated_kill_switch_state_payload(state, source, reason, payload)
     _save_kill_switch_state(state)
     execute(
@@ -11164,6 +11254,7 @@ def _local_execution_lock_snapshot(
         latest_activation = _latest_kill_switch_activation_event(str(state.get("reason") or "") or None)
         if latest_activation:
             activation = {
+                "event_id": latest_activation.get("id"),
                 "source": latest_activation.get("source"),
                 "reason": latest_activation.get("reason"),
                 "payload": latest_activation.get("payload") if isinstance(latest_activation.get("payload"), dict) else {},
@@ -11191,6 +11282,7 @@ def _local_execution_lock_snapshot(
         "market_action": False,
         "lock_active": lock_active,
         "lock_name": "kill_switch_state",
+        "lock_event_id": activation.get("event_id"),
         "lock_scope": str(effective_guardian.get("scope") or "global"),
         "lock_owner": str(activation.get("source") or effective_guardian.get("owner") or "kill_switch"),
         "lock_reason": str(activation.get("reason") or state.get("reason") or effective_guardian.get("reason") or "unknown"),

@@ -142,6 +142,85 @@ class ControlPlaneLiveCapabilityTests(unittest.TestCase):
         self.assertNotIn("constitutional_guardian", activated)
         self.assertNotIn("incident_ticket_key", activated)
 
+    def test_opportunity_gate_stale_trigger_after_reset_is_ignored(self) -> None:
+        state = {
+            "active": False,
+            "reason": "manual_reset",
+            "last_reset": {"by": "admin", "at": "2026-06-30T07:10:06Z", "event_id": "reset-1"},
+        }
+        payload = {
+            "gate": {
+                "evaluated_at": "2026-06-30T07:09:59Z",
+                "updated_at": "2026-06-30T07:09:59Z",
+                "source": "execution-router/health",
+                "metrics": {"consistency": 10.0, "bus_seq": 44},
+                "thresholds": {"kill_consistency_pct": 65.0},
+            }
+        }
+
+        precedence = control_plane._kill_switch_activation_precedence(
+            state,
+            "opportunity_gate",
+            "consistency_kill_threshold",
+            payload,
+        )
+
+        self.assertFalse(precedence["allowed"])
+        self.assertEqual(precedence["classification"], "STALE_TRIGGER_IGNORED")
+        self.assertEqual(precedence["reset_event_id"], "reset-1")
+        self.assertEqual(precedence["source_event_id"], "44")
+
+    def test_opportunity_gate_healthy_metric_after_reset_is_ignored(self) -> None:
+        state = {
+            "active": False,
+            "reason": "manual_reset",
+            "last_reset": {"by": "admin", "at": "2026-06-30T07:10:06Z", "event_id": "reset-1"},
+        }
+        payload = {
+            "gate": {
+                "evaluated_at": "2026-06-30T07:10:30Z",
+                "metrics": {"consistency": 100.0, "bus_seq": 45},
+                "thresholds": {"kill_consistency_pct": 65.0},
+            }
+        }
+
+        precedence = control_plane._kill_switch_activation_precedence(
+            state,
+            "opportunity_gate",
+            "consistency_kill_threshold",
+            payload,
+        )
+
+        self.assertFalse(precedence["allowed"])
+        self.assertEqual(precedence["classification"], "HEALTHY_TRIGGER_IGNORED")
+        self.assertEqual(precedence["metric_observed"], 100.0)
+        self.assertEqual(precedence["threshold"], 65.0)
+
+    def test_opportunity_gate_new_bad_metric_after_reset_can_rearm(self) -> None:
+        state = {
+            "active": False,
+            "reason": "manual_reset",
+            "last_reset": {"by": "admin", "at": "2026-06-30T07:10:06Z", "event_id": "reset-1"},
+        }
+        payload = {
+            "gate": {
+                "evaluated_at": "2026-06-30T07:10:30Z",
+                "metrics": {"consistency": 42.0, "bus_seq": 46},
+                "thresholds": {"kill_consistency_pct": 65.0},
+            }
+        }
+
+        precedence = control_plane._kill_switch_activation_precedence(
+            state,
+            "opportunity_gate",
+            "consistency_kill_threshold",
+            payload,
+        )
+
+        self.assertTrue(precedence["allowed"])
+        self.assertEqual(precedence["classification"], "NEW_TRIGGER_ACCEPTED")
+        self.assertEqual(precedence["source_event_id"], "46")
+
     def test_local_execution_lock_ignores_stale_guardian_and_uses_latest_event(self) -> None:
         state = {
             "active": True,
