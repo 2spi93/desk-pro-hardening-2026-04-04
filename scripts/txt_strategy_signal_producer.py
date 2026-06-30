@@ -57,10 +57,18 @@ def build_signal(source: dict[str, Any], *, now: datetime | None = None, ttl_min
     side = normalize_side(source.get("side"))
     generated_at = parse_time(source.get("generated_at")) or current
     expires_at = parse_time(source.get("expires_at")) or (generated_at + timedelta(minutes=max(1, ttl_minutes)))
-    expected_edge_bps = to_float(source.get("expected_edge_bps"))
-    estimated_fees_bps = to_float(source.get("estimated_fees_bps"))
+    gross_expected_edge_bps = to_float(source.get("gross_expected_edge_bps"), to_float(source.get("expected_edge_bps")))
+    expected_edge_bps = to_float(source.get("expected_edge_bps"), gross_expected_edge_bps)
+    estimated_entry_fee_bps = to_float(source.get("estimated_entry_fee_bps"))
+    estimated_exit_fee_bps = to_float(source.get("estimated_exit_fee_bps"))
+    estimated_fees_bps = to_float(source.get("estimated_fees_bps"), estimated_entry_fee_bps + estimated_exit_fee_bps)
     estimated_slippage_bps = to_float(source.get("estimated_slippage_bps"))
-    net_expected_edge_bps = round(expected_edge_bps - estimated_fees_bps - estimated_slippage_bps, 8)
+    estimated_funding_bps = to_float(source.get("estimated_funding_bps"))
+    uncertainty_buffer_bps = to_float(source.get("uncertainty_buffer_bps"))
+    source_net_edge = source.get("net_expected_edge_bps")
+    computed_net_edge_bps = round(gross_expected_edge_bps - estimated_fees_bps - estimated_slippage_bps - estimated_funding_bps - uncertainty_buffer_bps, 8)
+    net_expected_edge_bps = to_float(source_net_edge, computed_net_edge_bps) if source_net_edge is not None else computed_net_edge_bps
+    edge_lower_confidence_bound_bps = to_float(source.get("edge_lower_confidence_bound_bps"), net_expected_edge_bps)
     confidence = to_float(source.get("confidence"))
 
     for name, value in (
@@ -84,6 +92,8 @@ def build_signal(source: dict[str, Any], *, now: datetime | None = None, ttl_min
         blockers.append("confidence_invalid")
     if net_expected_edge_bps <= 0:
         blockers.append("net_expected_edge_not_positive")
+    if edge_lower_confidence_bound_bps <= 0:
+        blockers.append("edge_lower_confidence_bound_not_positive")
 
     core = {
         "source_id": source.get("source_id") or source.get("opportunity_id"),
@@ -97,10 +107,19 @@ def build_signal(source: dict[str, Any], *, now: datetime | None = None, ttl_min
         "market_regime": source.get("market_regime"),
         "entry_reason": source.get("entry_reason"),
         "invalidation_reason": source.get("invalidation_reason"),
+        "gross_expected_edge_bps": gross_expected_edge_bps,
         "expected_edge_bps": expected_edge_bps,
+        "estimated_entry_fee_bps": estimated_entry_fee_bps,
+        "estimated_exit_fee_bps": estimated_exit_fee_bps,
         "estimated_fees_bps": estimated_fees_bps,
         "estimated_slippage_bps": estimated_slippage_bps,
+        "estimated_funding_bps": estimated_funding_bps,
+        "uncertainty_buffer_bps": uncertainty_buffer_bps,
         "net_expected_edge_bps": net_expected_edge_bps,
+        "edge_lower_confidence_bound_bps": edge_lower_confidence_bound_bps,
+        "model_version": source.get("model_version"),
+        "market_snapshot_digest": source.get("market_snapshot_digest"),
+        "evidence_refs": source.get("evidence_refs") if isinstance(source.get("evidence_refs"), list) else [],
     }
     signal = {
         "schema_version": SIGNAL_SCHEMA_VERSION,

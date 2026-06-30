@@ -75,6 +75,54 @@ class TxtStrategySignalProducerTests(unittest.TestCase):
         self.assertIn("symbol_not_allowed", wrong["admission_blockers"])
         self.assertIn("side_invalid", wrong["admission_blockers"])
 
+    def test_full_opportunity_contract_uses_funding_buffer_and_lower_bound(self) -> None:
+        mod = _load_module()
+
+        signal = mod.build_signal(
+            _source(
+                gross_expected_edge_bps=21.0,
+                expected_edge_bps=None,
+                estimated_entry_fee_bps=5.0,
+                estimated_exit_fee_bps=5.0,
+                estimated_fees_bps=None,
+                estimated_slippage_bps=2.0,
+                estimated_funding_bps=1.0,
+                uncertainty_buffer_bps=3.0,
+                net_expected_edge_bps=None,
+                edge_lower_confidence_bound_bps=0.75,
+                model_version="strategy-brain-v1",
+                market_snapshot_digest="digest-1",
+                evidence_refs=["unit:test"],
+            ),
+            now=datetime(2026, 6, 29, 12, 1, tzinfo=timezone.utc),
+        )
+
+        self.assertTrue(signal["admissible"])
+        self.assertEqual(signal["estimated_fees_bps"], 10.0)
+        self.assertEqual(signal["net_expected_edge_bps"], 5.0)
+        self.assertEqual(signal["edge_lower_confidence_bound_bps"], 0.75)
+        self.assertEqual(signal["model_version"], "strategy-brain-v1")
+
+    def test_full_opportunity_contract_requires_positive_lower_bound(self) -> None:
+        mod = _load_module()
+
+        signal = mod.build_signal(
+            _source(
+                gross_expected_edge_bps=25.0,
+                estimated_entry_fee_bps=5.0,
+                estimated_exit_fee_bps=5.0,
+                estimated_fees_bps=None,
+                estimated_slippage_bps=2.0,
+                estimated_funding_bps=0.0,
+                uncertainty_buffer_bps=3.0,
+                edge_lower_confidence_bound_bps=-0.2,
+            ),
+            now=datetime(2026, 6, 29, 12, 1, tzinfo=timezone.utc),
+        )
+
+        self.assertFalse(signal["admissible"])
+        self.assertIn("edge_lower_confidence_bound_not_positive", signal["admission_blockers"])
+
 
 if __name__ == "__main__":
     unittest.main()
