@@ -7,7 +7,7 @@ import json
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -56,17 +56,48 @@ def fetch_snapshot_via_docker(*, container: str, venue: str, symbol: str, timefr
     return json.loads(result.stdout)
 
 
+def refresh_clean_ohlcv_via_docker(*, container: str, venue: str, symbol: str, since_minutes: int) -> dict[str, Any]:
+    since = (datetime.now(timezone.utc) - timedelta(minutes=max(1, since_minutes))).isoformat()
+    result = subprocess.run(
+        [
+            "docker",
+            "exec",
+            "-i",
+            container,
+            "python3",
+            "/workspace/scripts/backfill_market_ohlcv_clean_from_binance.py",
+            "--venue",
+            venue,
+            "--instrument",
+            symbol,
+            "--timeframe-sec",
+            "60",
+            "--since",
+            since,
+            "--write-db",
+            "--sleep-sec",
+            "0",
+        ],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    return json.loads(result.stdout)
+
+
 def observe(
     *,
     iterations: int,
     interval_sec: float,
     snapshot_provider: Callable[[], dict[str, Any]],
     brain_builder: Callable[[dict[str, Any]], dict[str, Any]],
+    pre_scan_hook: Callable[[], dict[str, Any] | None] | None = None,
 ) -> dict[str, Any]:
     started_at = datetime.now(timezone.utc)
     observations: list[dict[str, Any]] = []
     for index in range(iterations):
         observed_at = datetime.now(timezone.utc)
+        refresh_report = pre_scan_hook() if pre_scan_hook else None
         snapshot = snapshot_provider()
         report = brain_builder(snapshot)
         opportunity = report.get("opportunity") if isinstance(report.get("opportunity"), dict) else {}
@@ -81,6 +112,7 @@ def observe(
                 "edge_lower_confidence_bound_bps": opportunity.get("edge_lower_confidence_bound_bps"),
                 "blockers": report.get("blockers") if isinstance(report.get("blockers"), list) else [],
                 "snapshot_id": snapshot.get("snapshot_id"),
+                "refresh_inserted": refresh_report.get("inserted_total") if isinstance(refresh_report, dict) else None,
             }
         )
         if index < iterations - 1 and interval_sec > 0:
@@ -107,6 +139,7 @@ def observe(
         "latest_regime": observations[-1].get("market_regime") if observations else None,
         "latest_blockers": observations[-1].get("blockers") if observations else [],
         "observations": observations,
+        "refresh_enabled": bool(pre_scan_hook),
         "non_actions": ["no_broker_call", "no_order", "no_signal_consumption", "no_campaign_authorization"],
     }
 
@@ -129,6 +162,8 @@ def main() -> int:
     parser.add_argument("--symbol", default="BTCUSDT")
     parser.add_argument("--timeframe", default="1m")
     parser.add_argument("--limit", type=int, default=240)
+    parser.add_argument("--refresh-clean-before-scan", action="store_true")
+    parser.add_argument("--refresh-since-minutes", type=int, default=360)
     parser.add_argument("--output", default=str(DEFAULT_OUT_DIR / "strategy_shadow_observation.json"))
     parser.add_argument("--no-write", action="store_true")
     parser.add_argument("--text", action="store_true")
@@ -138,6 +173,16 @@ def main() -> int:
     report = observe(
         iterations=max(1, args.iterations),
         interval_sec=max(0.0, args.interval_sec),
+        pre_scan_hook=(
+            lambda: refresh_clean_ohlcv_via_docker(
+                container=args.container,
+                venue=args.venue,
+                symbol=args.symbol,
+                since_minutes=args.refresh_since_minutes,
+            )
+            if args.refresh_clean_before_scan
+            else None
+        ),
         snapshot_provider=lambda: fetch_snapshot_via_docker(
             container=args.container,
             venue=args.venue,

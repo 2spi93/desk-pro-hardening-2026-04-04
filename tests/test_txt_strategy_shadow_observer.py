@@ -64,6 +64,26 @@ class TxtStrategyShadowObserverTests(unittest.TestCase):
         self.assertIn("opportunities=0/3", text)
         self.assertIn("latest_status=NO_OPPORTUNITY", text)
 
+    def test_observe_can_record_pre_scan_refresh(self) -> None:
+        mod = _load_module()
+        calls = {"refresh": 0}
+
+        def refresh():
+            calls["refresh"] += 1
+            return {"inserted_total": 2}
+
+        report = mod.observe(
+            iterations=1,
+            interval_sec=0,
+            pre_scan_hook=refresh,
+            snapshot_provider=lambda: {"snapshot_id": "s1"},
+            brain_builder=lambda _snapshot: {"status": "NO_OPPORTUNITY", "market_regime": "RANGE", "blockers": []},
+        )
+
+        self.assertTrue(report["refresh_enabled"])
+        self.assertEqual(calls["refresh"], 1)
+        self.assertEqual(report["observations"][0]["refresh_inserted"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()
