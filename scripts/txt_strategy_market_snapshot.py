@@ -28,6 +28,7 @@ DEFAULT_DB_SECRET = Path("/opt/txt/secrets/database_url")
 DEFAULT_TAKER_FEE_BPS = 5.0
 DEFAULT_UNCERTAINTY_BUFFER_BPS = 3.0
 TIMEFRAME_TO_SEC = {"30s": 30, "1m": 60, "5m": 300, "15m": 900, "1h": 3600}
+DEFAULT_LONGEST_FEATURE_LOOKBACK_BARS = 240
 
 
 def parse_time(value: Any) -> datetime | None:
@@ -68,6 +69,10 @@ def stdev(values: list[float]) -> float:
         return 0.0
     avg = sum(values) / len(values)
     return math.sqrt(sum((value - avg) ** 2 for value in values) / (len(values) - 1))
+
+
+def timeframe_seconds(timeframe: str) -> int:
+    return TIMEFRAME_TO_SEC.get(timeframe, 60)
 
 
 def normalize_ohlcv_rows(payload: Any) -> list[dict[str, Any]]:
@@ -168,10 +173,12 @@ def build_snapshot(
     exit_fee_bps: float = DEFAULT_TAKER_FEE_BPS,
     uncertainty_buffer_bps: float = DEFAULT_UNCERTAINTY_BUFFER_BPS,
     funding_bps: float = 0.0,
+    longest_feature_lookback: int = DEFAULT_LONGEST_FEATURE_LOOKBACK_BARS,
 ) -> dict[str, Any]:
     current = now or datetime.now(timezone.utc)
-    closes = [float(row["close"]) for row in rows if to_float(row.get("close")) > 0]
-    volumes = [float(row.get("volume") or 0.0) for row in rows if to_float(row.get("close")) > 0]
+    valid_rows = [row for row in rows if to_float(row.get("close")) > 0]
+    closes = [float(row["close"]) for row in valid_rows]
+    volumes = [float(row.get("volume") or 0.0) for row in valid_rows]
     rets = [abs(pct_bps(closes[index], closes[index - 1])) for index in range(1, len(closes))]
     ranges = [
         abs(pct_bps(to_float(row.get("high"), to_float(row.get("close"))), to_float(row.get("low"), to_float(row.get("close")))))
@@ -182,15 +189,31 @@ def build_snapshot(
     median_range_bps = sorted(ranges[-30:])[len(ranges[-30:]) // 2] if ranges[-30:] else 0.0
     estimated_slippage_bps = round(max(1.0, min(8.0, realized_vol_bps * 0.18 + median_range_bps * 0.08)), 6)
     spread_bps = round(max(0.5, min(4.0, median_range_bps * 0.05 if median_range_bps else 1.0)), 6)
-    latest_bucket = rows[-1].get("bucket_start") if rows else None
+    latest_bucket = valid_rows[-1].get("bucket_start") if valid_rows else None
     latest_at = parse_time(latest_bucket)
     freshness_sec = max(0.0, (current - latest_at).total_seconds()) if latest_at else None
+    expected_interval_seconds = timeframe_seconds(timeframe)
+    parsed_times = [parse_time(row.get("bucket_start")) for row in valid_rows]
+    parsed_times = [item for item in parsed_times if item is not None]
+    duplicate_bar_count = len(parsed_times) - len(set(parsed_times))
+    missing_bar_count = 0
+    if len(parsed_times) >= 2:
+        expected_steps = int((max(parsed_times) - min(parsed_times)).total_seconds() // expected_interval_seconds) + 1
+        missing_bar_count = max(0, expected_steps - len(set(parsed_times)))
+    market_data_lag_seconds = freshness_sec
+    warmup_complete = (
+        len(closes) >= longest_feature_lookback
+        and duplicate_bar_count == 0
+        and missing_bar_count == 0
+        and (market_data_lag_seconds is None or market_data_lag_seconds <= expected_interval_seconds * 3)
+    )
     snapshot_core = {
         "symbol": symbol.upper(),
         "venue": venue,
         "timeframe": timeframe,
         "bar_count": len(closes),
         "latest_bucket_start": latest_bucket,
+        "latest_bar_at": latest_bucket,
         "latest_close": closes[-1] if closes else None,
         "realized_vol_bps": round(realized_vol_bps, 6),
         "median_range_bps": round(median_range_bps, 6),
@@ -201,6 +224,12 @@ def build_snapshot(
         "generated_at": current.isoformat(),
         **snapshot_core,
         "freshness_sec": freshness_sec,
+        "market_data_lag_seconds": market_data_lag_seconds,
+        "expected_interval_seconds": expected_interval_seconds,
+        "missing_bar_count": missing_bar_count,
+        "duplicate_bar_count": duplicate_bar_count,
+        "longest_feature_lookback": longest_feature_lookback,
+        "warmup_complete": warmup_complete,
         "closes": closes,
         "volumes": volumes,
         "spread_bps": spread_bps,
@@ -235,11 +264,12 @@ def main() -> int:
     parser.add_argument("--symbol", default="BTCUSDT")
     parser.add_argument("--venue", default="binance-public")
     parser.add_argument("--timeframe", default="1m")
-    parser.add_argument("--limit", type=int, default=96)
+    parser.add_argument("--limit", type=int, default=240)
     parser.add_argument("--entry-fee-bps", type=float, default=DEFAULT_TAKER_FEE_BPS)
     parser.add_argument("--exit-fee-bps", type=float, default=DEFAULT_TAKER_FEE_BPS)
     parser.add_argument("--funding-bps", type=float, default=0.0)
     parser.add_argument("--uncertainty-buffer-bps", type=float, default=DEFAULT_UNCERTAINTY_BUFFER_BPS)
+    parser.add_argument("--longest-feature-lookback", type=int, default=DEFAULT_LONGEST_FEATURE_LOOKBACK_BARS)
     parser.add_argument("--output", default=str(DEFAULT_OUT_DIR / "strategy_market_snapshot.json"))
     parser.add_argument("--no-write", action="store_true")
     parser.add_argument("--text", action="store_true")
@@ -269,6 +299,7 @@ def main() -> int:
         exit_fee_bps=args.exit_fee_bps,
         uncertainty_buffer_bps=args.uncertainty_buffer_bps,
         funding_bps=args.funding_bps,
+        longest_feature_lookback=max(30, args.longest_feature_lookback),
     )
     if not args.no_write:
         output = Path(args.output)

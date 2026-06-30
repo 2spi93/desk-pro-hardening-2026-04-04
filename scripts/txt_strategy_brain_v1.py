@@ -290,6 +290,14 @@ def build_opportunity(snapshot: dict[str, Any], *, now: datetime | None = None, 
         blockers.append("symbol_not_allowed")
     if len(closes) < 30:
         blockers.append("insufficient_market_history")
+    if snapshot.get("warmup_complete") is False:
+        blockers.append("market_data_not_warm")
+    if to_float(snapshot.get("market_data_lag_seconds"), 0.0) > to_float(snapshot.get("expected_interval_seconds"), 60.0) * 3:
+        blockers.append("market_data_stale")
+    if to_float(snapshot.get("missing_bar_count"), 0.0) > 0:
+        blockers.append("market_data_missing_bars")
+    if to_float(snapshot.get("duplicate_bar_count"), 0.0) > 0:
+        blockers.append("market_data_duplicate_bars")
     spread_bps = to_float(snapshot.get("spread_bps"), 0.0)
     slippage_bps = to_float(snapshot.get("estimated_slippage_bps"), to_float(snapshot.get("slippage_bps"), 2.0))
     if spread_bps > MAX_SPREAD_BPS:

@@ -35,6 +35,11 @@ def _trend_snapshot(**overrides) -> dict:
         "estimated_slippage_bps": 1.0,
         "estimated_funding_bps": 0.0,
         "uncertainty_buffer_bps": 2.0,
+        "warmup_complete": True,
+        "market_data_lag_seconds": 0,
+        "expected_interval_seconds": 60,
+        "missing_bar_count": 0,
+        "duplicate_bar_count": 0,
         "evidence_refs": ["unit:test"],
     }
     payload.update(overrides)
@@ -81,6 +86,17 @@ class TxtStrategyBrainV1Tests(unittest.TestCase):
 
         self.assertEqual(report["status"], "NO_OPPORTUNITY")
         self.assertIn("insufficient_market_history", report["blockers"])
+
+    def test_not_warm_snapshot_never_creates_opportunity(self) -> None:
+        mod = _load_module()
+
+        report = mod.build_opportunity(
+            _trend_snapshot(warmup_complete=False),
+            now=datetime(2026, 6, 30, 8, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(report["status"], "NO_OPPORTUNITY")
+        self.assertIn("market_data_not_warm", report["blockers"])
 
     def test_snapshot_digest_is_stable_for_same_input(self) -> None:
         mod = _load_module()

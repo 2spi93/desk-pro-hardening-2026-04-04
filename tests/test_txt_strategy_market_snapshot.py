@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sys
 import unittest
@@ -22,9 +22,10 @@ def _load_module():
 
 
 def _rows(count: int = 72) -> list[dict]:
+    start = datetime(2026, 6, 30, 8, 0, tzinfo=timezone.utc)
     return [
         {
-            "bucket_start": f"2026-06-30T08:{index % 60:02d}:00+00:00",
+            "bucket_start": (start + timedelta(minutes=index)).isoformat(),
             "open": 100.0 + index * 0.2,
             "high": 100.2 + index * 0.2,
             "low": 99.9 + index * 0.2,
@@ -43,6 +44,7 @@ class TxtStrategyMarketSnapshotTests(unittest.TestCase):
         snapshot = mod.build_snapshot(
             _rows(),
             now=datetime(2026, 6, 30, 9, 0, tzinfo=timezone.utc),
+            longest_feature_lookback=60,
         )
 
         self.assertEqual(snapshot["schema_version"], mod.SNAPSHOT_SCHEMA_VERSION)
@@ -52,6 +54,10 @@ class TxtStrategyMarketSnapshotTests(unittest.TestCase):
         self.assertEqual(snapshot["estimated_fees_bps"], 10.0)
         self.assertGreater(snapshot["estimated_slippage_bps"], 0)
         self.assertTrue(snapshot["snapshot_id"].startswith("mkt-"))
+        self.assertEqual(snapshot["expected_interval_seconds"], 60)
+        self.assertEqual(snapshot["missing_bar_count"], 0)
+        self.assertEqual(snapshot["duplicate_bar_count"], 0)
+        self.assertTrue(snapshot["warmup_complete"])
 
     def test_normalizes_endpoint_short_keys(self) -> None:
         mod = _load_module()
@@ -74,6 +80,23 @@ class TxtStrategyMarketSnapshotTests(unittest.TestCase):
 
         self.assertEqual(snapshot["bar_count"], 5)
         self.assertEqual(len(snapshot["closes"]), 5)
+        self.assertFalse(snapshot["warmup_complete"])
+
+    def test_detects_missing_and_duplicate_bars(self) -> None:
+        mod = _load_module()
+        rows = _rows(80)
+        rows.pop(10)
+        rows.append(dict(rows[-1]))
+
+        snapshot = mod.build_snapshot(
+            rows,
+            now=datetime(2026, 6, 30, 10, 0, tzinfo=timezone.utc),
+            longest_feature_lookback=60,
+        )
+
+        self.assertGreater(snapshot["missing_bar_count"], 0)
+        self.assertGreater(snapshot["duplicate_bar_count"], 0)
+        self.assertFalse(snapshot["warmup_complete"])
 
 
 if __name__ == "__main__":

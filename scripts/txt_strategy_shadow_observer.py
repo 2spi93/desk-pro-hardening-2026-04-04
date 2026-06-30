@@ -128,7 +128,7 @@ def main() -> int:
     parser.add_argument("--venue", default="binance-public")
     parser.add_argument("--symbol", default="BTCUSDT")
     parser.add_argument("--timeframe", default="1m")
-    parser.add_argument("--limit", type=int, default=96)
+    parser.add_argument("--limit", type=int, default=240)
     parser.add_argument("--output", default=str(DEFAULT_OUT_DIR / "strategy_shadow_observation.json"))
     parser.add_argument("--no-write", action="store_true")
     parser.add_argument("--text", action="store_true")
