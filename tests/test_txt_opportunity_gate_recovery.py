@@ -56,6 +56,67 @@ class TxtOpportunityGateRecoveryTests(unittest.TestCase):
         self.assertTrue(report["NO_MARKET_ACTION"])
         self.assertFalse(report["RESET_OR_CLOSE_PERFORMED"])
 
+    def test_report_prefers_detailed_lock_for_latch_provenance(self) -> None:
+        mod = _load_module()
+        before = _review()
+        before["detailed_lock"] = {
+            "activation": {
+                "payload": {
+                    "trigger_precedence": {
+                        "source_event_id": "evt-1",
+                        "metric_observed": 63.0,
+                        "threshold": 65.0,
+                    }
+                }
+            }
+        }
+
+        report = mod.build_report(before=before, executed=False, blocked_reasons=[])
+
+        self.assertEqual(report["before"]["latch_provenance"]["trigger_event_id"], "evt-1")
+        self.assertEqual(report["before"]["latch_provenance"]["classification"], "LEGITIMATE_THRESHOLD_BREACH")
+
+    def test_latch_provenance_classifies_legitimate_threshold_breach(self) -> None:
+        mod = _load_module()
+        lock = {
+            "activation": {
+                "source": "opportunity_gate",
+                "payload": {
+                    "trigger_precedence": {
+                        "source_event_id": "468928",
+                        "trigger_observed_at": "2026-06-30T15:35:46Z",
+                        "metric_observed": 63.3,
+                        "threshold": 65.0,
+                        "classification": "NEW_TRIGGER_ACCEPTED",
+                        "allowed": True,
+                    },
+                    "gate": {"source": "execution-router/health"},
+                },
+            }
+        }
+
+        provenance = mod.latch_provenance_from_lock(lock)
+
+        self.assertEqual(provenance["classification"], "LEGITIMATE_THRESHOLD_BREACH")
+        self.assertEqual(provenance["trigger_event_id"], "468928")
+
+    def test_latch_provenance_flags_healthy_trigger_regression(self) -> None:
+        mod = _load_module()
+        provenance = mod.latch_provenance_from_lock(
+            {
+                "activation": {
+                    "payload": {
+                        "trigger_precedence": {
+                            "metric_observed": 100.0,
+                            "threshold": 65.0,
+                        }
+                    }
+                }
+            }
+        )
+
+        self.assertEqual(provenance["classification"], "HEALTHY_OR_STALE_TRIGGER_REGRESSION")
+
 
 if __name__ == "__main__":
     unittest.main()
