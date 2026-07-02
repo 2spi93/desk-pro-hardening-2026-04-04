@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from datetime import datetime, timezone
 
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
@@ -15,6 +16,7 @@ app = FastAPI(title="Risk Gateway", version="0.1.0")
 POLICY_PATH = Path(os.getenv("RISK_POLICY_PATH", "/workspace/config/risk_policy.json"))
 STATE = {
     "daily_notional_used_usd": 0.0,
+    "daily_budget_date": None,
     "exposure_by_instrument": {},
 }
 
@@ -44,6 +46,17 @@ class RiskReleaseRequest(BaseModel):
 
 def load_policy() -> dict:
     return json.loads(POLICY_PATH.read_text())
+
+
+def _today_utc() -> str:
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+def _ensure_daily_budget_window() -> None:
+    today = _today_utc()
+    if STATE.get("daily_budget_date") != today:
+        STATE["daily_notional_used_usd"] = 0.0
+        STATE["daily_budget_date"] = today
 
 
 def _normalize_instrument(symbol: object) -> str:
@@ -117,12 +130,14 @@ async def startup() -> None:
 
 @app.get("/health")
 async def health() -> dict:
+    _ensure_daily_budget_window()
     policy = load_policy()
     return {
         "status": "ok",
         "service": "risk-gateway",
         "policy_version": policy["policy_version"],
         "daily_notional_used_usd": STATE["daily_notional_used_usd"],
+        "daily_budget_date": STATE["daily_budget_date"],
     }
 
 
@@ -139,6 +154,7 @@ async def exposures() -> dict:
 
 @app.post("/v1/checks/pre-trade", response_model=RiskDecision)
 async def pre_trade_check(request: RiskCheckRequest) -> RiskDecision:
+    _ensure_daily_budget_window()
     policy = load_policy()
     reasons: list[str] = []
     intent = request.intent
@@ -203,6 +219,7 @@ async def pre_trade_check(request: RiskCheckRequest) -> RiskDecision:
 
 @app.post("/v1/checks/mt5-order")
 async def mt5_order_check(request: Mt5OrderRiskRequest) -> dict:
+    _ensure_daily_budget_window()
     policy = load_policy()
     reasons: list[str] = []
     normalized_symbol = _normalize_instrument(request.symbol)
@@ -262,6 +279,7 @@ async def mt5_order_check(request: Mt5OrderRiskRequest) -> dict:
 
 
 def _release_reserved_risk(request: RiskReleaseRequest) -> dict:
+    _ensure_daily_budget_window()
     notional = float(request.estimated_notional_usd)
     STATE["daily_notional_used_usd"] = max(0.0, float(STATE["daily_notional_used_usd"]) - notional)
     current = float(STATE["exposure_by_instrument"].get(request.symbol, 0.0))

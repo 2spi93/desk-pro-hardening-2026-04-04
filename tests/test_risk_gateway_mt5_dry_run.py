@@ -10,6 +10,7 @@ class RiskGatewayMt5DryRunTests(unittest.TestCase):
     def setUp(self) -> None:
         self.risk_gateway = importlib.import_module("apps.risk_gateway.main")
         self.risk_gateway.STATE["daily_notional_used_usd"] = 0.0
+        self.risk_gateway.STATE["daily_budget_date"] = self.risk_gateway._today_utc()
         self.risk_gateway.STATE["exposure_by_instrument"] = {}
 
     def _policy(self) -> dict:
@@ -89,6 +90,17 @@ class RiskGatewayMt5DryRunTests(unittest.TestCase):
         self.assertEqual(result["status"], "released")
         self.assertEqual(self.risk_gateway.STATE["daily_notional_used_usd"], 0.0)
         self.assertEqual(self.risk_gateway.STATE["exposure_by_instrument"], {})
+
+    def test_daily_budget_rolls_over_on_new_utc_day(self) -> None:
+        self.risk_gateway.STATE["daily_notional_used_usd"] = 30.0
+        self.risk_gateway.STATE["daily_budget_date"] = "2026-07-01"
+        with patch.object(self.risk_gateway, "_today_utc", return_value="2026-07-02"), \
+             patch.object(self.risk_gateway, "load_policy", return_value=self._policy()):
+            result = asyncio.run(self.risk_gateway.mt5_order_check(self._request(dry_run=False)))
+
+        self.assertEqual(result["decision"], "accept")
+        self.assertEqual(self.risk_gateway.STATE["daily_budget_date"], "2026-07-02")
+        self.assertEqual(self.risk_gateway.STATE["daily_notional_used_usd"], 5.0)
 
 
 if __name__ == "__main__":
