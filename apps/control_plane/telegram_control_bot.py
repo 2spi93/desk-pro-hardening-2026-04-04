@@ -25,6 +25,7 @@ class ControlBotConfig:
     poll_timeout_seconds: int = 25
     request_timeout_seconds: int = 45
     idle_sleep_seconds: float = 1.0
+    auth_failure_sleep_seconds: float = 300.0
     state_path: Path = Path("/opt/txt/data/telegram-control-bot/state.json")
     log_path: Path = Path("/opt/txt/logs/telegram-control-bot.jsonl")
     clear_webhook_on_start: bool = True
@@ -94,6 +95,7 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> ControlBotConfig:
         poll_timeout_seconds=poll_timeout,
         request_timeout_seconds=request_timeout,
         idle_sleep_seconds=_coerce_float(raw.get("idle_sleep_seconds"), 1.0, 0.0, 30.0),
+        auth_failure_sleep_seconds=_coerce_float(raw.get("auth_failure_sleep_seconds"), 300.0, 30.0, 3600.0),
         state_path=Path(str(raw.get("state_path") or "/opt/txt/data/telegram-control-bot/state.json")),
         log_path=Path(str(raw.get("log_path") or "/opt/txt/logs/telegram-control-bot.jsonl")),
         clear_webhook_on_start=_coerce_bool(raw.get("clear_webhook_on_start"), True),
@@ -234,6 +236,12 @@ def run_bot(config: ControlBotConfig, *, once: bool = False) -> int:
         try:
             drain_pending_updates(config, state)
         except urllib.error.HTTPError as exc:
+            if exc.code in {401, 403}:
+                log_event(config, {"status": "error", "reason": "telegram_auth_failed", "http_status": exc.code, "error": str(exc)})
+                if once:
+                    return 4
+                time.sleep(config.auth_failure_sleep_seconds)
+                continue
             reason = "telegram_poll_conflict" if exc.code == 409 else "telegram_http_error"
             log_event(config, {"status": "warning", "reason": reason, "http_status": exc.code, "error": str(exc)})
             if exc.code == 409:

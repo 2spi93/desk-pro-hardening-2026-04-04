@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
+from unittest import mock
 
-from apps.control_plane.telegram_control_bot import BotState, ControlBotConfig, drain_pending_updates, load_config
+from apps.control_plane.telegram_control_bot import BotState, ControlBotConfig, drain_pending_updates, load_config, run_bot
 
 
 class TelegramControlBotTests(unittest.TestCase):
@@ -41,6 +43,22 @@ class TelegramControlBotTests(unittest.TestCase):
 
             self.assertEqual(state.next_update_id, 11)
             self.assertIn('"next_update_id": 11', config.state_path.read_text(encoding="utf-8"))
+
+    def test_run_bot_classifies_auth_failure_without_generic_loop_success(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = ControlBotConfig(token="token", chat_id="12345", state_path=Path(tmpdir) / "state.json", log_path=Path(tmpdir) / "bot.jsonl")
+            error = urllib.error.HTTPError("https://api.telegram.org/botTOKEN/getUpdates", 401, "Unauthorized", hdrs=None, fp=None)
+
+            with (
+                mock.patch("apps.control_plane.telegram_control_bot.ensure_polling_allowed"),
+                mock.patch("apps.control_plane.telegram_control_bot.drain_pending_updates", side_effect=error),
+            ):
+                exit_code = run_bot(config, once=True)
+
+            self.assertEqual(exit_code, 4)
+            log_text = config.log_path.read_text(encoding="utf-8")
+            self.assertIn('"reason": "telegram_auth_failed"', log_text)
+            self.assertIn('"http_status": 401', log_text)
 
 
 if __name__ == "__main__":
