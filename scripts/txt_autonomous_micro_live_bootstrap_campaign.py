@@ -55,6 +55,7 @@ class CampaignContract:
     max_slippage_bps: float = 10.0
     campaign_expiry: str | None = None
     operator_authorization: str | None = None
+    proof_renewal_canary: bool = False
     continuous_promotion: bool = False
 
     def as_dict(self) -> dict[str, Any]:
@@ -70,6 +71,7 @@ class CampaignContract:
             "max_slippage_bps": self.max_slippage_bps,
             "campaign_expiry": self.campaign_expiry,
             "operator_authorization": self.operator_authorization,
+            "proof_renewal_canary": self.proof_renewal_canary,
             "continuous_promotion": self.continuous_promotion,
         }
 
@@ -296,11 +298,10 @@ def build_review(
         blockers.append(str(signal_eval.get("reason") or "strategy_signal_blocked"))
 
     promotion_blockers = promotion_gate.get("BLOCKERS") if isinstance(promotion_gate.get("BLOCKERS"), list) else []
-    hard_stop_blockers = [
-        item
-        for item in promotion_blockers
-        if item not in {"risk_budget_not_available_today", "promotion_relevant_incidents_present"}
-    ]
+    allowed_promotion_blockers = {"risk_budget_not_available_today", "promotion_relevant_incidents_present"}
+    if contract.proof_renewal_canary:
+        allowed_promotion_blockers.add("latest_proof_not_fresh")
+    hard_stop_blockers = [item for item in promotion_blockers if item not in allowed_promotion_blockers]
     if hard_stop_blockers:
         blockers.extend(f"promotion_gate_{item}" for item in hard_stop_blockers)
     threshold_only_incident = (
@@ -335,6 +336,10 @@ def build_review(
         "generated_at": current.isoformat(),
         "mode": "read_only_campaign_review",
         "campaign_contract": contract.as_dict(),
+        "proof_renewal_canary": {
+            "enabled": contract.proof_renewal_canary,
+            "stale_proof_is_allowed_reason": "renewal_target" if contract.proof_renewal_canary else None,
+        },
         "strategy_signal": signal_eval,
         "opportunity_gate_readiness": {
             "ready": opportunity_gate.get("OPPORTUNITY_GATE_READY") if opportunity_gate else None,
@@ -450,6 +455,7 @@ def main() -> int:
     parser.add_argument("--max-slippage-bps", type=float, default=10.0)
     parser.add_argument("--campaign-expiry", default="")
     parser.add_argument("--authorize-campaign", default="")
+    parser.add_argument("--proof-renewal-canary", action="store_true")
     parser.add_argument("--strategy-signal-file", default="")
     parser.add_argument("--reports-file", default="")
     parser.add_argument("--observe-seconds", type=int, default=8)
@@ -469,6 +475,7 @@ def main() -> int:
         max_slippage_bps=args.max_slippage_bps,
         campaign_expiry=args.campaign_expiry or None,
         operator_authorization=args.authorize_campaign or None,
+        proof_renewal_canary=args.proof_renewal_canary,
     )
     reports = load_json(args.reports_file) if args.reports_file else collect_cold_reports()
     strategy_signal = load_json(args.strategy_signal_file)

@@ -21,8 +21,10 @@ def _load_module():
     return module
 
 
-def _reports(*, used: float = 0.0, incident_blocker: bool = False) -> dict:
-    blockers = ["promotion_relevant_incidents_present"] if incident_blocker else []
+def _reports(*, used: float = 0.0, incident_blocker: bool = False, promotion_blockers: list[str] | None = None) -> dict:
+    blockers = list(promotion_blockers or [])
+    if incident_blocker:
+        blockers.append("promotion_relevant_incidents_present")
     return {
         "promotion_gate": {
             "PROOF_LAYER_VALIDATED": True,
@@ -249,6 +251,43 @@ class TxtAutonomousMicroLiveBootstrapCampaignTests(unittest.TestCase):
 
         self.assertFalse(report["AUTONOMOUS_MICRO_BOOTSTRAP_AUTHORIZED"])
         self.assertIn("opportunity_gate_not_ready", report["BLOCKERS"])
+
+    def test_stale_proof_blocks_normal_autonomous_campaign(self) -> None:
+        mod = _load_module()
+        contract = mod.CampaignContract(
+            campaign_expiry="2026-06-30T00:00:00Z",
+            operator_authorization=mod.CAMPAIGN_AUTH_TOKEN,
+        )
+
+        report = mod.build_review(
+            contract=contract,
+            reports=_reports(used=0.0, promotion_blockers=["latest_proof_not_fresh"]),
+            strategy_signal=_signal(),
+            now=datetime(2026, 6, 29, 12, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertFalse(report["AUTONOMOUS_MICRO_BOOTSTRAP_AUTHORIZED"])
+        self.assertIn("promotion_gate_latest_proof_not_fresh", report["BLOCKERS"])
+
+    def test_stale_proof_is_allowed_only_for_dedicated_renewal_canary(self) -> None:
+        mod = _load_module()
+        contract = mod.CampaignContract(
+            campaign_expiry="2026-06-30T00:00:00Z",
+            operator_authorization=mod.CAMPAIGN_AUTH_TOKEN,
+            proof_renewal_canary=True,
+        )
+
+        report = mod.build_review(
+            contract=contract,
+            reports=_reports(used=0.0, promotion_blockers=["latest_proof_not_fresh"]),
+            strategy_signal=_signal("buy"),
+            now=datetime(2026, 6, 29, 12, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertTrue(report["AUTONOMOUS_MICRO_BOOTSTRAP_AUTHORIZED"])
+        self.assertEqual(report["NEXT_SIDE"], "buy")
+        self.assertNotIn("promotion_gate_latest_proof_not_fresh", report["BLOCKERS"])
+        self.assertEqual(report["proof_renewal_canary"]["stale_proof_is_allowed_reason"], "renewal_target")
 
 
 if __name__ == "__main__":
