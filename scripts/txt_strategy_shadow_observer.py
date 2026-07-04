@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 import time
@@ -16,6 +18,26 @@ from urllib import parse, request
 DEFAULT_OUT_DIR = Path("/opt/txt/var/proof_renewal")
 DEFAULT_JSONL_OUTPUT = DEFAULT_OUT_DIR / "strategy_shadow_observation.jsonl"
 BINGX_API_BASE_URL = "https://open-api.bingx.com"
+DEFAULT_LOCK_FILE = Path("/run/lock/txt-strategy-shadow-observer.lock")
+EXIT_LOCK_HELD = 3
+
+
+def acquire_single_instance_lock(lock_path: Path) -> "object | None":
+    """Take an exclusive non-blocking flock; return the open handle (kept for
+    process lifetime) or None when another observer instance already holds it.
+    The lock guards ANY launch path (systemd or manual) — one observer max."""
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(lock_path, "a+")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    handle.seek(0)
+    handle.truncate()
+    handle.write(f"{os.getpid()}\n")
+    handle.flush()
+    return handle
 
 
 def load_brain_module():
@@ -359,7 +381,18 @@ def main() -> int:
     parser.add_argument("--output", default=str(DEFAULT_OUT_DIR / "strategy_shadow_observation.json"))
     parser.add_argument("--no-write", action="store_true")
     parser.add_argument("--text", action="store_true")
+    parser.add_argument("--lock-file", default=str(DEFAULT_LOCK_FILE))
+    parser.add_argument("--no-lock", action="store_true", help="skip the single-instance lock (tests only)")
     args = parser.parse_args()
+
+    if not args.no_lock:
+        lock_handle = acquire_single_instance_lock(Path(args.lock_file))
+        if lock_handle is None:
+            print(
+                f"SHADOW_OBSERVER_LOCK_HELD another observer instance holds {args.lock_file}; refusing to start",
+                file=sys.stderr,
+            )
+            return EXIT_LOCK_HELD
 
     brain = load_brain_module()
     jsonl_path = Path(args.jsonl_output) if args.jsonl_output else None

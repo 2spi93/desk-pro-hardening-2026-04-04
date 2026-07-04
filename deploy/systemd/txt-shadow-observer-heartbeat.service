@@ -1,0 +1,14 @@
+[Unit]
+Description=TXT shadow observer heartbeat (watch the watcher; restart only if alive-but-silent)
+After=txt-strategy-shadow-observer.service
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/txt
+# Read-only on trading. Writes shadow_observer_heartbeat.json; restarts the
+# observer service ONLY when it is alive but produced no scan for >3x cadence
+# (or duplicate instances). Market-data staleness => degraded flag, no restart.
+ExecStart=/usr/bin/python3 /opt/txt/scripts/txt_shadow_observer_heartbeat.py
+StandardOutput=append:/opt/txt/logs/shadow-observer-heartbeat.log
+StandardError=append:/opt/txt/logs/shadow-observer-heartbeat.err.log

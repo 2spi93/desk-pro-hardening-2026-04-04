@@ -1,0 +1,23 @@
+[Unit]
+Description=TXT Strategy Brain shadow observer (permanent, shadow-only: no broker call, no order, no signal consumption, no campaign authorization)
+Wants=network-online.target
+After=network-online.target docker.service
+# Loop protection: block restarts beyond 5 starts in 10 minutes.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=exec
+User=root
+WorkingDirectory=/opt/txt
+# One bounded 1440-scan (24h) block per start; Restart=always relaunches the
+# next block after a CLEAN exit too (on-failure would stop the watch at the
+# end of each day). Single instance enforced by the observer's own flock.
+ExecStart=/opt/txt/scripts/txt_strategy_shadow_observer_service.sh
+Restart=always
+RestartSec=15
+StandardOutput=append:/opt/txt/logs/strategy-shadow-observer.log
+StandardError=append:/opt/txt/logs/strategy-shadow-observer.err.log
+
+[Install]
+WantedBy=multi-user.target

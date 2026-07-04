@@ -160,6 +160,23 @@ class TxtStrategyShadowObserverTests(unittest.TestCase):
 
             self.assertEqual(mod.load_seen_snapshot_keys(path), {"a", "b"})
 
+    def test_single_instance_lock_refuses_second_holder(self) -> None:
+        mod = _load_module()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lock_path = Path(tmpdir) / "observer.lock"
+
+            first = mod.acquire_single_instance_lock(lock_path)
+            self.assertIsNotNone(first)
+            self.assertEqual(lock_path.read_text(encoding="utf-8").strip(), str(__import__("os").getpid()))
+
+            second = mod.acquire_single_instance_lock(lock_path)
+            self.assertIsNone(second)
+
+            first.close()
+            third = mod.acquire_single_instance_lock(lock_path)
+            self.assertIsNotNone(third)
+            third.close()
+
 
 if __name__ == "__main__":
     unittest.main()
