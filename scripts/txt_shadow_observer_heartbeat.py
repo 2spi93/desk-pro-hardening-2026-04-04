@@ -79,10 +79,26 @@ def _service_active_seconds(now: datetime) -> float | None:
     return (now - entered).total_seconds()
 
 
+def _observer_pids() -> list[int]:
+    """Real observer processes only: cmdline matches AND the process is a
+    python interpreter (a shell merely quoting the path must not count —
+    a false double would trigger an unjustified restart)."""
+    pids: list[int] = []
+    for raw in _run(["pgrep", "-f", r"scripts/txt_strategy_shadow_observer\.py"]).splitlines():
+        try:
+            pid = int(raw)
+            comm = Path(f"/proc/{pid}/comm").read_text(encoding="utf-8").strip()
+        except (ValueError, OSError):
+            continue
+        if comm.startswith("python"):
+            pids.append(pid)
+    return pids
+
+
 def main() -> int:
     now = datetime.now(timezone.utc)
     service_state = _run(["systemctl", "is-active", SERVICE]) or "unknown"
-    pids = [p for p in _run(["pgrep", "-f", r"scripts/txt_strategy_shadow_observer\.py"]).splitlines() if p]
+    pids = _observer_pids()
     run_id = CURRENT_RUN_ID.read_text(encoding="utf-8").strip() if CURRENT_RUN_ID.exists() else None
 
     row = _last_scan_row(CURRENT_JSONL) if CURRENT_JSONL.exists() else None
@@ -121,7 +137,7 @@ def main() -> int:
         "service": SERVICE,
         "service_state": service_state,
         "service_active_seconds": active_secs,
-        "service_pid": int(pids[0]) if pids else None,
+        "service_pid": pids[0] if pids else None,
         "instance_count": len(pids),
         "run_id": run_id,
         "last_scan_at": last_scan_at.isoformat() if last_scan_at else None,
