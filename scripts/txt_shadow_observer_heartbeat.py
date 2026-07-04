@@ -37,6 +37,8 @@ import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib import parse, request
+from urllib.error import HTTPError
 
 OUT_DIR = Path("/opt/txt/var/proof_renewal")
 CURRENT_JSONL = OUT_DIR / "strategy_shadow_observation_current.jsonl"
@@ -59,6 +61,13 @@ ALERT_NON_ACTIONS = {
     "signal_consumption": False,
     "campaign_authorization": False,
 }
+
+# Passive remote delivery of an OPEN alert (one Telegram message per episode).
+# Same secrets as telegram_chat_probe.sh; a dead token (401) degrades to a
+# logged failure — the LOCAL alert file stays the source of truth.
+TELEGRAM_TOKEN_FILE = Path("/opt/txt/secrets/telegram_bot_token")
+TELEGRAM_CHAT_ID_FILE = Path("/opt/txt/secrets/telegram_chat_id")
+TELEGRAM_API_BASE_URL = os.environ.get("TELEGRAM_API_BASE_URL", "https://api.telegram.org")
 
 _REVIEW_MODULE = None
 
@@ -179,6 +188,58 @@ def _build_alert(*, now: datetime, run_id: str, episode: dict, age_seconds: floa
             "basis, budget and gates must be recomputed before any decision"
         ),
     }
+
+
+def _read_secret(path: Path) -> str | None:
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+        return value or None
+    except OSError:
+        return None
+
+
+def _format_fresh_episode_message(alert: dict, now: datetime) -> str:
+    """Passive operator notice: no command, no implicit authorization."""
+    review = _review_module()
+    expires_at = review.parse_time(alert.get("expires_at"))
+    remaining = int(max(0.0, (expires_at - now).total_seconds())) if expires_at else 0
+    return (
+        "TXT SHADOW — épisode shadow frais détecté\n"
+        f"strategy={alert.get('strategy_id')} side={alert.get('side')} regime={alert.get('market_regime')}\n"
+        f"LCB={alert.get('edge_lower_confidence_bound_bps')} bps | basis={alert.get('venue_basis_bps')} bps | scans={alert.get('scan_count')}\n"
+        f"episode={alert.get('episode_key')}\n"
+        "Préflight read-only requis.\n"
+        "Aucun ordre lancé.\n"
+        "Autorisation live absente.\n"
+        f"Expiration dans {remaining} secondes."
+    )
+
+
+def _send_telegram_passive_notice(
+    message: str,
+    *,
+    token_file: Path = TELEGRAM_TOKEN_FILE,
+    chat_id_file: Path = TELEGRAM_CHAT_ID_FILE,
+    api_base_url: str = TELEGRAM_API_BASE_URL,
+    opener=request.urlopen,
+) -> str:
+    """Best-effort delivery; every failure degrades to a status string and a
+    log line — never an exception, never a retry storm (one attempt per
+    OPEN alert), never anything but sendMessage."""
+    token = _read_secret(token_file)
+    chat_id = _read_secret(chat_id_file)
+    if not token or not chat_id:
+        return "skipped_no_secrets"
+    payload = parse.urlencode({"chat_id": chat_id, "text": message}).encode("utf-8")
+    req = request.Request(f"{api_base_url}/bot{token}/sendMessage", data=payload, method="POST")
+    try:
+        with opener(req, timeout=10) as response:
+            json.load(response)
+        return "sent"
+    except HTTPError as exc:
+        return "failed_auth" if exc.code == 401 else f"failed_http_{exc.code}"
+    except Exception:  # noqa: BLE001 — delivery is best-effort by design
+        return "failed"
 
 
 def process_episode_alerts(
@@ -368,7 +429,7 @@ def main() -> int:
 
     # Passive fresh-episode alert pass. Its failure must never break the
     # liveness heartbeat (fail-closed: log only, no alert).
-    episode_alert = {"action": "skipped", "episode_key": None}
+    episode_alert = {"action": "skipped", "episode_key": None, "delivery": "not_attempted"}
     if run_id and CURRENT_JSONL.exists():
         try:
             jsonl_real = CURRENT_JSONL.resolve()
@@ -376,11 +437,26 @@ def main() -> int:
             alert_state, alert_action, episode_key = process_episode_alerts(
                 now=now, run_id=run_id, jsonl_path=jsonl_real, state=alert_state
             )
+            delivery = "not_attempted"
+            if alert_action == "opened":
+                # One passive Telegram notice per episode, on OPEN only.
+                alert_payload = _load_json(ALERT_PATH)
+                delivery = _send_telegram_passive_notice(_format_fresh_episode_message(alert_payload, now))
+                alert_state["last_delivery"] = {
+                    "episode_key": episode_key,
+                    "status": delivery,
+                    "attempted_at": now.isoformat(),
+                }
+                if delivery != "sent":
+                    print(
+                        f"fresh-episode Telegram delivery {delivery} — LOCAL alert file remains authoritative",
+                        file=sys.stderr,
+                    )
             _atomic_write_json(ALERT_STATE_PATH, alert_state)
-            episode_alert = {"action": alert_action, "episode_key": episode_key}
+            episode_alert = {"action": alert_action, "episode_key": episode_key, "delivery": delivery}
         except Exception as exc:  # noqa: BLE001 — fail-closed by design
             print(f"shadow-episode-alert pass failed (fail-closed, no alert): {exc}", file=sys.stderr)
-            episode_alert = {"action": "error", "episode_key": None}
+            episode_alert = {"action": "error", "episode_key": None, "delivery": "not_attempted"}
 
     heartbeat = {
         "schema_version": "txt-shadow-observer-heartbeat/v1",

@@ -211,5 +211,67 @@ class TxtShadowObserverHeartbeatAlertTests(unittest.TestCase):
         json.loads(self.alert.read_text(encoding="utf-8"))
 
 
+class TelegramPassiveDeliveryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.mod = _load_module()
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmpdir.name)
+        self.token = self.dir / "token"
+        self.chat = self.dir / "chat"
+        self.token.write_text("123:abc\n", encoding="utf-8")
+        self.chat.write_text("-100999\n", encoding="utf-8")
+
+    def tearDown(self) -> None:
+        self.tmpdir.cleanup()
+
+    def _send(self, opener) -> str:
+        return self.mod._send_telegram_passive_notice(
+            "test", token_file=self.token, chat_id_file=self.chat, opener=opener
+        )
+
+    def test_message_is_passive_and_carries_countdown(self) -> None:
+        alert = {
+            "strategy_id": "liquidity_confirmed_momentum",
+            "side": "sell",
+            "market_regime": "BREAKOUT",
+            "edge_lower_confidence_bound_bps": 19.1,
+            "venue_basis_bps": -2.0,
+            "scan_count": 8,
+            "episode_key": "liquidity_confirmed_momentum|sell|BREAKOUT@2026-07-04T11:58:00+00:00",
+            "expires_at": (NOW + timedelta(seconds=240)).isoformat(),
+        }
+        message = self.mod._format_fresh_episode_message(alert, NOW)
+
+        self.assertIn("épisode shadow frais détecté", message)
+        self.assertIn("Préflight read-only requis.", message)
+        self.assertIn("Aucun ordre lancé.", message)
+        self.assertIn("Autorisation live absente.", message)
+        self.assertIn("Expiration dans 240 secondes.", message)
+        # a passive notice must never carry an order-like instruction
+        self.assertNotIn("GO", message)
+
+    def test_delivery_statuses_degrade_cleanly(self) -> None:
+        from contextlib import contextmanager
+        from io import BytesIO
+        from urllib.error import HTTPError
+
+        @contextmanager
+        def ok_opener(req, timeout=None):
+            yield BytesIO(b'{"ok": true}')
+
+        def auth_fail_opener(req, timeout=None):
+            raise HTTPError(req.full_url, 401, "Unauthorized", None, None)
+
+        def network_fail_opener(req, timeout=None):
+            raise OSError("unreachable")
+
+        self.assertEqual(self._send(ok_opener), "sent")
+        self.assertEqual(self._send(auth_fail_opener), "failed_auth")
+        self.assertEqual(self._send(network_fail_opener), "failed")
+
+        self.token.unlink()
+        self.assertEqual(self._send(ok_opener), "skipped_no_secrets")
+
+
 if __name__ == "__main__":
     unittest.main()
