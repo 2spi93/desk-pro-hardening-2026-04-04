@@ -22,6 +22,159 @@ SUPERSEDED = "SUPERSEDED"
 UNRELATED_TO_EXECUTION_ROUTER = "UNRELATED_TO_EXECUTION_ROUTER"
 UNRESOLVED_INSUFFICIENT_EVIDENCE = "UNRESOLVED_INSUFFICIENT_EVIDENCE"
 
+# The certified-outcomes incident (INC-444A3CCAFA family) historically pointed
+# at a route that no longer exists; it must be adjudicated on live canonical
+# certification truth, never on the frozen ticket title. See
+# derive_certification_health / classify_certification_incident below.
+LEGACY_CERTIFIED_OUTCOMES_ENDPOINT = "/constitutional/certified-outcomes"
+CONSTITUTIONAL_CERTIFIED_THRESHOLD = 100
+
+
+def derive_certification_health(
+    projection: dict[str, Any] | None,
+    scanner_report: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Pure derivation of the canonical certification-pipeline health from the
+    read-only certified-outcomes projection and the scanner runtime truth
+    matrix. No I/O — the caller fetches both artifacts and injects the result
+    as runtime['certification'] so the adjudicator stays cold-testable."""
+    projection = projection or {}
+    scanner_report = scanner_report or {}
+    counter = scanner_report.get("runtime_context") or {}
+    counter = counter.get("certified_outcomes_counter") if isinstance(counter, dict) else {}
+    counter = counter if isinstance(counter, dict) else {}
+    certified_outcomes = scanner_report.get("certified_outcomes")
+    certified_outcomes = certified_outcomes if isinstance(certified_outcomes, dict) else {}
+
+    projected = projection.get("certified_total")
+    scanner_total = counter.get("scanner_certified_total")
+    if scanner_total is None:
+        scanner_total = certified_outcomes.get("certified_total")
+    threshold = certified_outcomes.get("required_total") or CONSTITUTIONAL_CERTIFIED_THRESHOLD
+
+    projection_present = bool(projection) and projected is not None
+    if not projection_present:
+        projection_health = "unavailable"
+    elif projection.get("blockers"):
+        projection_health = "invalid"
+    else:
+        projection_health = "healthy"
+    scanner_health = "healthy" if scanner_total is not None else "unavailable"
+
+    delta = None
+    if projected is not None and scanner_total is not None:
+        try:
+            delta = int(projected) - int(scanner_total)
+        except (TypeError, ValueError):
+            delta = None
+
+    effective = counter.get("effective_certified_total")
+    if effective is None:
+        effective = projected if projected is not None else scanner_total
+
+    return {
+        "projected_certified_total": projected,
+        "scanner_certified_total": scanner_total,
+        "effective_certified_total": effective,
+        "counter_delta": delta,
+        "constitutional_threshold": threshold,
+        "projection_health": projection_health,
+        "scanner_health": scanner_health,
+        "projection_digest": projection.get("projection_digest"),
+        "certifier_version": projection.get("certifier_version") or counter.get("certifier_version"),
+    }
+
+
+def classify_certification_incident(certification: dict[str, Any] | None) -> tuple[str, str, str]:
+    """Classify the constitutional certified-outcomes incident from live
+    certification truth. Returns (classification, detail, recommended).
+
+    The frozen ticket title NEVER decides the verdict:
+      - no runtime evidence at all   -> UNRESOLVED_INSUFFICIENT_EVIDENCE
+      - pipeline unavailable/invalid -> ACTIVE_CONFIRMED
+      - scanner vs projection diverge -> ACTIVE_CONFIRMED
+      - healthy + delta 0 + certified < threshold -> RESOLVED (progressing)
+      - healthy + certified >= threshold           -> RESOLVED (reached)
+    """
+    cert = certification if isinstance(certification, dict) else None
+    if not cert:
+        return (
+            UNRESOLVED_INSUFFICIENT_EVIDENCE,
+            "certification_runtime_evidence_absent",
+            "run_certified_outcomes_projection_before_close",
+        )
+
+    projection_health = cert.get("projection_health")
+    scanner_health = cert.get("scanner_health")
+    projected = cert.get("projected_certified_total")
+    scanner_total = cert.get("scanner_certified_total")
+    delta = cert.get("counter_delta")
+    threshold = cert.get("constitutional_threshold") or CONSTITUTIONAL_CERTIFIED_THRESHOLD
+    effective = cert.get("effective_certified_total")
+
+    if projection_health != "healthy" or scanner_health != "healthy" or projected is None or scanner_total is None:
+        return (
+            ACTIVE_CONFIRMED,
+            "certification_pipeline_unavailable_or_invalid",
+            "restore_certification_pipeline_before_close",
+        )
+    if delta is not None and delta != 0:
+        return (
+            ACTIVE_CONFIRMED,
+            "scanner_projection_counter_divergent",
+            "reconcile_scanner_and_projection_before_close",
+        )
+    if effective is not None and effective >= threshold:
+        return (
+            RESOLVED_BUT_UNCLOSED,
+            "threshold_reached",
+            "eligible_for_operator_close_threshold_reached",
+        )
+    return (
+        RESOLVED_BUT_UNCLOSED,
+        "threshold_progressing_normally",
+        "eligible_for_operator_close_runtime_healthy_threshold_unmet",
+    )
+
+
+def fetch_certification_runtime(
+    container: str,
+    *,
+    repo_root: Path = Path("/opt/txt"),
+    scanner_report_path: Path | None = None,
+) -> dict[str, Any]:
+    """Host-side probe: run the read-only certified-outcomes projection and
+    reconcile it with the scanner runtime truth matrix, returning the derived
+    certification health for injection as runtime['certification']. Best-effort:
+    any failure yields {} so the classifier treats it as evidence-absent
+    (fail-closed), never a false recovery. Reads only; no ticket mutation."""
+    if scanner_report_path is None:
+        scanner_report_path = DEFAULT_OUT_DIR / "certified_outcomes_review_runtime_truth_matrix.json"
+    projection: dict[str, Any] = {}
+    try:
+        result = subprocess.run(
+            [
+                "python3",
+                str(repo_root / "scripts" / "txt_certified_outcomes_projection.py"),
+                "--no-write",
+                "--docker-container",
+                container,
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=120,
+        )
+        projection = json.loads(result.stdout)
+    except Exception:
+        projection = {}
+    try:
+        scanner_report = json.loads(Path(scanner_report_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        scanner_report = {}
+    return derive_certification_health(projection, scanner_report)
+
 
 def parse_time(value: Any) -> datetime | None:
     if not value:
@@ -167,11 +320,20 @@ def classify_incident(
     reason = "no_current_recovery_evidence"
     recommended = "inspect_before_closure"
 
+    legacy_reference: dict[str, Any] | None = None
     if "certified outcomes gate" in lower_blob or "certified_outcomes_below_gate" in lower_blob:
-        classification = ACTIVE_CONFIRMED
-        reason = "payload_states_live_promotion_remains_blocked"
-        recommended = "keep_open_until_certified_outcomes_gate_recovers"
+        # Adjudicate on live canonical certification truth, NOT the frozen
+        # title. runtime['certification'] is injected by the caller (probe).
+        classification, reason, recommended = classify_certification_incident(runtime.get("certification"))
         relevant_to_promotion = True
+        if LEGACY_CERTIFIED_OUTCOMES_ENDPOINT in lower_blob:
+            # The route named in the historic ticket was retired; annotate it as
+            # a stale reference so an operator sees the fault cannot recur here.
+            legacy_reference = {
+                "legacy_endpoint": LEGACY_CERTIFIED_OUTCOMES_ENDPOINT,
+                "legacy_endpoint_status": "retired_or_missing",
+                "classification": "STALE_REFERENCE",
+            }
     elif "freeze runtime" in lower_blob or source == "opportunity_gate":
         if runtime.get("gate") == "go" and runtime.get("kill_recommended") in (False, None):
             classification = RESOLVED_BUT_UNCLOSED
@@ -221,6 +383,7 @@ def classify_incident(
         "relevant_to_promotion_gate": relevant_to_promotion,
         "recommended_disposition": recommended,
         "age_days": round(days, 2) if days is not None else None,
+        "legacy_reference": legacy_reference,
     }
 
 
@@ -289,7 +452,13 @@ def main() -> int:
     parser.add_argument("--check", action="store_true", help="Exit 2 if promotion-relevant blockers remain.")
     args = parser.parse_args()
 
-    data = json.loads(Path(args.input_json).read_text(encoding="utf-8")) if args.input_json else fetch_json(args.docker_container)
+    if args.input_json:
+        data = json.loads(Path(args.input_json).read_text(encoding="utf-8"))
+    else:
+        data = fetch_json(args.docker_container)
+        # Inject live certification truth so the constitutional certified-
+        # outcomes incident is adjudicated on runtime, not the frozen title.
+        data.setdefault("runtime", {})["certification"] = fetch_certification_runtime(args.docker_container)
     report = build_report(data, stale_days=args.stale_days)
     if not args.no_write:
         out_dir = Path(args.out_dir)

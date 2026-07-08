@@ -17,6 +17,7 @@ DEFAULT_CONTAINER = "control-plane"
 DEFAULT_OUT_DIR = Path("/opt/txt/var/proof_renewal")
 DEFAULT_MIN_CYCLES = 3
 DEFAULT_FRESH_HOURS = 72.0
+DEFAULT_SCANNER_REPORT = DEFAULT_OUT_DIR / "certified_outcomes_review_runtime_truth_matrix.json"
 
 
 def _load_incident_adjudicator():
@@ -206,6 +207,16 @@ def load_json(path: Path) -> dict[str, Any]:
     except FileNotFoundError:
         return {"missing": True, "path": str(path)}
     return data if isinstance(data, dict) else {"invalid": True, "path": str(path)}
+
+
+def fetch_certification(container: str, *, scanner_report_path: Path = DEFAULT_SCANNER_REPORT) -> dict[str, Any]:
+    """Delegate to the adjudicator's canonical certification probe so the
+    promotion gate and the standalone adjudicator share one source of truth.
+    Reads only; places no order and mutates no ticket."""
+    adjudicator = _load_incident_adjudicator()
+    if adjudicator is None:
+        return {}
+    return adjudicator.fetch_certification_runtime(container, scanner_report_path=scanner_report_path)
 
 
 @dataclass
@@ -491,6 +502,7 @@ def main() -> int:
     else:
         payload = fetch_db_payload(args.docker_container, limit=args.limit)
         runtime = fetch_runtime(args.docker_container)
+        runtime["certification"] = fetch_certification(args.docker_container)
         out_dir = Path(args.out_dir)
         readiness = load_json(out_dir / "readiness_report.json")
         rail = load_json(out_dir / "rail_separation_audit.json")
