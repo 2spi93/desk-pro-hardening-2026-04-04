@@ -66,6 +66,35 @@ def _load_alert() -> dict:
         return {}
 
 
+def _arm_info() -> dict:
+    try:
+        return json.loads(ARM_MARKER.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _arm_expires_at() -> datetime | None:
+    return _parse_ts(_arm_info().get("arm_expires_at"))
+
+
+def _write_outcome(result: str, now: datetime, **extra) -> Path:
+    """Durable outcome artifact, written on EVERY terminal state (fired /
+    aborted / error / ARM_EXPIRED) so the result survives even if Telegram is
+    down. This local artifact is the source of truth for the operator."""
+    path = OUT_DIR / f"sell_canary_autoexec_outcome_{now.strftime('%Y%m%dT%H%M%SZ')}.json"
+    payload = {
+        "schema": "txt.sell-canary-autoexec-outcome.v1",
+        "result": result,
+        "at": now.isoformat(),
+        "arm_expires_at": _arm_info().get("arm_expires_at"),
+        **extra,
+    }
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    os.replace(tmp, path)
+    return path
+
+
 def evaluate_fresh_sell(alert: dict, now: datetime, margin_sec: float) -> dict | None:
     """Fresh, non-expired SELL with at least margin_sec of runway left. Pure."""
     if alert.get("status") != "FRESH_SHADOW_EPISODE":
@@ -169,14 +198,25 @@ def process_once(*, arm_live: bool, margin_sec: float, now: datetime | None = No
             f"cmd=bingx_autonomous_proof_renewal_v1.sh execute --side sell --confirm-live {CONFIRM_TOKEN} --go-phrase \"{GO_PHRASE}\"",
             True,
         )
-    # COMMIT POINT: write consumed marker BEFORE firing so a crash cannot re-fire.
+    # COMMIT POINT: write consumed marker BEFORE firing so a crash cannot
+    # re-fire. From here, EVERY path (success / abort / error) is terminal:
+    # write a durable outcome artifact and spend the one-shot.
     _consume(fresh, now, mode="live")
-    result = _fire_runner(now)
-    return (
-        f"SELL_AUTOEXEC FIRED episode={fresh['episode_key']} exit_code={result['exit_code']} "
-        f"log={Path(result['log']).name} :: {result['tail'].splitlines()[-1] if result['tail'].strip() else 'no-output'}",
-        True,
-    )
+    try:
+        result = _fire_runner(now)
+        tail = result["tail"].splitlines()[-1] if result["tail"].strip() else "no-output"
+        _write_outcome(
+            "FIRED", now, episode_key=fresh["episode_key"], exit_code=result["exit_code"],
+            runner_log=Path(result["log"]).name, tail=result["tail"][-1200:],
+        )
+        return (
+            f"SELL_AUTOEXEC FIRED episode={fresh['episode_key']} exit_code={result['exit_code']} "
+            f"log={Path(result['log']).name} :: {tail}",
+            True,
+        )
+    except Exception as exc:  # noqa: BLE001 — terminal; one-shot already spent
+        _write_outcome("FIRE_ERROR", now, episode_key=fresh["episode_key"], error=str(exc)[:200])
+        return (f"SELL_AUTOEXEC FIRE_ERROR episode={fresh['episode_key']} error={str(exc)[:120]}", True)
 
 
 def main() -> int:
@@ -190,11 +230,28 @@ def main() -> int:
     if args.arm_live and not ARM_MARKER.exists():
         print("SELL_AUTOEXEC refuse=not_armed (ARM marker absent)", flush=True)
         return 3
+    if args.arm_live and _arm_expires_at() is None:
+        # A hard, short expiry is MANDATORY to arm (doctrine: expiry courte).
+        print("SELL_AUTOEXEC refuse=arm_expiry_missing (hard arm_expires_at required)", flush=True)
+        return 3
     if CONSUMED_MARKER.exists():
         print("SELL_AUTOEXEC refuse=already_consumed (needs new authorization)", flush=True)
         return 0
 
+    def _disarm() -> None:
+        if ARM_MARKER.exists() and args.arm_live:
+            ARM_MARKER.unlink()
+
+    def _expired(now: datetime) -> bool:
+        exp = _arm_expires_at()
+        return exp is not None and now >= exp
+
     if args.once:
+        if args.arm_live and _expired(_now()):
+            _write_outcome("ARM_EXPIRED", _now(), no_order=True)
+            _disarm()
+            print("SELL_AUTOEXEC ARM_EXPIRED disarmed=auto no_order=true", flush=True)
+            return 0
         line, _ = process_once(arm_live=args.arm_live, margin_sec=args.margin_sec)
         if line:
             print(line, flush=True)
@@ -202,13 +259,17 @@ def main() -> int:
 
     while True:
         try:
+            # Hard ARM expiry: disarm even if no episode ever appears.
+            if args.arm_live and _expired(_now()):
+                _write_outcome("ARM_EXPIRED", _now(), no_order=True)
+                _disarm()
+                print("SELL_AUTOEXEC ARM_EXPIRED disarmed=auto no_order=true", flush=True)
+                return 0
             line, fired = process_once(arm_live=args.arm_live, margin_sec=args.margin_sec)
             if line:
                 print(line, flush=True)
             if fired:
-                # one-shot: disarm and stop after a fire (or dry-run would-fire)
-                if ARM_MARKER.exists() and args.arm_live:
-                    ARM_MARKER.unlink()
+                _disarm()  # one-shot: disarm and stop after a fire (or dry WOULD_FIRE)
                 print("SELL_AUTOEXEC stopped=one_shot_complete", flush=True)
                 return 0
         except Exception as exc:  # noqa: BLE001

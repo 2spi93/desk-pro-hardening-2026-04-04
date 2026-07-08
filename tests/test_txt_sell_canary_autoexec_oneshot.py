@@ -86,5 +86,61 @@ class SellCanaryAutoexecTests(unittest.TestCase):
         self.assertEqual(self.m.GO_PHRASE, "GO renew BingX autonomous proof side=sell")
 
 
+class ArmExpiryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.m = _load()
+        import tempfile
+
+        self._tmp = tempfile.TemporaryDirectory()
+        d = Path(self._tmp.name)
+        # redirect markers/artifacts to a temp dir so no real marker is touched
+        self.m.OUT_DIR = d
+        self.m.ARM_MARKER = d / "sell_canary_autoexec.ARMED"
+        self.m.CONSUMED_MARKER = d / "sell_canary_autoexec.CONSUMED"
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _arm(self, secs_from_now: float | None) -> None:
+        import json as _json
+
+        payload = {"scope": "one_sell_cycle"}
+        if secs_from_now is not None:
+            # relative to REAL now, since _arm_expires_at/_now use wall clock
+            expiry = datetime.now(timezone.utc) + timedelta(seconds=secs_from_now)
+            payload["arm_expires_at"] = expiry.isoformat()
+        self.m.ARM_MARKER.write_text(_json.dumps(payload), encoding="utf-8")
+
+    def test_arm_expires_at_parses(self) -> None:
+        self._arm(3600)
+        exp = self.m._arm_expires_at()
+        self.assertIsNotNone(exp)
+
+    def test_missing_expiry_returns_none(self) -> None:
+        self._arm(None)
+        self.assertIsNone(self.m._arm_expires_at())
+
+    def test_expired_when_past(self) -> None:
+        self._arm(-60)
+        exp = self.m._arm_expires_at()
+        self.assertTrue(exp is not None and self.m._now() >= exp)
+
+    def test_not_expired_when_future(self) -> None:
+        self._arm(3600)
+        exp = self.m._arm_expires_at()
+        self.assertTrue(exp is not None and self.m._now() < exp)
+
+    def test_write_outcome_is_durable_artifact(self) -> None:
+        import json as _json
+
+        self._arm(3600)
+        path = self.m._write_outcome("ARM_EXPIRED", NOW, no_order=True)
+        self.assertTrue(path.exists())
+        data = _json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(data["result"], "ARM_EXPIRED")
+        self.assertTrue(data["no_order"])
+        self.assertEqual(data["schema"], "txt.sell-canary-autoexec-outcome.v1")
+
+
 if __name__ == "__main__":
     unittest.main()
