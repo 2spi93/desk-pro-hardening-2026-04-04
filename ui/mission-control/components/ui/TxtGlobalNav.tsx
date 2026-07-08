@@ -14,6 +14,7 @@ const INTERNAL_NAV_ITEMS = [
   { href: "/fund-manager", label: "Fund Manager" },
   { href: "/live-capital", label: "Live Capital" },
   { href: "/live-ops", label: "Live Ops" },
+  { href: "/canary", label: "Canary" },
   { href: "/terminal", label: "Terminal" },
   { href: "/live-readiness", label: UI_TERMS.readiness },
   { href: "/advanced/reality-gap", label: UI_TERMS.executionGap },
