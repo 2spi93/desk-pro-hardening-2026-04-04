@@ -110,7 +110,10 @@ services:
       start_period: 15s
 
   runtime-redis:
-    image: redis:7-alpine
+    # Pinned to the 7.4-branch security patch (>= 7.4.9 fixes the 2026 Redis
+    # RCE CVEs in client unblock / RESTORE / Lua). Stay on 7.4.x; do not jump
+    # to 8.x just for features. Cache only (--save "" --appendonly no).
+    image: redis:7.4.9-alpine
     container_name: runtime-redis
     restart: unless-stopped
     <<: *txt-runtime-guardrails
