@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 import subprocess
 import tempfile
@@ -10,6 +11,10 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "alpha_reactivation_board.py"
+
+# Pin the recency window to just after the fixtures below so these tests are
+# deterministic regardless of wall-clock time (fixtures are dated 2026-06-05).
+FIXED_NOW = datetime(2026, 6, 5, 12, 0, 0, tzinfo=timezone.utc)
 
 
 def _load_module():
@@ -31,7 +36,7 @@ class AlphaReactivationBoardTests(unittest.TestCase):
             "gap": [{"decision_id": "g1", "created_at": "2026-06-05T10:00:00+00:00"}],
         }
 
-        board = mod.build_board(proof_payload=proof_payload, money_rows=[], window_hours=720, alpha_days=30)
+        board = mod.build_board(proof_payload=proof_payload, money_rows=[], window_hours=720, alpha_days=30, now=FIXED_NOW)
 
         self.assertEqual(board["status"], "ALPHA_REACTIVATION_PENDING")
         self.assertEqual(board["next"]["id"], "FILL")
@@ -59,7 +64,7 @@ class AlphaReactivationBoardTests(unittest.TestCase):
             for _ in range(10)
         ]
 
-        board = mod.build_board(proof_payload=proof_payload, money_rows=money_rows, window_hours=720, alpha_days=30)
+        board = mod.build_board(proof_payload=proof_payload, money_rows=money_rows, window_hours=720, alpha_days=30, now=FIXED_NOW)
 
         self.assertEqual(board["status"], "ALPHA_REACTIVATION_PENDING")
         alpha_row = next(row for row in board["rows"] if row["id"] == "ALPHA_30D")
@@ -87,7 +92,7 @@ class AlphaReactivationBoardTests(unittest.TestCase):
             for _ in range(100)
         ]
 
-        board = mod.build_board(proof_payload=proof_payload, money_rows=money_rows, window_hours=720, alpha_days=30)
+        board = mod.build_board(proof_payload=proof_payload, money_rows=money_rows, window_hours=720, alpha_days=30, now=FIXED_NOW)
 
         self.assertEqual(board["alpha_v2"]["status"], "ALPHA_V2_BLOCKED")
         self.assertIn("active_20d_required", board["alpha_v2"]["missing"])
@@ -114,7 +119,7 @@ class AlphaReactivationBoardTests(unittest.TestCase):
             for _ in range(5)
         ]
 
-        board = mod.build_board(proof_payload=proof_payload, money_rows=money_rows, window_hours=720, alpha_days=30)
+        board = mod.build_board(proof_payload=proof_payload, money_rows=money_rows, window_hours=720, alpha_days=30, now=FIXED_NOW)
 
         self.assertEqual(board["status"], "ALPHA_REACTIVATED")
         self.assertEqual(board["alpha_v2"]["status"], "ALPHA_V2_READY")

@@ -81,8 +81,12 @@ def build_board(
     money_rows: list[dict[str, Any]],
     window_hours: float = DEFAULT_WINDOW_HOURS,
     alpha_days: float = 30.0,
+    now: datetime | None = None,
 ) -> dict[str, Any]:
-    proof = recent_real_proof_audit.build_audit(proof_payload, hours=window_hours)
+    # now is injectable so the recency window is deterministic under test;
+    # the proof audit is the only wall-clock-dependent input here.
+    current = now or datetime.now(timezone.utc)
+    proof = recent_real_proof_audit.build_audit(proof_payload, hours=window_hours, now=current)
     money10 = money_reality_audit.build_audit(money_rows, min_real_trades=10)
     money50 = money_reality_audit.build_audit(money_rows, min_real_trades=50)
     money100 = money_reality_audit.build_audit(money_rows, min_real_trades=100)
@@ -165,7 +169,7 @@ def build_board(
     return {
         "title": "TXT ALPHA REACTIVATION",
         "status": "ALPHA_REACTIVATED" if not next_items else "ALPHA_REACTIVATION_PENDING",
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": current.isoformat(),
         "window_hours": window_hours,
         "rows": rows,
         "next": next_items[0] if next_items else None,
