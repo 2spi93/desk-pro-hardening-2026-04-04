@@ -56,6 +56,16 @@ async def amain():
     out["open_positions"] = len(cp._bingx_flattenable_positions(pos, acct, symbol=sym))
     oo = await cp._bingx_signed_get(sp, "/openApi/swap/v2/trade/openOrders", {"symbol": swap})
     out["open_orders"] = len(cp._bingx_extract_dict_items(oo, "orders", "data", "list"))
+    # Reference-venue (Binance) symbol status: an abnormal status (e.g.
+    # CANCEL_ONLY from the 2026-07 deployment) must not feed a canary edge.
+    try:
+        base = getattr(cp, "BINANCE_API_BASE_URL", "https://api.binance.com")
+        ei = get(f"{base}/api/v3/exchangeInfo?symbol={sym}")
+        syms = ei.get("symbols") if isinstance(ei, dict) else None
+        out["reference_venue_symbol_status"] = (syms[0].get("status") if syms else None)
+    except Exception as e:
+        out["reference_venue_symbol_status"] = None
+        out["reference_venue_status_error"] = str(e)[:80]
     asyncio_done = True
     # code presence (cold pipeline)
     out["d2_fence_in_loaded_main"] = "assert_legacy_finalize_not_for_proof_rail" in inspect.getsource(cp.update_outcome)
@@ -79,6 +89,8 @@ if [ -z "$RAW" ]; then echo '{"error":"probe_failed"}' | tee "$REPORT"; exit 1; 
 
 NOTIONAL_CAP="$NOTIONAL_CAP" GO_PHRASE="$GO_PHRASE" REPORT="$REPORT" python3 - "$RAW" <<'PY'
 import json, os, sys
+sys.path.insert(0, "/opt/txt/scripts")
+from reference_venue_status import classify_reference_venue_status
 d = json.loads(sys.argv[1])
 reasons = []
 def need(cond, why):
@@ -94,6 +106,12 @@ need(d.get("market_data_plane") == "ok", "market_data_plane_unhealthy")
 need(bool(d.get("d2_fence_in_loaded_main")), "d2_fence_not_deployed")
 need(bool(d.get("proof_finalizer_importable")), "proof_finalizer_missing")
 need(bool(d.get("d1_order_shape_importable")), "d1_order_shape_missing")
+# Reference-venue (Binance) symbol status: fail-closed unless positively TRADING.
+ref_status = classify_reference_venue_status(
+    d.get("reference_venue_symbol_status"),
+    fetched=("reference_venue_status_error" not in d),
+)
+need(ref_status["admissible"], ref_status["reason"])
 # the dedicated GO phrase is NOT present in this read-only context -> cannot execute
 report = {
     "ready_for_dedicated_go": len(reasons) == 0,
@@ -101,6 +119,8 @@ report = {
     "no_market_action": True,
     "notional_cap_usd": float(os.environ["NOTIONAL_CAP"]),
     "dedicated_go_phrase": os.environ["GO_PHRASE"],
+    "reference_venue_status": ref_status,
+    "reference_venue_schema_drift": ref_status["schema_drift"],
     "state": d,
 }
 with open(os.environ["REPORT"], "w", encoding="utf-8") as f:
