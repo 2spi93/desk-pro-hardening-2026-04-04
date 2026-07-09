@@ -3984,6 +3984,11 @@ async def place_routed_order(payload: dict) -> dict:
                 "order_type": effective_live_context.get("order_type"),
                 "price": effective_live_context.get("price"),
                 "protection": effective_live_context.get("protection") if isinstance(effective_live_context.get("protection"), dict) else {},
+                # FTE-001 step 5: persist the venue order id on the fill so post-trade
+                # income-ledger events can be reconciled to this cycle (deterministic
+                # order_id->tradeId bridge). Absent on the book/split path (None).
+                "venue_order_id": str((broker_order or {}).get("order_id") or "") or None,
+                "client_order_id": str((broker_order or {}).get("client_order_id") or "") or None,
             },
             "route": {
                 "chosen": str(selected.get("venue") or actual_venue),
