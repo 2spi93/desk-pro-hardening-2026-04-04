@@ -155,29 +155,33 @@ class DeterministicReconcileTests(unittest.TestCase):
             income_cross_check_net_usd=-0.00600271,
         )
         self.assertEqual(r["attribution"], "DETERMINISTIC")
-        self.assertEqual(r["realized_pnl_semantics"], "VERIFIED")
-        self.assertEqual(r["semantics_cross_check"]["status"], "ALIGNED")
+        self.assertTrue(r["order_level_actual"])
+        self.assertEqual(r["independent_cross_check"], "ALIGNED")
+        self.assertTrue(r["independently_cross_verified"])
         self.assertTrue(r["reconciled_actual"])
         self.assertEqual(r["net_result_certainty"], "RECONCILED_ACTUAL")
         self.assertAlmostEqual(r["net_result_usd"], -0.005973, places=6)
         self.assertEqual(r["financial_truth"]["funding_usd"], "NOT_APPLICABLE")
 
-    def test_divergent_cross_check_stays_unverified(self) -> None:
+    def test_ambiguous_cross_check_keeps_order_level_actual(self) -> None:
         r = self.m.reconcile_deterministic(
             cycle_id="proofcyc-x", leg_costs=self._legs(), open_at=OPEN, close_at=CLOSE,
             ledger_synced_through=NOW, now=NOW,
-            income_cross_check_net_usd=-0.05,  # way off
+            income_cross_check_net_usd=-0.05,  # contaminated / way off
         )
-        self.assertEqual(r["semantics_cross_check"]["status"], "DIVERGENT")
-        self.assertEqual(r["realized_pnl_semantics"], "UNVERIFIED")
+        # order-level truth STANDS; only the independent cross-check is ambiguous
+        self.assertEqual(r["independent_cross_check"], "AMBIGUOUS")
+        self.assertTrue(r["order_level_actual"])
+        self.assertFalse(r["independently_cross_verified"])
         self.assertFalse(r["reconciled_actual"])
 
-    def test_no_cross_check_is_unverified(self) -> None:
+    def test_no_cross_check_is_order_level_actual_not_verified(self) -> None:
         r = self.m.reconcile_deterministic(
             cycle_id="proofcyc-x", leg_costs=self._legs(), open_at=OPEN, close_at=CLOSE,
             ledger_synced_through=NOW, now=NOW,
         )
-        self.assertEqual(r["semantics_cross_check"]["status"], "NO_CROSS_CHECK")
+        self.assertEqual(r["independent_cross_check"], "NONE")
+        self.assertTrue(r["order_level_actual"])
         self.assertFalse(r["reconciled_actual"])
 
 

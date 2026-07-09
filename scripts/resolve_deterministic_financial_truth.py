@@ -76,14 +76,20 @@ async def run():
             for lf in legfills:
                 did=lf["decision_id"]; leg='entry' if did.endswith('-entry') else 'exit'
                 coid=('txt-'+cyc+'-'+leg).lower()
+                import hashlib
                 try:
                     r=await cp._bingx_signed_get(sp,'/openApi/swap/v2/trade/order',{'symbol':SWAP,'clientOrderId':coid})
                     o=r.get('order') if isinstance(r,dict) else {}
                 except Exception as e:
                     o={"error":str(e)[:100]}
-                legs.append({"decision_id":did,"client_order_id":coid,"order_id":str(o.get("orderId") or ""),
-                             "commission_usd":float(o.get("commission") or 0),"profit_usd":float(o.get("profit") or 0),
-                             "filled_at":lf["filled_at"].isoformat(),"resolved":bool(o.get("orderId"))})
+                raw_hash=hashlib.sha256(json.dumps(o,sort_keys=True,default=str).encode()).hexdigest()
+                legs.append({"decision_id":did,"leg":leg,"client_order_id":coid,"order_id":str(o.get("orderId") or ""),
+                             "commission_usd":float(o.get("commission") or 0),"commission_asset":"USDT",
+                             "profit_usd":float(o.get("profit") or 0),"executed_qty":str(o.get("executedQty") or ""),
+                             "avg_price":str(o.get("avgPrice") or ""),"order_status":str(o.get("status") or ""),
+                             "venue_updated_at_ms":int(o.get("updateTime") or 0),
+                             "filled_at":lf["filled_at"].isoformat(),"resolved":bool(o.get("orderId")),
+                             "raw_payload_hash":raw_hash,"source_endpoint":"/openApi/swap/v2/trade/order?clientOrderId"})
             out["cycles"].append({"cycle_id":cyc,"open_at":first.isoformat(),"close_at":last.isoformat(),
                                   "ledger_net_usd":ledger_net,"legs":legs})
     print(json.dumps(out, default=str))
@@ -101,12 +107,44 @@ def _dt(v):
     return datetime.fromisoformat(str(v).replace("Z", "+00:00"))
 
 
+ORDER_LEVEL_LEDGER = OUT_DIR / "order_level_truth.jsonl"
+
+
+def _persist_order_level(cycle: dict, now: datetime) -> int:
+    """Append-only durable persistence of the venue order-level truth, so it is
+    captured BEFORE BingX history queries may stop returning old orders. Deduped
+    by (cycle_id, leg, order_id)."""
+    seen = set()
+    if ORDER_LEVEL_LEDGER.exists():
+        for line in ORDER_LEVEL_LEDGER.read_text(encoding="utf-8").splitlines():
+            try:
+                r = json.loads(line)
+                seen.add((r.get("cycle_id"), r.get("leg"), r.get("order_id")))
+            except json.JSONDecodeError:
+                continue
+    written = 0
+    with ORDER_LEVEL_LEDGER.open("a", encoding="utf-8") as fh:
+        for leg in cycle["legs"]:
+            if not leg.get("resolved"):
+                continue
+            key = (cycle["cycle_id"], leg.get("leg"), leg.get("order_id"))
+            if key in seen:
+                continue
+            rec = {"schema": "txt.order-level-financial-truth.v1", "cycle_id": cycle["cycle_id"],
+                   "retrieved_at": now.isoformat(), **leg}
+            fh.write(json.dumps(rec, sort_keys=True, default=str) + "\n")
+            seen.add(key)
+            written += 1
+    return written
+
+
 def main() -> int:
     eng = _load_engine()
     data = _fetch()
     now = datetime.now(timezone.utc)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     summary = []
+    total_persisted = 0
     for c in data["cycles"]:
         unresolved = [l for l in c["legs"] if not l.get("resolved")]
         leg_costs = [eng.LegVenueCost(l["decision_id"], l["order_id"], l["client_order_id"],
@@ -121,15 +159,18 @@ def main() -> int:
             truth["reconciled_actual"] = False
             truth["financial_truth_not_actual"] = True
             truth["attribution"] = "DETERMINISTIC_INCOMPLETE"
+        total_persisted += _persist_order_level(c, now)
         path = OUT_DIR / f"{c['cycle_id']}.deterministic.json"
         path.write_text(json.dumps(truth, indent=2, sort_keys=True, default=str), encoding="utf-8")
         summary.append(truth)
-        print(f"{c['cycle_id']:32s} net={truth['net_result_usd']:+.6f} attr={truth['attribution']:<22s} "
-              f"semantics={truth['realized_pnl_semantics']:<10s} xcheck={truth['semantics_cross_check']['status']:<9s} "
+        print(f"{c['cycle_id']:32s} net={truth['net_result_usd']:+.6f} attr={truth['attribution']:<24s} "
+              f"order_level_actual={truth.get('order_level_actual')} xcheck={truth['independent_cross_check']:<9s} "
               f"reconciled_actual={truth['reconciled_actual']}")
     (OUT_DIR / "deterministic_summary.json").write_text(json.dumps({"generated_at": now.isoformat(), "cycles": summary}, indent=2, sort_keys=True, default=str), encoding="utf-8")
     ra = sum(1 for t in summary if t["reconciled_actual"])
-    print(f"\nfinancially_reconciled_actual_outcomes={ra}/{len(summary)}")
+    ola = sum(1 for t in summary if t.get("order_level_actual"))
+    print(f"\norder_level_actual={ola}/{len(summary)}  cross_verified(reconciled_actual)={ra}/{len(summary)}  persisted_new_records={total_persisted}")
+    print(f"durable ledger: {ORDER_LEVEL_LEDGER}")
     return 0
 
 

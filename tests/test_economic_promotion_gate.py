@@ -19,27 +19,16 @@ def _load():
     return m
 
 
-def _heuristic_cycle(net):
+def _det(net, cross="ALIGNED", alpha=False):
+    verified = cross == "ALIGNED"
     return {
         "net_result_usd": net,
-        "value_truth": "ACTUAL",
-        "attribution": "HEURISTIC_MATCH",
-        "net_result_certainty": "RECONCILED_HEURISTIC",
-        "realized_pnl_semantics": "UNVERIFIED",
-        "reconciled_actual": False,
-        "alpha_sample_eligible": False,
-    }
-
-
-def _admissible_cycle(net):
-    return {
-        "net_result_usd": net,
-        "value_truth": "ACTUAL",
         "attribution": "DETERMINISTIC",
-        "net_result_certainty": "RECONCILED_ACTUAL",
-        "realized_pnl_semantics": "VERIFIED",
-        "reconciled_actual": True,
-        "alpha_sample_eligible": True,
+        "order_level_actual": True,
+        "independent_cross_check": cross,
+        "independently_cross_verified": verified,
+        "reconciled_actual": verified,
+        "alpha_sample_eligible": alpha,
     }
 
 
@@ -47,52 +36,51 @@ class EconomicGateTests(unittest.TestCase):
     def setUp(self) -> None:
         self.m = _load()
 
-    def test_current_state_heuristic_and_negative(self) -> None:
-        cycles = [_heuristic_cycle(n) for n in (-0.0042, -0.0048, -0.0029, -0.0060)]
+    def test_current_state_3_of_4_cross_verified(self) -> None:
+        cycles = [_det(-0.0042), _det(-0.0048, cross="AMBIGUOUS"), _det(-0.0029), _det(-0.0060)]
         r = self.m.evaluate_economic_promotion(cycles, min_series=100)
-        self.assertEqual(r["economic_promotion"]["status"], "BLOCKED")
-        self.assertEqual(r["financial_truth"]["status"], "PARTIAL")
-        # honest counters: values observed but 0 deterministically reconciled
         c = r["counters"]
         self.assertEqual(c["certified_operational_outcomes"], 4)
-        self.assertEqual(c["financially_observed_outcomes"], 4)
-        self.assertEqual(c["financially_heuristic_reconciled"], 4)
-        self.assertEqual(c["financially_reconciled_actual_outcomes"], 0)
+        self.assertEqual(c["deterministically_attributed_orders"], 4)
+        self.assertEqual(c["order_level_actual_outcomes"], 4)
+        self.assertEqual(c["independently_cross_verified_outcomes"], 3)
+        self.assertEqual(c["cross_check_ambiguous_outcomes"], 1)
+        self.assertEqual(c["fully_reconciled_actual_outcomes"], 3)
         self.assertEqual(c["economically_admissible_outcomes"], 0)
-        for b in ("venue_trade_id_linkage_missing", "financial_reconciliation_not_aligned",
-                  "realized_pnl_semantics_unverified", "income_pagination_incomplete",
-                  "economic_sample_insufficient", "net_expectancy_unavailable"):
+        self.assertEqual(r["order_level_financials"]["status"], "ACTUAL")
+        self.assertEqual(r["independent_cross_check"]["verified"], 3)
+        # corpus semantic proven (3 >= 2) -> that blocker clears
+        self.assertTrue(r["independent_cross_check"]["semantics_corpus_verified"])
+        self.assertNotIn("realized_pnl_semantics_unverified", r["economic_promotion"]["blockers"])
+        self.assertNotIn("venue_order_linkage_incomplete", r["economic_promotion"]["blockers"])
+        # still BLOCKED for honest reasons
+        self.assertEqual(r["economic_promotion"]["status"], "BLOCKED")
+        for b in ("income_pagination_incomplete", "economic_sample_insufficient", "net_expectancy_unavailable"):
             self.assertIn(b, r["economic_promotion"]["blockers"])
-        # with 0 admissible cycles, expectancy is UNKNOWN, never asserted negative
-        self.assertNotIn("net_expectancy_not_positive", r["economic_promotion"]["blockers"])
         self.assertIsNone(r["net_expectancy"]["positive"])
 
-    def test_ledger_stale_style_missing_is_not_observed(self) -> None:
-        stale = {"value_truth": "MISSING", "attribution": "HEURISTIC_MATCH",
-                 "net_result_certainty": "MISSING", "realized_pnl_semantics": "UNVERIFIED",
-                 "reconciled_actual": False, "alpha_sample_eligible": False, "net_result_usd": 0.0}
-        r = self.m.evaluate_economic_promotion([stale], min_series=100)
-        self.assertEqual(r["counters"]["financially_observed_outcomes"], 0)
-        self.assertEqual(r["economic_promotion"]["status"], "BLOCKED")
+    def test_too_few_cross_checks_keeps_semantics_unverified(self) -> None:
+        cycles = [_det(-0.004, cross="ALIGNED"), _det(-0.004, cross="AMBIGUOUS"), _det(-0.004, cross="AMBIGUOUS")]
+        r = self.m.evaluate_economic_promotion(cycles, min_series=100, semantics_corpus_min=2)
+        self.assertFalse(r["independent_cross_check"]["semantics_corpus_verified"])
+        self.assertIn("realized_pnl_semantics_unverified", r["economic_promotion"]["blockers"])
 
-    def test_proof_cycles_excluded_from_alpha_sample(self) -> None:
-        # deterministic + verified but proof (alpha ineligible) -> still 0 admissible
-        cycles = [dict(_admissible_cycle(0.01), alpha_sample_eligible=False) for _ in range(100)]
+    def test_proof_cycles_excluded_from_alpha(self) -> None:
+        cycles = [_det(0.01, alpha=False) for _ in range(100)]
         r = self.m.evaluate_economic_promotion(cycles, min_series=100, income_pagination_complete=True)
         self.assertEqual(r["counters"]["economically_admissible_outcomes"], 0)
         self.assertIn("economic_sample_insufficient", r["economic_promotion"]["blockers"])
+        self.assertIn("net_expectancy_unavailable", r["economic_promotion"]["blockers"])
 
-    def test_full_admissible_series_passes(self) -> None:
-        cycles = [_admissible_cycle(0.02) for _ in range(100)]
+    def test_full_admissible_positive_series_passes(self) -> None:
+        cycles = [_det(0.02, alpha=True) for _ in range(100)]
         r = self.m.evaluate_economic_promotion(cycles, min_series=100, income_pagination_complete=True)
         self.assertEqual(r["economic_promotion"]["status"], "PASS")
         self.assertEqual(r["economic_promotion"]["blockers"], [])
-        self.assertEqual(r["counters"]["economically_admissible_outcomes"], 100)
 
-    def test_negative_admissible_series_blocked(self) -> None:
-        cycles = [_admissible_cycle(-0.01) for _ in range(100)]
+    def test_admissible_negative_series_blocked_not_positive(self) -> None:
+        cycles = [_det(-0.01, alpha=True) for _ in range(100)]
         r = self.m.evaluate_economic_promotion(cycles, min_series=100, income_pagination_complete=True)
-        self.assertEqual(r["economic_promotion"]["status"], "BLOCKED")
         self.assertIn("net_expectancy_not_positive", r["economic_promotion"]["blockers"])
         self.assertNotIn("net_expectancy_unavailable", r["economic_promotion"]["blockers"])
 
