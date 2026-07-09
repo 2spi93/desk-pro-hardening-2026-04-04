@@ -6424,7 +6424,77 @@ def _capital_flow_source_bounds(account_id: str, source: str) -> tuple[datetime 
     return coerce(row.get("first_at")), coerce(row.get("last_at"))
 
 
-async def _bingx_fetch_income_history_events(account_id: str, secret_payload: dict, as_of: str) -> list[dict[str, Any]]:
+BINGX_INCOME_PAGE_LIMIT = 100
+BINGX_INCOME_MIN_WINDOW_SEC = 60.0
+
+
+def _bingx_income_event_key(item: dict[str, Any]) -> str:
+    return str(
+        item.get("tranId")
+        or item.get("tradeId")
+        or f"{item.get('incomeType')}:{item.get('time')}:{item.get('income')}"
+    )
+
+
+async def _bingx_income_collect_bisect(
+    secret_payload: dict,
+    window_start: datetime,
+    window_end: datetime,
+    *,
+    limit: int = BINGX_INCOME_PAGE_LIMIT,
+    min_window_sec: float = BINGX_INCOME_MIN_WINDOW_SEC,
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    """Anti-saturation collector: recursively bisect any window that returns the
+    page limit (potentially truncated) until every leaf returns < limit. Dedup by
+    tranId/tradeId. Coverage is 'complete' only if no window stayed saturated at
+    min size and no fetch failed — so covered_through advances ONLY on full
+    success."""
+    items: dict[str, dict[str, Any]] = {}
+    state = {"slices": 0, "saturation_unresolved": [], "fetch_error": None}
+
+    async def recurse(ws: datetime, we: datetime) -> bool:
+        state["slices"] += 1
+        try:
+            payload = await _bingx_signed_get(
+                secret_payload,
+                "/openApi/swap/v2/user/income",
+                {"recvWindow": 60000, "limit": limit,
+                 "startTime": int(ws.timestamp() * 1000), "endTime": int(we.timestamp() * 1000)},
+            )
+        except Exception as exc:  # noqa: BLE001
+            state["fetch_error"] = str(exc)[:160]
+            return False
+        page = [it for it in payload if isinstance(it, dict)] if isinstance(payload, list) else []
+        if len(page) < limit:
+            for it in page:
+                items[_bingx_income_event_key(it)] = it
+            return True
+        if (we - ws).total_seconds() <= min_window_sec:
+            for it in page:
+                items[_bingx_income_event_key(it)] = it
+            state["saturation_unresolved"].append({"start": ws.isoformat(), "end": we.isoformat(), "returned": len(page)})
+            return False
+        mid = ws + (we - ws) / 2
+        left = await recurse(ws, mid)
+        right = await recurse(mid, we)
+        return left and right
+
+    proven = await recurse(window_start, window_end)
+    coverage = {
+        "complete": bool(proven and not state["saturation_unresolved"] and state["fetch_error"] is None),
+        "slice_count": state["slices"],
+        "saturation_unresolved": state["saturation_unresolved"],
+        "fetch_error": state["fetch_error"],
+        "window_start": window_start.isoformat(),
+        "window_end": window_end.isoformat(),
+    }
+    return items, coverage
+
+
+async def _bingx_fetch_income_history_events(account_id: str, secret_payload: dict, as_of: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Returns (normalized_events, coverage). coverage.complete=True only when the
+    whole [start_at, as_of] range was collected without saturation or fetch error;
+    the caller advances the checkpoint's covered_through ONLY on complete."""
     as_of_dt = _parse_iso_utc(as_of) or _now_utc()
     start_at = _history_backfill_start(
         account_id,
@@ -6433,25 +6503,68 @@ async def _bingx_fetch_income_history_events(account_id: str, secret_payload: di
         BINGX_INCOME_HISTORY_BACKFILL_DAYS,
         incremental_days=7,
     )
+    items, coverage = await _bingx_income_collect_bisect(secret_payload, start_at, as_of_dt)
+    coverage["fetched_event_count"] = len(items)
+    coverage["covered_through"] = as_of_dt.isoformat() if coverage["complete"] else None
+    return _bingx_normalize_income_history_events(list(items.values())), coverage
 
-    window_start = start_at
-    collected: list[dict[str, Any]] = []
-    while window_start < as_of_dt:
-        window_end = min(window_start + timedelta(days=7), as_of_dt)
-        payload = await _bingx_signed_get(
-            secret_payload,
-            "/openApi/swap/v2/user/income",
-            {
-                "recvWindow": 60000,
-                "limit": 100,
-                "startTime": int(window_start.timestamp() * 1000),
-                "endTime": int(window_end.timestamp() * 1000),
-            },
+
+def _persist_income_sync_checkpoint(account_id: str, provider: str, coverage: dict[str, Any], *, now: datetime | None = None) -> dict[str, Any]:
+    """Append-only explicit sync checkpoint. covered_through / last_success_at
+    advance ONLY on a fully complete collection; a partial/failed collection
+    inserts a `partial` row that KEEPS the last valid covered_through. Table is
+    self-creating so this is deploy-safe."""
+    current = now or _now_utc()
+    execute(
+        """
+        CREATE TABLE IF NOT EXISTS capital_flow_sync_checkpoints (
+            id BIGSERIAL PRIMARY KEY,
+            account_id TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            endpoint TEXT,
+            window_start TIMESTAMPTZ,
+            covered_through TIMESTAMPTZ,
+            last_attempt_at TIMESTAMPTZ,
+            last_success_at TIMESTAMPTZ,
+            fetched_event_count INTEGER,
+            slice_count INTEGER,
+            saturation_unresolved_count INTEGER,
+            status TEXT,
+            error_code TEXT,
+            schema_version TEXT,
+            created_at TIMESTAMPTZ DEFAULT now()
         )
-        if isinstance(payload, list):
-            collected.extend(item for item in payload if isinstance(item, dict))
-        window_start = window_end
-    return _bingx_normalize_income_history_events(collected)
+        """,
+    )
+    complete = bool(coverage.get("complete"))
+    status = "success" if complete else "partial"
+    prev = fetch_one(
+        """
+        SELECT covered_through, last_success_at FROM capital_flow_sync_checkpoints
+        WHERE account_id = %s AND provider = %s AND status = 'success'
+        ORDER BY last_success_at DESC NULLS LAST LIMIT 1
+        """,
+        (account_id, provider),
+    ) or {}
+    covered_through = coverage.get("covered_through") if complete else prev.get("covered_through")
+    last_success_at = current if complete else prev.get("last_success_at")
+    execute(
+        """
+        INSERT INTO capital_flow_sync_checkpoints
+            (account_id, provider, endpoint, window_start, covered_through, last_attempt_at,
+             last_success_at, fetched_event_count, slice_count, saturation_unresolved_count,
+             status, error_code, schema_version)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        (
+            account_id, provider, "/openApi/swap/v2/user/income", coverage.get("window_start"),
+            covered_through, current, last_success_at, coverage.get("fetched_event_count"),
+            coverage.get("slice_count"), len(coverage.get("saturation_unresolved") or []),
+            status, coverage.get("fetch_error"), "txt.income-sync-checkpoint.v1",
+        ),
+    )
+    return {"status": status, "covered_through": str(covered_through) if covered_through else None, "complete": complete,
+            "saturation_unresolved": len(coverage.get("saturation_unresolved") or []), "slice_count": coverage.get("slice_count")}
 
 
 async def _binance_fetch_income_history_events(account_id: str, secret_payload: dict, as_of: str) -> list[dict[str, Any]]:
@@ -7605,11 +7718,18 @@ async def _sync_bingx_account_state(account_id: str, account: dict | None = None
     persisted = _postprocess_connector_sync(account_row, "bingx", as_of, balances, positions, previous_balances, previous_positions, persisted)
     income_history_warning: str | None = None
     try:
-        income_history_events = await _bingx_fetch_income_history_events(account_id, secret_payload, as_of)
+        income_history_events, income_coverage = await _bingx_fetch_income_history_events(account_id, secret_payload, as_of)
         persisted["bingx_income_history_events_persisted"] = _persist_capital_flow_events(account_row, income_history_events)
         persisted["capital_ledger"] = _account_capital_ledger(account_id)
+        # Explicit checkpoint AFTER persistence; covered_through advances only on a
+        # fully complete (unsaturated, no-error) collection.
+        persisted["income_sync_checkpoint"] = _persist_income_sync_checkpoint(account_id, "bingx", income_coverage)
     except Exception as exc:
         income_history_warning = f"bingx_income_history: {str(exc)}"
+        try:
+            _persist_income_sync_checkpoint(account_id, "bingx", {"complete": False, "fetch_error": str(exc)[:160], "window_start": None, "fetched_event_count": 0, "slice_count": 0, "saturation_unresolved": []})
+        except Exception:
+            pass
     persisted["status"] = "partial" if errors else "ok"
     persisted["connector_account"] = _connector_account_public_view(connector_account)
     persisted["account_overview"] = account_overview_items

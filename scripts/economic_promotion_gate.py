@@ -15,6 +15,8 @@ Proof cycles are OPERATIONAL_PROOF and excluded from the alpha sample.
 """
 from __future__ import annotations
 
+import json
+from datetime import datetime, timezone
 from typing import Any
 
 CONSTITUTIONAL_TARGET = 100
@@ -103,6 +105,65 @@ def evaluate_economic_promotion(
     }
 
 
+def read_income_checkpoint_runtime(container: str = "control-plane", *, freshness_sec: float = 900.0) -> dict[str, Any]:
+    """Read the CANONICAL income-sync checkpoint (capital_flow_sync_checkpoints)
+    and derive the runtime-proof flags. All False until the wired pipeline has
+    actually RUN post-deploy — so the pagination blocker cannot clear at merge."""
+    import subprocess
+
+    code = (
+        "import json,os\n"
+        "from pathlib import Path\n"
+        "import psycopg\n"
+        "from psycopg.rows import dict_row\n"
+        "def u():\n"
+        " v=os.environ.get('DATABASE_URL')\n"
+        " if v: return v\n"
+        " for c in (Path('/run/secrets/database_url'),Path('/workspace/secrets/database_url')):\n"
+        "  if c.exists(): return c.read_text().strip()\n"
+        "out={'checkpoint_present':False}\n"
+        "try:\n"
+        " with psycopg.connect(u(),row_factory=dict_row) as cn, cn.cursor() as cur:\n"
+        "  cur.execute(\"select to_regclass('public.capital_flow_sync_checkpoints') as t\")\n"
+        "  if cur.fetchone()['t'] is None: print(json.dumps(out)); raise SystemExit(0)\n"
+        "  cur.execute(\"select covered_through,last_success_at,saturation_unresolved_count,status,schema_version from capital_flow_sync_checkpoints where provider='bingx' and status='success' order by last_success_at desc nulls last limit 1\")\n"
+        "  r=cur.fetchone()\n"
+        "  if r: out={'checkpoint_present':True,'covered_through':str(r['covered_through']),'last_success_at':str(r['last_success_at']),'saturation_unresolved_count':r['saturation_unresolved_count'],'schema_version':r['schema_version']}\n"
+        "except Exception as e:\n"
+        " out['error']=str(e)[:120]\n"
+        "print(json.dumps(out,default=str))\n"
+    )
+    try:
+        res = subprocess.run(["docker", "exec", "-i", container, "python3", "-c", code],
+                             capture_output=True, text=True, timeout=30)
+        data = json.loads(res.stdout) if res.stdout.strip() else {}
+    except Exception as exc:  # noqa: BLE001
+        data = {"error": str(exc)[:120]}
+    present = bool(data.get("checkpoint_present"))
+    last_success = _parse_ts(data.get("last_success_at")) if present else None
+    fresh = last_success is not None and (datetime.now(timezone.utc) - last_success).total_seconds() <= freshness_sec
+    coverage_complete = present and (data.get("saturation_unresolved_count") in (0, None))
+    # pagination_runtime_verified requires the NEW pipeline schema to have written it
+    pagination_runtime_verified = present and data.get("schema_version") == "txt.income-sync-checkpoint.v1"
+    return {
+        "checkpoint_present": present,
+        "checkpoint_runtime_fresh": bool(fresh),
+        "coverage_complete": bool(coverage_complete),
+        "pagination_runtime_verified": bool(pagination_runtime_verified),
+        "raw": data,
+    }
+
+
+def _parse_ts(value):
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
 def _main() -> int:
     import json
     from pathlib import Path
@@ -113,8 +174,13 @@ def _main() -> int:
     det = base / "deterministic_summary.json"
     summary_path = det if det.exists() else base / "replay_summary.json"
     data = json.loads(summary_path.read_text(encoding="utf-8"))
-    report = evaluate_economic_promotion(data.get("cycles") or [])
+    # Read the canonical income checkpoint; the pagination blocker clears ONLY on
+    # runtime proof (all three flags), NOT at code merge.
+    rt = read_income_checkpoint_runtime()
+    income_pagination_complete = rt["pagination_runtime_verified"] and rt["checkpoint_runtime_fresh"] and rt["coverage_complete"]
+    report = evaluate_economic_promotion(data.get("cycles") or [], income_pagination_complete=income_pagination_complete)
     report["source"] = summary_path.name
+    report["income_hardening_runtime"] = rt
     out = summary_path.with_name("economic_promotion_gate.json")
     out.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
     ep = report["economic_promotion"]
