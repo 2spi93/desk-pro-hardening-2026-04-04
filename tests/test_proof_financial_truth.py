@@ -63,17 +63,25 @@ class ReconcileTests(unittest.TestCase):
     def setUp(self) -> None:
         self.m = _load()
 
-    def test_real_cycle_all_actual(self) -> None:
+    def test_real_cycle_values_actual_attribution_heuristic(self) -> None:
         r = self.m.reconcile_cycle_financials(
             cycle_id="proofcyc-x", legs=_legs(self.m), income_events=_income(self.m),
             ledger_synced_through=CLOSE + timedelta(minutes=20), now=NOW,
         )
+        # venue VALUES are real
         self.assertAlmostEqual(r["gross_result_usd"], -0.00103, places=6)
         self.assertAlmostEqual(r["trading_fees_usd"], -0.00497271, places=6)
-        self.assertEqual(r["financial_truth"]["funding_usd"], "NOT_APPLICABLE")
         self.assertAlmostEqual(r["net_result_usd"], -0.00600271, places=6)
-        self.assertFalse(r["financial_truth_not_actual"])
-        self.assertEqual(r["financial_truth"]["actual_coverage_pct"], 100.0)
+        self.assertEqual(r["financial_truth"]["funding_usd"], "NOT_APPLICABLE")
+        # but attribution is heuristic -> NOT reconciled-actual, and PnL semantics unverified
+        self.assertEqual(r["attribution"], "HEURISTIC_MATCH")
+        self.assertEqual(r["financial_truth"]["gross_result_usd"], "RECONCILED_HEURISTIC")
+        self.assertEqual(r["net_result_certainty"], "RECONCILED_HEURISTIC")
+        self.assertEqual(r["realized_pnl_semantics"], "UNVERIFIED")
+        self.assertFalse(r["reconciled_actual"])
+        self.assertTrue(r["financial_truth_not_actual"])
+        self.assertFalse(r["alpha_sample_eligible"])
+        self.assertEqual(r["outcome_purpose"], "OPERATIONAL_PROOF")
 
     def test_ledger_not_fresh_forces_missing(self) -> None:
         r = self.m.reconcile_cycle_financials(
@@ -101,7 +109,7 @@ class ReconcileTests(unittest.TestCase):
             ledger_synced_through=CLOSE + timedelta(minutes=20), now=NOW,
         )
         self.assertAlmostEqual(r["funding_usd"], -0.0004, places=6)
-        self.assertEqual(r["financial_truth"]["funding_usd"], "RECONCILED_ACTUAL")
+        self.assertEqual(r["financial_truth"]["funding_usd"], "RECONCILED_HEURISTIC")
 
     def test_no_fee_events_with_fallback_is_estimated_never_zero(self) -> None:
         r = self.m.reconcile_cycle_financials(
@@ -115,15 +123,19 @@ class ReconcileTests(unittest.TestCase):
         self.assertEqual(r["financial_truth"]["gross_result_usd"], "MISSING")
         self.assertTrue(r["financial_truth_not_actual"])
 
-    def test_deterministic_bridge_marks_reconciled(self) -> None:
+    def test_deterministic_bridge_marks_attribution_actual_but_semantics_still_gate(self) -> None:
         income = [self.m.IncomeEvent("realized_pnl", -0.001, CLOSE, "Buy to Close", trade_id="T9940546")]
         r = self.m.reconcile_cycle_financials(
             cycle_id="proofcyc-x", legs=_legs(self.m), income_events=income,
             ledger_synced_through=CLOSE + timedelta(minutes=20), now=NOW,
             order_trade_ids={"proofcyc-x-exit": {"T9940546"}},
         )
-        self.assertEqual(r["reconciliation"], "deterministic_order_trade_id")
+        self.assertEqual(r["attribution"], "DETERMINISTIC")
         self.assertEqual(r["financial_truth"]["gross_result_usd"], "RECONCILED_ACTUAL")
+        # even deterministic attribution is NOT economically admissible until the
+        # REALIZED_PNL-vs-fees semantics are proven (balance reconciliation)
+        self.assertEqual(r["realized_pnl_semantics"], "UNVERIFIED")
+        self.assertFalse(r["reconciled_actual"])
 
 
 if __name__ == "__main__":

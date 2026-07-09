@@ -29,10 +29,17 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 ACTUAL = "ACTUAL"
-RECONCILED_ACTUAL = "RECONCILED_ACTUAL"
+RECONCILED_ACTUAL = "RECONCILED_ACTUAL"       # venue value + DETERMINISTIC attribution
+RECONCILED_HEURISTIC = "RECONCILED_HEURISTIC"  # venue value, but attribution by heuristic match
 ESTIMATED = "ESTIMATED"
 MISSING = "MISSING"
 NOT_APPLICABLE = "NOT_APPLICABLE"
+
+# "Fully actual" for gate purposes: the VALUE is a venue actual AND the
+# attribution to this cycle is proven (deterministic) or the field is proven
+# not to apply. RECONCILED_HEURISTIC is deliberately EXCLUDED — the amounts are
+# real venue values but the cycle attribution is not yet mathematically proven.
+FULLY_ACTUAL = {ACTUAL, RECONCILED_ACTUAL, NOT_APPLICABLE}
 
 # Default reconciliation window: income settlement events land within a minute
 # or two of the fill (observed ~31-71s). Kept tight to avoid cross-cycle bleed.
@@ -148,9 +155,11 @@ def reconcile_cycle_financials(
             elif ev.event_type == "funding_fee":
                 funding_events.append(ev)
 
-    match_status = RECONCILED_ACTUAL
-    if deterministic:
-        match_status = RECONCILED_ACTUAL  # (deterministic bridge — strongest form)
+    # Attribution truth: DETERMINISTIC (venue trade-id link) vs HEURISTIC (time
+    # window). The ledger VALUES are venue-actual either way; only the mapping to
+    # THIS cycle differs. A matched amount is therefore RECONCILED_ACTUAL only
+    # when the attribution is deterministic; else RECONCILED_HEURISTIC.
+    match_status = RECONCILED_ACTUAL if deterministic else RECONCILED_HEURISTIC
 
     # --- fees ---
     if not ledger_fresh:
@@ -183,38 +192,53 @@ def reconcile_cycle_financials(
         funding_usd, funding_cert = 0.0, MISSING
 
     # --- net + coverage ---
+    # net = REALIZED_PNL + TRADING_FEE + FUNDING is only the correct identity IF
+    # BingX REALIZED_PNL is GROSS of commissions. That is NOT yet proven (needs a
+    # balance-movement reconciliation), so the semantics are UNVERIFIED and the
+    # net can be no stronger than RECONCILED_HEURISTIC.
     net_usd = gross_usd + fees_usd + funding_usd
     field_cert = {
         "gross_result_usd": gross_cert,
         "trading_fees_usd": fees_cert,
         "funding_usd": funding_cert,
     }
-    actual_like = {ACTUAL, RECONCILED_ACTUAL, NOT_APPLICABLE}
-    missing_fields = [k for k, v in field_cert.items() if v not in actual_like]
-    all_actual = not missing_fields
-    net_cert = (
-        (RECONCILED_ACTUAL if not deterministic else RECONCILED_ACTUAL)
-        if all_actual
-        else (MISSING if MISSING in field_cert.values() else ESTIMATED)
-    )
-    actual_coverage_pct = round(100.0 * sum(1 for v in field_cert.values() if v in actual_like) / len(field_cert), 1)
+    missing_fields = [k for k, v in field_cert.items() if v not in FULLY_ACTUAL]
+    all_fully_actual = not missing_fields
+    realized_pnl_semantics = "UNVERIFIED"  # until a balance reconciliation proves it
+    if not ledger_fresh:
+        net_cert = MISSING
+    elif all_fully_actual and realized_pnl_semantics == "VERIFIED":
+        net_cert = RECONCILED_ACTUAL
+    elif any(v in (RECONCILED_HEURISTIC, RECONCILED_ACTUAL) for v in field_cert.values()) and MISSING not in field_cert.values():
+        net_cert = RECONCILED_HEURISTIC
+    else:
+        net_cert = MISSING if MISSING in field_cert.values() else ESTIMATED
+    fully_actual_coverage_pct = round(100.0 * sum(1 for v in field_cert.values() if v in FULLY_ACTUAL) / len(field_cert), 1)
+    # A cycle is only economically ADMISSIBLE-actual when values are actual AND
+    # attribution is deterministic AND the PnL semantics are proven.
+    reconciled_actual = all_fully_actual and deterministic and realized_pnl_semantics == "VERIFIED"
 
     return {
-        "schema": "txt.proof-financial-truth.v2",
+        "schema": "txt.proof-financial-truth.v3",
         "cycle_id": cycle_id,
         "open_at": open_at.isoformat(),
         "close_at": close_at.isoformat(),
         "ledger_synced_through": ledger_synced_through.isoformat() if ledger_synced_through else None,
         "ledger_fresh": ledger_fresh,
-        "reconciliation": "deterministic_order_trade_id" if deterministic else "heuristic_symbol_time_info",
+        "outcome_purpose": "OPERATIONAL_PROOF",
+        "alpha_sample_eligible": False,
+        "attribution": "DETERMINISTIC" if deterministic else "HEURISTIC_MATCH",
+        "value_truth": "ACTUAL" if (fee_events or pnl_events) else ("MISSING" if not ledger_fresh else "NONE"),
+        "realized_pnl_semantics": realized_pnl_semantics,
         "gross_result_usd": round(gross_usd, 8),
         "trading_fees_usd": round(fees_usd, 8),
         "funding_usd": round(funding_usd, 8),
         "net_result_usd": round(net_usd, 8),
+        "net_result_certainty": net_cert,
         "financial_truth": {
             **field_cert,
             "net_result_usd": net_cert,
-            "actual_coverage_pct": actual_coverage_pct,
+            "fully_actual_coverage_pct": fully_actual_coverage_pct,
             "missing_fields": missing_fields,
         },
         "matched_events": {
@@ -222,5 +246,6 @@ def reconcile_cycle_financials(
             "realized_pnl": len(pnl_events),
             "funding_fee": len(funding_events),
         },
-        "financial_truth_not_actual": not all_actual,
+        "reconciled_actual": reconciled_actual,
+        "financial_truth_not_actual": not reconciled_actual,
     }
