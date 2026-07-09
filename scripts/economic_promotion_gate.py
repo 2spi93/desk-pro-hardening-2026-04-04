@@ -39,7 +39,8 @@ def evaluate_economic_promotion(
     admissible = [c for c in alpha_cycles if c.get("reconciled_actual")]
     admissible_nets = [float(c.get("net_result_usd") or 0.0) for c in admissible]
     net_mean = round(sum(admissible_nets) / len(admissible_nets), 8) if admissible_nets else None
-    net_positive = net_mean is not None and net_mean > 0.0
+    # With no admissible alpha sample, expectancy is UNKNOWN — not negative.
+    net_positive = None if net_mean is None else (net_mean > 0.0)
 
     # observed (heuristic) net expectancy — informational only, NOT admissible
     observed_nets = [float(c.get("net_result_usd") or 0.0) for c in cycles if c.get("value_truth") == "ACTUAL"]
@@ -55,7 +56,10 @@ def evaluate_economic_promotion(
         blockers.append("income_pagination_incomplete")
     if len(admissible) < min_series:
         blockers.append("economic_sample_insufficient")
-    if not net_positive:
+    # Net-expectancy truth: only assertable from a real admissible alpha sample.
+    if not admissible:
+        blockers.append("net_expectancy_unavailable")      # UNKNOWN, not negative
+    elif net_mean is not None and net_mean <= 0.0:
         blockers.append("net_expectancy_not_positive")
 
     financial_truth_status = "PARTIAL" if observed > 0 and reconciled_actual < operational else ("COMPLETE" if reconciled_actual == operational and operational else "MISSING")

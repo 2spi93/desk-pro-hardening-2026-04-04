@@ -61,8 +61,11 @@ class EconomicGateTests(unittest.TestCase):
         self.assertEqual(c["economically_admissible_outcomes"], 0)
         for b in ("venue_trade_id_linkage_missing", "financial_reconciliation_not_aligned",
                   "realized_pnl_semantics_unverified", "income_pagination_incomplete",
-                  "economic_sample_insufficient", "net_expectancy_not_positive"):
+                  "economic_sample_insufficient", "net_expectancy_unavailable"):
             self.assertIn(b, r["economic_promotion"]["blockers"])
+        # with 0 admissible cycles, expectancy is UNKNOWN, never asserted negative
+        self.assertNotIn("net_expectancy_not_positive", r["economic_promotion"]["blockers"])
+        self.assertIsNone(r["net_expectancy"]["positive"])
 
     def test_ledger_stale_style_missing_is_not_observed(self) -> None:
         stale = {"value_truth": "MISSING", "attribution": "HEURISTIC_MATCH",
@@ -91,6 +94,7 @@ class EconomicGateTests(unittest.TestCase):
         r = self.m.evaluate_economic_promotion(cycles, min_series=100, income_pagination_complete=True)
         self.assertEqual(r["economic_promotion"]["status"], "BLOCKED")
         self.assertIn("net_expectancy_not_positive", r["economic_promotion"]["blockers"])
+        self.assertNotIn("net_expectancy_unavailable", r["economic_promotion"]["blockers"])
 
 
 if __name__ == "__main__":
