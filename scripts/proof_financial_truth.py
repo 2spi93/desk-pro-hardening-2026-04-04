@@ -131,6 +131,7 @@ def reconcile_deterministic(
     now: datetime,
     income_cross_check_net_usd: float | None = None,
     cross_check_tolerance_usd: float = 0.0005,
+    cross_check_status: str | None = None,
     funding_interval_hours: int = DEFAULT_FUNDING_INTERVAL_HOURS,
     funding_events_usd: float | None = None,
 ) -> dict[str, Any]:
@@ -160,10 +161,15 @@ def reconcile_deterministic(
     # identity per cycle, but an AMBIGUOUS cross-check (e.g. contaminated income
     # window from an adjacent cycle) does NOT invalidate the order-level truth.
     order_level_actual = all(l.order_id for l in leg_costs)
-    if income_cross_check_net_usd is not None and abs(net_usd - income_cross_check_net_usd) <= cross_check_tolerance_usd:
-        cross_check = {"status": "ALIGNED", "ledger_net_usd": round(income_cross_check_net_usd, 8), "delta_usd": round(net_usd - income_cross_check_net_usd, 8)}
+    # A one-to-one matcher status (income_leg_matcher.cross_check_cycle) is the
+    # authoritative cross-check when provided — it excludes adjacent cycles by
+    # tight time window + structure. The net-delta path is a coarse fallback.
+    if cross_check_status is not None:
+        cross_check = {"status": cross_check_status, "method": "one_to_one_leg_matcher"}
+    elif income_cross_check_net_usd is not None and abs(net_usd - income_cross_check_net_usd) <= cross_check_tolerance_usd:
+        cross_check = {"status": "ALIGNED", "method": "net_delta", "ledger_net_usd": round(income_cross_check_net_usd, 8), "delta_usd": round(net_usd - income_cross_check_net_usd, 8)}
     elif income_cross_check_net_usd is not None:
-        cross_check = {"status": "AMBIGUOUS", "ledger_net_usd": round(income_cross_check_net_usd, 8), "delta_usd": round(net_usd - income_cross_check_net_usd, 8),
+        cross_check = {"status": "AMBIGUOUS", "method": "net_delta", "ledger_net_usd": round(income_cross_check_net_usd, 8), "delta_usd": round(net_usd - income_cross_check_net_usd, 8),
                        "note": "order-level truth stands; income cross-check window likely contaminated"}
     else:
         cross_check = {"status": "NONE"}

@@ -29,12 +29,16 @@ ACCOUNT_ID = "29586394"
 SWAP = "BTC-USDT"
 
 
-def _load_engine():
-    spec = importlib.util.spec_from_file_location("proof_financial_truth", ROOT / "scripts" / "proof_financial_truth.py")
+def _load_mod(name):
+    spec = importlib.util.spec_from_file_location(name, ROOT / "scripts" / f"{name}.py")
     m = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = m
     spec.loader.exec_module(m)
     return m
+
+
+def _load_engine():
+    return _load_mod("proof_financial_truth")
 
 
 # In-container: list cycles + income-ledger net per cycle, then signed order query
@@ -66,12 +70,24 @@ async def run():
                            where decision_id like %s and fill_type='live-broker' order by filled_at""",(cyc+'%',))
             legfills=[dict(r) for r in cur.fetchall()]
             first=min(l["filled_at"] for l in legfills); last=max(l["filled_at"] for l in legfills)
+            _td=__import__('datetime').timedelta
             cur.execute("""select coalesce(sum(amount_usd),0) as net from capital_flow_events
                            where source='bingx-income-history' and asset_symbol = ANY(%s)
                            and event_type in ('trading_fee','realized_pnl','funding_fee')
                            and occurred_at between %s and %s""",
-                        (['BTC-USDT','BTCUSDT'], first - __import__('datetime').timedelta(minutes=5), last + __import__('datetime').timedelta(minutes=10)))
+                        (['BTC-USDT','BTCUSDT'], first - _td(minutes=5), last + _td(minutes=10)))
             ledger_net=float(cur.fetchone()["net"])
+            # individual income events (wide window) for the one-to-one matcher
+            cur.execute("""select event_type, amount_usd,
+                           cast(extract(epoch from occurred_at)*1000 as bigint) as time_ms,
+                           asset_symbol, external_event_id from capital_flow_events
+                           where source='bingx-income-history' and asset_symbol = ANY(%s)
+                           and event_type in ('trading_fee','realized_pnl','funding_fee')
+                           and occurred_at between %s and %s order by occurred_at""",
+                        (['BTC-USDT','BTCUSDT'], first - _td(minutes=30), last + _td(minutes=30)))
+            income_events=[{"income_type":r["event_type"],"amount":float(r["amount_usd"] or 0),
+                            "time_ms":int(r["time_ms"]),"symbol":"BTC-USDT","external_event_id":r["external_event_id"]}
+                           for r in cur.fetchall()]
             legs=[]
             for lf in legfills:
                 did=lf["decision_id"]; leg='entry' if did.endswith('-entry') else 'exit'
@@ -91,7 +107,7 @@ async def run():
                              "filled_at":lf["filled_at"].isoformat(),"resolved":bool(o.get("orderId")),
                              "raw_payload_hash":raw_hash,"source_endpoint":"/openApi/swap/v2/trade/order?clientOrderId"})
             out["cycles"].append({"cycle_id":cyc,"open_at":first.isoformat(),"close_at":last.isoformat(),
-                                  "ledger_net_usd":ledger_net,"legs":legs})
+                                  "ledger_net_usd":ledger_net,"legs":legs,"income_events":income_events})
     print(json.dumps(out, default=str))
 asyncio.run(run())
 '''.replace("__ACCT__", ACCOUNT_ID).replace("__SWAP__", SWAP)
@@ -140,6 +156,7 @@ def _persist_order_level(cycle: dict, now: datetime) -> int:
 
 def main() -> int:
     eng = _load_engine()
+    matcher = _load_mod("income_leg_matcher")
     data = _fetch()
     now = datetime.now(timezone.utc)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -149,11 +166,17 @@ def main() -> int:
         unresolved = [l for l in c["legs"] if not l.get("resolved")]
         leg_costs = [eng.LegVenueCost(l["decision_id"], l["order_id"], l["client_order_id"],
                                       float(l["commission_usd"]), float(l["profit_usd"]), _dt(l["filled_at"])) for l in c["legs"]]
+        # one-to-one cross-check (excludes adjacent cycles by tight time window)
+        match_legs = [{"order_update_ms": l.get("venue_updated_at_ms") or 0,
+                       "commission_usd": l["commission_usd"], "profit_usd": l["profit_usd"]} for l in c["legs"]]
+        xcheck = matcher.cross_check_cycle(legs=match_legs, income_events=c.get("income_events") or [], symbol="BTC-USDT")
         truth = eng.reconcile_deterministic(
             cycle_id=c["cycle_id"], leg_costs=leg_costs, open_at=_dt(c["open_at"]), close_at=_dt(c["close_at"]),
             ledger_synced_through=now, now=now,
             income_cross_check_net_usd=float(c["ledger_net_usd"]),
+            cross_check_status=xcheck["status"],
         )
+        truth["cross_check_detail"] = xcheck
         truth["unresolved_legs"] = len(unresolved)
         if unresolved:
             truth["reconciled_actual"] = False
