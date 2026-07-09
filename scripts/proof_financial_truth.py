@@ -109,6 +109,94 @@ def _match_events(leg: Leg, events: list[IncomeEvent], window_sec: float, order_
     return matched
 
 
+@dataclass
+class LegVenueCost:
+    """Deterministic per-leg venue truth from the BingX order query, keyed by a
+    clientOrderId that embeds the cycle+leg (txt-proofcyc-<cycle>-<leg>)."""
+    decision_id: str
+    order_id: str
+    client_order_id: str
+    commission_usd: float           # venue commission for this order (signed, <=0)
+    profit_usd: float               # venue GROSS realized pnl for this order
+    filled_at: datetime | None = None
+
+
+def reconcile_deterministic(
+    *,
+    cycle_id: str,
+    leg_costs: list[LegVenueCost],
+    open_at: datetime,
+    close_at: datetime,
+    ledger_synced_through: datetime | None,
+    now: datetime,
+    income_cross_check_net_usd: float | None = None,
+    cross_check_tolerance_usd: float = 0.0005,
+    funding_interval_hours: int = DEFAULT_FUNDING_INTERVAL_HOURS,
+    funding_events_usd: float | None = None,
+) -> dict[str, Any]:
+    """Deterministic financial truth: per-order commission+profit attributed to
+    the cycle via clientOrderId. Values ACTUAL, attribution DETERMINISTIC. PnL
+    semantics VERIFIED iff an independent source (income ledger net) agrees
+    within tolerance — proving REALIZED_PNL is gross of commission (net =
+    profit + commission), so no double-count."""
+    if not leg_costs:
+        return {"cycle_id": cycle_id, "error": "no_leg_costs"}
+    gross_usd = round(sum(l.profit_usd for l in leg_costs), 8)
+    fees_usd = round(sum(l.commission_usd for l in leg_costs), 8)
+
+    # funding
+    if funding_events_usd is not None:
+        funding_usd, funding_cert = round(funding_events_usd, 8), RECONCILED_ACTUAL
+    elif not _crosses_funding_boundary(open_at, close_at, funding_interval_hours):
+        funding_usd, funding_cert = 0.0, NOT_APPLICABLE
+    else:
+        funding_usd, funding_cert = 0.0, MISSING
+
+    net_usd = round(gross_usd + fees_usd + funding_usd, 8)
+
+    # semantics verification via independent cross-check
+    if income_cross_check_net_usd is not None and abs(net_usd - income_cross_check_net_usd) <= cross_check_tolerance_usd:
+        realized_pnl_semantics = "VERIFIED"
+        cross_check = {"status": "ALIGNED", "ledger_net_usd": round(income_cross_check_net_usd, 8), "delta_usd": round(net_usd - income_cross_check_net_usd, 8)}
+    elif income_cross_check_net_usd is not None:
+        realized_pnl_semantics = "UNVERIFIED"
+        cross_check = {"status": "DIVERGENT", "ledger_net_usd": round(income_cross_check_net_usd, 8), "delta_usd": round(net_usd - income_cross_check_net_usd, 8)}
+    else:
+        realized_pnl_semantics = "UNVERIFIED"
+        cross_check = {"status": "NO_CROSS_CHECK"}
+
+    field_cert = {"gross_result_usd": RECONCILED_ACTUAL, "trading_fees_usd": RECONCILED_ACTUAL, "funding_usd": funding_cert}
+    all_fully_actual = all(v in FULLY_ACTUAL for v in field_cert.values())
+    reconciled_actual = all_fully_actual and realized_pnl_semantics == "VERIFIED"
+    net_cert = RECONCILED_ACTUAL if reconciled_actual else RECONCILED_HEURISTIC
+
+    return {
+        "schema": "txt.proof-financial-truth.v3",
+        "cycle_id": cycle_id,
+        "open_at": open_at.isoformat(),
+        "close_at": close_at.isoformat(),
+        "ledger_synced_through": ledger_synced_through.isoformat() if ledger_synced_through else None,
+        "ledger_fresh": True,
+        "outcome_purpose": "OPERATIONAL_PROOF",
+        "alpha_sample_eligible": False,
+        "attribution": "DETERMINISTIC",
+        "attribution_key": "clientOrderId->orderId (venue order query)",
+        "value_truth": "ACTUAL",
+        "realized_pnl_semantics": realized_pnl_semantics,
+        "semantics_cross_check": cross_check,
+        "legs": [{"decision_id": l.decision_id, "order_id": l.order_id, "client_order_id": l.client_order_id,
+                  "commission_usd": l.commission_usd, "profit_usd": l.profit_usd} for l in leg_costs],
+        "gross_result_usd": gross_usd,
+        "trading_fees_usd": fees_usd,
+        "funding_usd": funding_usd,
+        "net_result_usd": net_usd,
+        "net_result_certainty": net_cert,
+        "financial_truth": {**field_cert, "net_result_usd": net_cert, "missing_fields": []},
+        "reconciled_actual": reconciled_actual,
+        "financial_truth_not_actual": not reconciled_actual,
+    }
+
+
 def reconcile_cycle_financials(
     *,
     cycle_id: str,

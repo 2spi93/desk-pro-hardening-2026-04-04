@@ -138,5 +138,48 @@ class ReconcileTests(unittest.TestCase):
         self.assertFalse(r["reconciled_actual"])
 
 
+class DeterministicReconcileTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.m = _load()
+
+    def _legs(self):
+        return [
+            self.m.LegVenueCost("proofcyc-x-entry", "OID1", "txt-proofcyc-x-entry", -0.002486, 0.0, OPEN),
+            self.m.LegVenueCost("proofcyc-x-exit", "OID2", "txt-proofcyc-x-exit", -0.002487, -0.0010, CLOSE),
+        ]
+
+    def test_deterministic_aligned_cross_check_is_reconciled_actual(self) -> None:
+        r = self.m.reconcile_deterministic(
+            cycle_id="proofcyc-x", leg_costs=self._legs(), open_at=OPEN, close_at=CLOSE,
+            ledger_synced_through=CLOSE + timedelta(minutes=20), now=NOW,
+            income_cross_check_net_usd=-0.00600271,
+        )
+        self.assertEqual(r["attribution"], "DETERMINISTIC")
+        self.assertEqual(r["realized_pnl_semantics"], "VERIFIED")
+        self.assertEqual(r["semantics_cross_check"]["status"], "ALIGNED")
+        self.assertTrue(r["reconciled_actual"])
+        self.assertEqual(r["net_result_certainty"], "RECONCILED_ACTUAL")
+        self.assertAlmostEqual(r["net_result_usd"], -0.005973, places=6)
+        self.assertEqual(r["financial_truth"]["funding_usd"], "NOT_APPLICABLE")
+
+    def test_divergent_cross_check_stays_unverified(self) -> None:
+        r = self.m.reconcile_deterministic(
+            cycle_id="proofcyc-x", leg_costs=self._legs(), open_at=OPEN, close_at=CLOSE,
+            ledger_synced_through=NOW, now=NOW,
+            income_cross_check_net_usd=-0.05,  # way off
+        )
+        self.assertEqual(r["semantics_cross_check"]["status"], "DIVERGENT")
+        self.assertEqual(r["realized_pnl_semantics"], "UNVERIFIED")
+        self.assertFalse(r["reconciled_actual"])
+
+    def test_no_cross_check_is_unverified(self) -> None:
+        r = self.m.reconcile_deterministic(
+            cycle_id="proofcyc-x", leg_costs=self._legs(), open_at=OPEN, close_at=CLOSE,
+            ledger_synced_through=NOW, now=NOW,
+        )
+        self.assertEqual(r["semantics_cross_check"]["status"], "NO_CROSS_CHECK")
+        self.assertFalse(r["reconciled_actual"])
+
+
 if __name__ == "__main__":
     unittest.main()

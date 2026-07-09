@@ -103,9 +103,14 @@ def _main() -> int:
     import json
     from pathlib import Path
 
-    summary_path = Path("/opt/txt/var/proof_renewal/financial_truth/replay_summary.json")
+    base = Path("/opt/txt/var/proof_renewal/financial_truth")
+    # Prefer the DETERMINISTIC summary (clientOrderId->orderId venue truth); fall
+    # back to the heuristic replay if the bridge has not been resolved yet.
+    det = base / "deterministic_summary.json"
+    summary_path = det if det.exists() else base / "replay_summary.json"
     data = json.loads(summary_path.read_text(encoding="utf-8"))
     report = evaluate_economic_promotion(data.get("cycles") or [])
+    report["source"] = summary_path.name
     out = summary_path.with_name("economic_promotion_gate.json")
     out.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
     ep = report["economic_promotion"]
