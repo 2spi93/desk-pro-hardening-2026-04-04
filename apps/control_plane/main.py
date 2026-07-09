@@ -6509,10 +6509,11 @@ async def _bingx_fetch_income_history_events(account_id: str, secret_payload: di
     return _bingx_normalize_income_history_events(list(items.values())), coverage
 
 
-def _persist_income_sync_checkpoint(account_id: str, provider: str, coverage: dict[str, Any], *, now: datetime | None = None) -> dict[str, Any]:
+def _persist_income_sync_checkpoint(account_id: str, provider: str, coverage: dict[str, Any], *, persist_complete: bool = True, now: datetime | None = None) -> dict[str, Any]:
     """Append-only explicit sync checkpoint. covered_through / last_success_at
-    advance ONLY on a fully complete collection; a partial/failed collection
-    inserts a `partial` row that KEEPS the last valid covered_through. Table is
+    advance ONLY on a fully complete collection AND a complete persistence of
+    every fetched event; a partial/failed collection or persistence inserts a
+    `partial` row that KEEPS the last valid covered_through. Table is
     self-creating so this is deploy-safe."""
     current = now or _now_utc()
     execute(
@@ -6536,7 +6537,9 @@ def _persist_income_sync_checkpoint(account_id: str, provider: str, coverage: di
         )
         """,
     )
-    complete = bool(coverage.get("complete"))
+    # Success requires BOTH a complete fetch coverage AND a complete persistence
+    # of every fetched event — never advance covered_through on a partial persist.
+    complete = bool(coverage.get("complete")) and bool(persist_complete)
     status = "success" if complete else "partial"
     prev = fetch_one(
         """
@@ -7719,11 +7722,14 @@ async def _sync_bingx_account_state(account_id: str, account: dict | None = None
     income_history_warning: str | None = None
     try:
         income_history_events, income_coverage = await _bingx_fetch_income_history_events(account_id, secret_payload, as_of)
-        persisted["bingx_income_history_events_persisted"] = _persist_capital_flow_events(account_row, income_history_events)
+        _events_persisted = _persist_capital_flow_events(account_row, income_history_events)
+        persisted["bingx_income_history_events_persisted"] = _events_persisted
         persisted["capital_ledger"] = _account_capital_ledger(account_id)
         # Explicit checkpoint AFTER persistence; covered_through advances only on a
-        # fully complete (unsaturated, no-error) collection.
-        persisted["income_sync_checkpoint"] = _persist_income_sync_checkpoint(account_id, "bingx", income_coverage)
+        # fully complete collection AND every fetched event persisted.
+        _persist_complete = _events_persisted >= len(income_history_events)
+        persisted["income_sync_checkpoint"] = _persist_income_sync_checkpoint(
+            account_id, "bingx", income_coverage, persist_complete=_persist_complete)
     except Exception as exc:
         income_history_warning = f"bingx_income_history: {str(exc)}"
         try:
