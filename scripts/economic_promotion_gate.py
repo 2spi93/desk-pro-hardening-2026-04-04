@@ -105,7 +105,7 @@ def evaluate_economic_promotion(
     }
 
 
-def read_income_checkpoint_runtime(container: str = "control-plane", *, freshness_sec: float = 900.0) -> dict[str, Any]:
+def read_income_checkpoint_runtime(container: str = "control-plane", *, freshness_sec: float = 900.0, deployed_commit: str | None = None) -> dict[str, Any]:
     """Read the CANONICAL income-sync checkpoint (capital_flow_sync_checkpoints)
     and derive the runtime-proof flags. All False until the wired pipeline has
     actually RUN post-deploy — so the pagination blocker cannot clear at merge."""
@@ -124,11 +124,15 @@ def read_income_checkpoint_runtime(container: str = "control-plane", *, freshnes
         "out={'checkpoint_present':False}\n"
         "try:\n"
         " with psycopg.connect(u(),row_factory=dict_row) as cn, cn.cursor() as cur:\n"
-        "  cur.execute(\"select to_regclass('public.capital_flow_sync_checkpoints') as t\")\n"
-        "  if cur.fetchone()['t'] is None: print(json.dumps(out)); raise SystemExit(0)\n"
-        "  cur.execute(\"select covered_through,last_success_at,saturation_unresolved_count,status,schema_version from capital_flow_sync_checkpoints where provider='bingx' and status='success' order by last_success_at desc nulls last limit 1\")\n"
-        "  r=cur.fetchone()\n"
-        "  if r: out={'checkpoint_present':True,'covered_through':str(r['covered_through']),'last_success_at':str(r['last_success_at']),'saturation_unresolved_count':r['saturation_unresolved_count'],'schema_version':r['schema_version']}\n"
+        "  if cur.execute(\"select to_regclass('public.capital_flow_sync_checkpoints') as t\") or cur.fetchone()['t'] is not None:\n"
+        "   cur.execute(\"select covered_through,last_success_at,saturation_unresolved_count,status,schema_version from capital_flow_sync_checkpoints where provider='bingx' and status='success' order by last_success_at desc nulls last limit 1\")\n"
+        "   r=cur.fetchone()\n"
+        "   if r: out.update({'checkpoint_present':True,'covered_through':str(r['covered_through']),'last_success_at':str(r['last_success_at']),'saturation_unresolved_count':r['saturation_unresolved_count'],'schema_version':r['schema_version']})\n"
+        "  cur.execute(\"select to_regclass('public.capital_flow_pagination_evidence') as t\")\n"
+        "  if cur.fetchone()['t'] is not None:\n"
+        "   cur.execute(\"select slice_count,coverage_complete,deployed_commit,verified_at,events_fetched from capital_flow_pagination_evidence where provider='bingx' order by verified_at desc nulls last limit 1\")\n"
+        "   e=cur.fetchone()\n"
+        "   if e: out['pagination_evidence']={'slice_count':e['slice_count'],'coverage_complete':e['coverage_complete'],'deployed_commit':e['deployed_commit'],'verified_at':str(e['verified_at']),'events_fetched':e['events_fetched']}\n"
         "except Exception as e:\n"
         " out['error']=str(e)[:120]\n"
         "print(json.dumps(out,default=str))\n"
@@ -143,13 +147,22 @@ def read_income_checkpoint_runtime(container: str = "control-plane", *, freshnes
     last_success = _parse_ts(data.get("last_success_at")) if present else None
     fresh = last_success is not None and (datetime.now(timezone.utc) - last_success).total_seconds() <= freshness_sec
     coverage_complete = present and (data.get("saturation_unresolved_count") in (0, None))
-    # pagination_runtime_verified requires the NEW pipeline schema to have written it
-    pagination_runtime_verified = present and data.get("schema_version") == "txt.income-sync-checkpoint.v1"
+    # pagination_runtime_verified requires PERSISTED canonical evidence (a real
+    # bisection run: slice_count>1, coverage_complete, tied to the deployed
+    # commit) — NOT an ephemeral observation or merely the checkpoint schema.
+    ev = data.get("pagination_evidence") or {}
+    pagination_runtime_verified = bool(
+        ev
+        and int(ev.get("slice_count") or 0) > 1
+        and bool(ev.get("coverage_complete"))
+        and (deployed_commit is None or str(ev.get("deployed_commit")) == str(deployed_commit))
+    )
     return {
         "checkpoint_present": present,
         "checkpoint_runtime_fresh": bool(fresh),
         "coverage_complete": bool(coverage_complete),
-        "pagination_runtime_verified": bool(pagination_runtime_verified),
+        "pagination_runtime_verified": pagination_runtime_verified,
+        "pagination_evidence": ev or None,
         "raw": data,
     }
 
@@ -176,7 +189,12 @@ def _main() -> int:
     data = json.loads(summary_path.read_text(encoding="utf-8"))
     # Read the canonical income checkpoint; the pagination blocker clears ONLY on
     # runtime proof (all three flags), NOT at code merge.
-    rt = read_income_checkpoint_runtime()
+    import subprocess as _sp
+    try:
+        _head = _sp.run(["git", "-C", "/opt/txt", "rev-parse", "--short", "HEAD"], capture_output=True, text=True, timeout=10).stdout.strip()
+    except Exception:
+        _head = None
+    rt = read_income_checkpoint_runtime(deployed_commit=_head)
     income_pagination_complete = rt["pagination_runtime_verified"] and rt["checkpoint_runtime_fresh"] and rt["coverage_complete"]
     report = evaluate_economic_promotion(data.get("cycles") or [], income_pagination_complete=income_pagination_complete)
     report["source"] = summary_path.name
