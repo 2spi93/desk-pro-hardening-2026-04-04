@@ -19,6 +19,8 @@ CHART_OFFLINE_CAPTURE_HARD_FAIL_CONSECUTIVE_FAILS="${CHART_OFFLINE_CAPTURE_HARD_
 CHART_OFFLINE_CAPTURE_SNAPSHOT_CONSECUTIVE_FAILS="${CHART_OFFLINE_CAPTURE_SNAPSHOT_CONSECUTIVE_FAILS:-1}"
 CHART_CAPTURE_REQUIRED_FAILS_FILE="${CHART_CAPTURE_REQUIRED_FAILS_FILE:-${STATE_FILE}.chart_offline_required}"
 CHART_CAPTURE_THRESHOLD_REASON_FILE="${CHART_CAPTURE_THRESHOLD_REASON_FILE:-${STATE_FILE}.chart_offline_reason}"
+CHART_INCIDENT_STATE_FILE="${CHART_INCIDENT_STATE_FILE:-${ROOT_DIR}/logs/healthwatch/chart-offline/incident-state.json}"
+CHART_FULL_CAPTURE_INTERVAL_SEC="${CHART_FULL_CAPTURE_INTERVAL_SEC:-3600}"
 PUBLIC_CHART_DIAGNOSTIC_ENABLED="${PUBLIC_CHART_DIAGNOSTIC_ENABLED:-1}"
 PUBLIC_CHART_DIAGNOSTIC_INTERVAL_SEC="${PUBLIC_CHART_DIAGNOSTIC_INTERVAL_SEC:-900}"
 PUBLIC_CHART_MAX_BARS_STALE_MS="${PUBLIC_CHART_MAX_BARS_STALE_MS:-30000}"
@@ -464,78 +466,78 @@ if [[ "$UI_ASSET_CHECK_ENABLED" == "1" ]]; then
 fi
 
 if [[ "$CHART_OFFLINE_CAPTURE_ENABLED" == "1" ]]; then
-  if chart_capture_output="$(CAPTURE_PERSIST_ON_CRITICAL=0 $ROOT_DIR/scripts/capture_chart_offline_context.sh 2>&1)"; then
-    chart_capture_count=0
-    chart_capture_required_fails="$CHART_OFFLINE_CAPTURE_CONSECUTIVE_FAILS"
-    chart_capture_threshold_reason="healthy"
-    echo "$chart_capture_count" > "$CHART_CAPTURE_COUNT_FILE"
-    echo "$chart_capture_required_fails" > "$CHART_CAPTURE_REQUIRED_FAILS_FILE"
-    echo "$chart_capture_threshold_reason" > "$CHART_CAPTURE_THRESHOLD_REASON_FILE"
-    if [[ "$chart_capture_state" == "captured" ]]; then
-      alert "recovery" "Chart OHLCV pipeline recovered: offline capture condition cleared."
-    fi
-    echo "healthy" > "$CHART_CAPTURE_STATE_FILE"
-  else
-    capture_exit=$?
-    if [[ $capture_exit -eq 10 ]]; then
-      if [[ -f "$ROOT_DIR/logs/healthwatch/chart-offline/latest-probe.json" ]]; then
-        threshold_eval="$(python3 - "$ROOT_DIR/logs/healthwatch/chart-offline/latest-probe.json" "$CHART_OFFLINE_CAPTURE_CONSECUTIVE_FAILS" "$CHART_OFFLINE_CAPTURE_HARD_FAIL_CONSECUTIVE_FAILS" "$CHART_OFFLINE_CAPTURE_SNAPSHOT_CONSECUTIVE_FAILS" <<'PY'
+  set +e
+  chart_capture_output="$(CAPTURE_PERSIST_ON_CRITICAL=0 "$ROOT_DIR/scripts/capture_chart_offline_context.sh" 2>&1)"
+  capture_exit=$?
+  set -e
+  printf '%s\n' "$chart_capture_output" >> "$LOG_DIR/healthwatch.log"
+
+  if [[ $capture_exit -eq 0 || $capture_exit -eq 10 ]]; then
+    decision_file="$(mktemp)"
+    trap 'rm -f "$decision_file"' EXIT
+    python3 "$ROOT_DIR/scripts/healthwatch_incident_policy.py" \
+      --probe "$ROOT_DIR/logs/healthwatch/chart-offline/latest-probe.json" \
+      --state "$CHART_INCIDENT_STATE_FILE" \
+      --decision "$decision_file" \
+      --full-capture-interval-seconds "$CHART_FULL_CAPTURE_INTERVAL_SEC" \
+      --daily-summary-dir "$ROOT_DIR/logs/healthwatch/chart-offline/daily" \
+      >> "$LOG_DIR/healthwatch.log"
+    read -r capture_full capture_event capture_signature incident_occurrences < <(
+      python3 - "$decision_file" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-probe_path, default_threshold, hard_fail_threshold, snapshot_threshold = sys.argv[1:5]
-payload = json.loads(Path(probe_path).read_text())
-reasons = payload.get("offline_reasons") if isinstance(payload, dict) else []
-reasons = reasons if isinstance(reasons, list) else []
-
-snapshot_reasons = {
-    "control_plane_snapshot_unavailable",
-    "control_plane_snapshot_missing",
-    "snapshot_non_200",
-    "snapshot_structural_data_loss",
-}
-hard_fail_reasons = {
-    "ohlcv_component_hard_fail",
-    "depth_component_hard_fail",
-    "trades_component_hard_fail",
-    "ohlcv_seq_missing_hard_fail",
-}
-
-if any(reason in snapshot_reasons for reason in reasons):
-    print(f"{int(snapshot_threshold)} snapshot")
-elif any(reason in hard_fail_reasons for reason in reasons):
-    print(f"{int(hard_fail_threshold)} hard-fail")
-else:
-    print(f"{int(default_threshold)} default")
+decision = json.loads(Path(sys.argv[1]).read_text())
+print(
+    "1" if decision.get("capture_full") else "0",
+    decision.get("event") or "UNKNOWN",
+    decision.get("signature") or "none",
+    int(decision.get("occurrences") or 0),
+)
 PY
-)"
-        chart_capture_required_fails="${threshold_eval%% *}"
-        chart_capture_threshold_reason="${threshold_eval#* }"
-      else
-        chart_capture_required_fails="$CHART_OFFLINE_CAPTURE_CONSECUTIVE_FAILS"
-        chart_capture_threshold_reason="default"
-      fi
-
-      chart_capture_count=$((chart_capture_count + 1))
-      echo "$chart_capture_count" > "$CHART_CAPTURE_COUNT_FILE"
-      echo "$chart_capture_required_fails" > "$CHART_CAPTURE_REQUIRED_FAILS_FILE"
-      echo "$chart_capture_threshold_reason" > "$CHART_CAPTURE_THRESHOLD_REASON_FILE"
-      printf '%s\n' "$chart_capture_output" >> "$LOG_DIR/healthwatch.log"
-      if (( chart_capture_count >= chart_capture_required_fails )); then
-        persisted_chart_capture_output="$(CAPTURE_PERSIST_ON_CRITICAL=1 $ROOT_DIR/scripts/capture_chart_offline_context.sh 2>&1 || true)"
-        printf '%s\n' "$persisted_chart_capture_output" >> "$LOG_DIR/healthwatch.log"
-        if [[ "$chart_capture_state" != "captured" ]]; then
-          alert "warning" "Chart OHLCV offline context captured after ${chart_capture_count}/${chart_capture_required_fails} consecutive ${chart_capture_threshold_reason} critical runs. $(printf '%s' "$persisted_chart_capture_output" | tail -n 1)"
-        fi
-        echo "captured" > "$CHART_CAPTURE_STATE_FILE"
-      else
-        echo "pending" > "$CHART_CAPTURE_STATE_FILE"
-      fi
+    )
+    if [[ $capture_exit -eq 10 ]]; then
+      echo "$incident_occurrences" > "$CHART_CAPTURE_COUNT_FILE"
     else
-      printf '%s\n' "$chart_capture_output" >> "$LOG_DIR/healthwatch.log"
-      alert "warning" "Chart OHLCV capture probe failed unexpectedly (exit=$capture_exit)."
+      echo "0" > "$CHART_CAPTURE_COUNT_FILE"
     fi
+    echo "1" > "$CHART_CAPTURE_REQUIRED_FAILS_FILE"
+    echo "signature-policy" > "$CHART_CAPTURE_THRESHOLD_REASON_FILE"
+
+    if [[ "$capture_full" == "1" ]]; then
+      set +e
+      persisted_chart_capture_output="$(
+        CAPTURE_PERSIST_ON_CRITICAL=1 \
+        CAPTURE_FORCE_PERSIST=1 \
+        CAPTURE_PROBE_INPUT="$ROOT_DIR/logs/healthwatch/chart-offline/latest-probe.json" \
+        CAPTURE_EVENT_TYPE="$capture_event" \
+        CAPTURE_INCIDENT_SIGNATURE="$capture_signature" \
+        "$ROOT_DIR/scripts/capture_chart_offline_context.sh" 2>&1
+      )"
+      persisted_capture_exit=$?
+      set -e
+      if [[ $persisted_capture_exit -ne 0 && $persisted_capture_exit -ne 10 ]]; then
+        alert "warning" "Chart Healthwatch event capture failed unexpectedly (exit=${persisted_capture_exit}, event=${capture_event})."
+      fi
+      printf '%s\n' "$persisted_chart_capture_output" >> "$LOG_DIR/healthwatch.log"
+    fi
+
+    if [[ "$capture_event" == "RECOVERY" ]]; then
+      alert "recovery" "Chart OHLCV pipeline recovered; recovery evidence captured."
+      echo "healthy" > "$CHART_CAPTURE_STATE_FILE"
+    elif [[ $capture_exit -eq 10 ]]; then
+      if [[ "$capture_event" == "FIRST_FAILURE" || "$capture_event" == "SIGNATURE_CHANGE" ]]; then
+        alert "warning" "Chart Healthwatch incident ${capture_event}; full evidence captured (occurrence=${incident_occurrences})."
+      fi
+      echo "active" > "$CHART_CAPTURE_STATE_FILE"
+    else
+      echo "healthy" > "$CHART_CAPTURE_STATE_FILE"
+    fi
+    rm -f "$decision_file"
+    trap - EXIT
+  else
+    alert "warning" "Chart OHLCV capture probe failed unexpectedly (exit=$capture_exit)."
   fi
 fi
 

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LOG_ROOT="${ROOT_DIR}/logs/healthwatch/chart-offline"
+LOG_ROOT="${HEALTHWATCH_CHART_LOG_ROOT:-${ROOT_DIR}/logs/healthwatch/chart-offline}"
 mkdir -p "$LOG_ROOT"
 
 UI_BASE_URL="${UI_BASE_URL:-https://app.txt.gtixt.com}"
@@ -15,11 +15,18 @@ CAPTURE_LOOKBACK_MINUTES="${CAPTURE_LOOKBACK_MINUTES:-60}"
 CAPTURE_LOG_TAIL="${CAPTURE_LOG_TAIL:-200}"
 CAPTURE_SECRET_FILE="${CAPTURE_SECRET_FILE:-${ROOT_DIR}/secrets/default_operator_password}"
 CAPTURE_PERSIST_ON_CRITICAL="${CAPTURE_PERSIST_ON_CRITICAL:-1}"
+CAPTURE_FORCE_PERSIST="${CAPTURE_FORCE_PERSIST:-0}"
+CAPTURE_PROBE_INPUT="${CAPTURE_PROBE_INPUT:-}"
+CAPTURE_EVENT_TYPE="${CAPTURE_EVENT_TYPE:-FIRST_FAILURE}"
+CAPTURE_INCIDENT_SIGNATURE="${CAPTURE_INCIDENT_SIGNATURE:-unknown}"
 
 TMP_JSON="$(mktemp)"
 trap 'rm -f "$TMP_JSON"' EXIT
 
-python3 - "$UI_BASE_URL" "$CAPTURE_INSTRUMENT" "$CAPTURE_VENUE" "$CAPTURE_TIMEFRAME" "$CAPTURE_LOOKBACK_MINUTES" "$CAPTURE_TRADE_LIMIT" "$CAPTURE_SECRET_FILE" > "$TMP_JSON" <<'PY'
+if [[ -n "$CAPTURE_PROBE_INPUT" ]]; then
+  cp -- "$CAPTURE_PROBE_INPUT" "$TMP_JSON"
+else
+  python3 - "$UI_BASE_URL" "$CAPTURE_INSTRUMENT" "$CAPTURE_VENUE" "$CAPTURE_TIMEFRAME" "$CAPTURE_LOOKBACK_MINUTES" "$CAPTURE_TRADE_LIMIT" "$CAPTURE_SECRET_FILE" > "$TMP_JSON" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -205,28 +212,29 @@ print(json.dumps({
     "snapshot": snapshot,
   }, indent=2))
 PY
+fi
 
-if ! python3 - "$TMP_JSON" <<'PY'
+probe_offline="$(python3 - "$TMP_JSON" <<'PY'
 import json, sys
 from pathlib import Path
 data = json.loads(Path(sys.argv[1]).read_text())
-raise SystemExit(0 if data.get("offline") else 1)
+print("1" if data.get("offline") else "0")
 PY
-then
-    cp "$TMP_JSON" "$LOG_ROOT/latest-probe.json"
+)"
+python3 "$ROOT_DIR/scripts/healthwatch_atomic.py" "$TMP_JSON" "$LOG_ROOT/latest-probe.json"
+
+if [[ "$probe_offline" != "1" && "$CAPTURE_FORCE_PERSIST" != "1" ]]; then
   exit 0
 fi
 
-cp "$TMP_JSON" "$LOG_ROOT/latest-probe.json"
-
-if [[ "$CAPTURE_PERSIST_ON_CRITICAL" != "1" ]]; then
+if [[ "$probe_offline" == "1" && "$CAPTURE_PERSIST_ON_CRITICAL" != "1" ]]; then
     exit 10
 fi
 
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 CAPTURE_DIR="${LOG_ROOT}/${STAMP}"
 mkdir -p "$CAPTURE_DIR"
-cp "$TMP_JSON" "$CAPTURE_DIR/summary.json"
+python3 "$ROOT_DIR/scripts/healthwatch_atomic.py" "$TMP_JSON" "$CAPTURE_DIR/summary.json"
 
 {
   echo "captured_at=${STAMP}"
@@ -235,7 +243,25 @@ cp "$TMP_JSON" "$CAPTURE_DIR/summary.json"
   echo "instrument=${CAPTURE_INSTRUMENT}"
   echo "venue=${CAPTURE_VENUE}"
   echo "timeframe=${CAPTURE_TIMEFRAME}"
+  echo "event_type=${CAPTURE_EVENT_TYPE}"
+  echo "incident_signature=${CAPTURE_INCIDENT_SIGNATURE}"
 } > "$CAPTURE_DIR/context.env"
+
+python3 - "$ROOT_DIR" "$CAPTURE_DIR/incident-event.json" "$CAPTURE_EVENT_TYPE" "$CAPTURE_INCIDENT_SIGNATURE" "$probe_offline" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+from scripts.healthwatch_atomic import atomic_write_json
+
+destination, event_type, signature, offline = sys.argv[2:6]
+atomic_write_json(Path(destination), {
+    "event": event_type,
+    "signature": signature,
+    "offline": offline == "1",
+})
+PY
 
 if command -v docker >/dev/null 2>&1; then
   (
@@ -250,6 +276,9 @@ if command -v docker >/dev/null 2>&1; then
   )
 fi
 
-ln -sfn "$CAPTURE_DIR" "$LOG_ROOT/latest"
-echo "Captured chart offline context in $CAPTURE_DIR"
-exit 10
+latest_link_tmp="$LOG_ROOT/.latest.$$"
+ln -s "$CAPTURE_DIR" "$latest_link_tmp"
+mv -Tf "$latest_link_tmp" "$LOG_ROOT/latest"
+echo "Captured chart Healthwatch event ${CAPTURE_EVENT_TYPE} in $CAPTURE_DIR"
+[[ "$probe_offline" == "1" ]] && exit 10
+exit 0

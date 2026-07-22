@@ -11,9 +11,11 @@ mkdir -p "$(dirname "$LOCAL_TERMINAL_DIAGNOSTIC_JSON")"
 
 python3 - "$LOCAL_TERMINAL_CAPTURE_FILE" "$LOCAL_TERMINAL_DIAGNOSTIC_JSON" "$LOCAL_TERMINAL_STALE_AFTER_SEC" "$LOCAL_TERMINAL_ROUTING_BLOCK_CONSECUTIVE_CAPTURES" <<'PY'
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+import tempfile
 
 capture_file, output_file, stale_after_raw, routing_block_threshold_raw = sys.argv[1:5]
 
@@ -32,6 +34,20 @@ def load_json(path):
         return json.loads(Path(path).read_text())
     except Exception:
         return None
+
+
+def atomic_write_text(path, value):
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{destination.name}.", dir=destination.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(value)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_name, destination)
+    finally:
+        Path(temporary_name).unlink(missing_ok=True)
 
 
 def normalize_int(value, default):
@@ -213,7 +229,7 @@ if isinstance(store, dict):
     elif result["capture_freshness_state"] in {"stale", "invalid"}:
         result["state"] = "failed"
 
-Path(output_file).write_text(json.dumps(result, indent=2) + "\n")
+atomic_write_text(output_file, json.dumps(result, indent=2) + "\n")
 print(
     "local_terminal_state={state} freshness={freshness} publish_age_sec={publish_age} routing_block={routing_block} consecutive={count}/{threshold}".format(
         state=result["state"],

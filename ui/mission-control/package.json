@@ -37,6 +37,7 @@
     "test:terminal-v4-canonical-multi-tf": "sh scripts/run_terminal_v4_canonical_multi_tf.sh",
     "test:xscale-viewport-guard": "node scripts/test-xscale-viewport-guard.js",
     "test:ohlcv-kernel-regression": "sh scripts/test-ohlcv-kernel-regression.sh",
+    "test:market-snapshot-contract": "sh scripts/test-market-snapshot-contract.sh",
     "test:predictor-contract-regression": "sh scripts/test-predictor-contract-regression.sh",
     "scan:truth-divergence-matrix": "sh scripts/scan-runtime-truth-matrix.sh",
     "scan:lifecycle-publish-gate": "sh scripts/scan-lifecycle-publish-gate.sh",

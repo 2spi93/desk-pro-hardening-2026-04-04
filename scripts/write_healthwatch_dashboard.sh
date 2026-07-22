@@ -28,9 +28,11 @@ LOCAL_TERMINAL_ROUTING_BLOCK_STATE_FILE="${LOCAL_TERMINAL_ROUTING_BLOCK_STATE_FI
 
 python3 - "$DASHBOARD_JSON" "$DASHBOARD_MD" "$STATE_FILE" "$CHART_CAPTURE_STATE_FILE" "$CHART_CAPTURE_COUNT_FILE" "$CHART_CAPTURE_THRESHOLD" "$CHART_CAPTURE_REQUIRED_FAILS_FILE" "$CHART_CAPTURE_THRESHOLD_REASON_FILE" "$PUBLIC_CHART_DIAGNOSTIC_STATE_FILE" "$PUBLIC_CHART_FRESHNESS_STATE_FILE" "$PUBLIC_CHART_RENDERABILITY_STATE_FILE" "$PUBLIC_CHART_VISUAL_STATE_FILE" "$PUBLIC_CHART_FAILURE_REASON_FILE" "$PUBLIC_CHART_FAILURE_DETAILS_FILE" "$LOCAL_TERMINAL_DIAGNOSTIC_JSON" "$LOCAL_TERMINAL_STALE_STATE_FILE" "$LOCAL_TERMINAL_ROUTING_BLOCK_STATE_FILE" "$CHART_PROBE_JSON" "$PUBLIC_DIAG_JSON" <<'PY'
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+import tempfile
 
 (
     dashboard_json_path,
@@ -69,7 +71,22 @@ def read_json(path: str):
         return None
 
 
+def atomic_write_text(path: str, value: str) -> None:
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{destination.name}.", dir=destination.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(value)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_name, destination)
+    finally:
+        Path(temporary_name).unlink(missing_ok=True)
+
+
 chart_probe = read_json(chart_probe_path) or {}
+chart_incident = read_json(str(Path(chart_probe_path).with_name("incident-state.json"))) or {}
 public_diag = read_json(public_diag_path) or {}
 local_terminal_diag = read_json(local_terminal_diag_path) or {}
 offline_alignment = chart_probe.get("public_signal_alignment") if isinstance(chart_probe, dict) else None
@@ -112,6 +129,12 @@ data = {
         "advisory_reasons": advisory_reasons if isinstance(advisory_reasons, list) else [],
         "public_signal_alignment": offline_alignment if isinstance(offline_alignment, dict) else {},
         "captured_at": chart_probe.get("captured_at") if isinstance(chart_probe, dict) else None,
+        "event_count": int(chart_incident.get("occurrences") or 0),
+        "artifact_policy": "first-change-recovery-hourly",
+        "incident_signature": chart_incident.get("signature"),
+        "first_seen": chart_incident.get("first_seen"),
+        "last_seen": chart_incident.get("last_seen"),
+        "last_full_capture": chart_incident.get("last_full_capture"),
     },
     "public_chart_visibility": {
         "state": public_chart_state,
@@ -157,7 +180,7 @@ data = {
     },
 }
 
-Path(dashboard_json_path).write_text(json.dumps(data, indent=2) + "\n")
+atomic_write_text(dashboard_json_path, json.dumps(data, indent=2) + "\n")
 
 chart_capture = data["chart_offline_capture"]
 public_chart = data["public_chart_visibility"]
@@ -176,6 +199,8 @@ md_lines = [
     "## Chart Offline Capture",
     f"- State: {chart_capture['state']}",
     f"- Consecutive critical runs: {chart_capture['consecutive_critical_runs']} / {chart_capture['active_threshold']}",
+    f"- Incident event count: {chart_capture['event_count']}",
+    f"- Artifact policy: {chart_capture['artifact_policy']}",
     f"- Threshold reason: {chart_capture['threshold_reason']}",
     f"- Offline: {chart_capture['offline']}",
     f"- Offline reasons: {', '.join(chart_capture['offline_reasons']) if chart_capture['offline_reasons'] else 'none'}",
@@ -229,5 +254,5 @@ md_lines = [
     f"- Auto incident status: {local_terminal['auto_incident_status']}",
 ]
 
-Path(dashboard_md_path).write_text("\n".join(md_lines) + "\n")
+atomic_write_text(dashboard_md_path, "\n".join(md_lines) + "\n")
 PY
