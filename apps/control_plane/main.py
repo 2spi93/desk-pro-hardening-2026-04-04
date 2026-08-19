@@ -34,6 +34,7 @@ from apps.control_plane.protection_runtime import (
     detect_protection_status_events,
 )
 from apps.control_plane.proof_finalizer import assert_legacy_finalize_not_for_proof_rail
+from apps.control_plane.market_bus_contract import build_market_bus_snapshot_contract
 from shared.auth import AuthContext, auth_context_from_token, hash_password, issue_access_token, sign_approval_payload, verify_approval_signature, verify_password
 from shared.db import ensure_schema, execute, execute_rowcount, fetch_all, fetch_one, json_dumps
 from shared.models import (
@@ -19743,21 +19744,23 @@ async def market_bus_snapshot(
     }
     overall_status = "ok" if all(component.get("status") == "ok" for component in component_health.values()) else "degraded"
 
-    return {
-        "instrument": symbol,
-        "venue": venue,
-        "timeframe": timeframe,
-        "trades": trades,
-        "microstructure": microstructure,
-        "session_state": session_state,
-        "orderbook": orderbook,
-        "routing_score": routing_score,
-        "meta": {
-            "health": {
-                "status": overall_status,
-                "components": component_health,
-            },
-            "sequencing": {
+    observed_at = _now_utc().isoformat()
+    return build_market_bus_snapshot_contract(
+        instrument=symbol,
+        venue=venue,
+        timeframe=timeframe,
+        trades=trades,
+        ohlcv_rows=ohlcv_rows if isinstance(ohlcv_rows, list) else [],
+        depth_snapshot=depth_snapshot if isinstance(depth_snapshot, dict) else None,
+        microstructure=microstructure,
+        session_state=session_state,
+        orderbook=orderbook,
+        routing_score=routing_score,
+        health={
+            "status": overall_status,
+            "components": component_health,
+        },
+        sequencing={
                 "ohlcv": {
                     "first_seq": ohlcv_first_seq,
                     "latest_seq": ohlcv_latest_seq,
@@ -19774,19 +19777,16 @@ async def market_bus_snapshot(
                     "count": len(trades) if isinstance(trades, list) else 0,
                     "raw_count": int(trade_preprocessor.get("raw_count") or 0) if isinstance(trade_preprocessor, dict) else None,
                 },
-            },
-            "preprocessor": {
-                "trades": {
-                    **(trade_preprocessor or {}),
-                    "journal": trade_preprocessor_journal,
-                    "journal_summary": trade_preprocessor_journal_summary,
-                    "analytics": trade_preprocessor_analytics,
-                    "alert": trade_preprocessor_alert,
-                },
-            },
         },
-        "as_of": _now_utc().isoformat(),
-    }
+        trade_preprocessor={
+            **(trade_preprocessor or {}),
+            "journal": trade_preprocessor_journal,
+            "journal_summary": trade_preprocessor_journal_summary,
+            "analytics": trade_preprocessor_analytics,
+            "alert": trade_preprocessor_alert,
+        },
+        observed_at=observed_at,
+    )
 
 
 @app.get("/v1/broker/balance")

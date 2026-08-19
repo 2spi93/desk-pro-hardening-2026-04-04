@@ -1,0 +1,16 @@
+{
+  "version": "txt.healthwatch-retention.v1",
+  "raw_full_diagnostics_days": 7,
+  "incident_transitions_days": 90,
+  "identical_active_incident_full_capture_seconds": 3600,
+  "long_term_summary_interval_seconds": 86400,
+  "latest_state": "always",
+  "log_rotation": {
+    "frequency": "daily",
+    "max_size": "100M",
+    "rotate": 14,
+    "compress": true
+  },
+  "activation_status": "NOT_ACTIVATED",
+  "historical_deletion_status": "NOT_AUTHORIZED"
+}

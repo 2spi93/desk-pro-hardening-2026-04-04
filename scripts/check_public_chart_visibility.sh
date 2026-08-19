@@ -33,6 +33,7 @@ if [[ -z "$MC_TOKEN" ]]; then
   exit 1
 fi
 
+DIAGNOSTIC_TMP="$(mktemp "${OUT_DIR}/.diagnostic.json.XXXXXX")"
 docker run --rm \
   --network host \
   -v "${ROOT_DIR}:/workspace" \
@@ -41,6 +42,11 @@ docker run --rm \
   -e "PUBLIC_CHART_MAX_BARS_STALE_MS=${PUBLIC_CHART_MAX_BARS_STALE_MS}" \
   -v "${OUT_DIR}:/artifacts" \
   "$PLAYWRIGHT_IMAGE" \
-  bash -lc 'node scripts/chart_stability_diagnose_playwright.js' | tee "$OUT_DIR/diagnostic.json"
+  bash -lc 'node scripts/chart_stability_diagnose_playwright.js' | tee "$DIAGNOSTIC_TMP"
 
-ln -sfn "$OUT_DIR" "$LOG_ROOT/latest"
+python3 "$ROOT_DIR/scripts/healthwatch_atomic.py" "$DIAGNOSTIC_TMP" "$OUT_DIR/diagnostic.json"
+rm -f "$DIAGNOSTIC_TMP"
+
+LATEST_TMP="$LOG_ROOT/.latest.$$"
+ln -s "$OUT_DIR" "$LATEST_TMP"
+mv -Tf "$LATEST_TMP" "$LOG_ROOT/latest"

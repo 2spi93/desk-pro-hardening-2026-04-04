@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 
-import { fallbackMicrostructure, fallbackSessionState, hasUsableOhlcvRows } from "../../../../../lib/binanceMarketFallback";
+import { fallbackMicrostructure, fallbackSessionState } from "../../../../../lib/binanceMarketFallback";
 import { cpFetchJsonSafe, extractMcContextHeaders } from "../../../../../lib/controlPlane";
+import { assessMarketSnapshot, attachMarketSnapshotAssessment, shouldUseCanonicalSnapshot } from "../../../../../lib/marketSnapshotContract";
 
 type JsonMap = Record<string, unknown>;
 
@@ -97,11 +98,13 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
     { headers: extractMcContextHeaders(request) },
   );
 
-  if (response.ok && hasUsableOhlcvRows(safeRecord(payload).ohlcv_rows)) {
-    return NextResponse.json(payload, {
+  const controlPlaneAssessment = assessMarketSnapshot(payload);
+  if (shouldUseCanonicalSnapshot(response.ok, controlPlaneAssessment)) {
+    return NextResponse.json(attachMarketSnapshotAssessment(payload, controlPlaneAssessment), {
       status: response.status,
       headers: {
         "X-Data-Source": "market-bus-snapshot",
+        "X-Market-Snapshot-Availability": controlPlaneAssessment.state,
       },
     });
   }
@@ -239,7 +242,8 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
   }, Number.NEGATIVE_INFINITY);
   const tradesFreshnessMs = Number.isFinite(latestTradeMs) ? Math.max(0, nowMs - latestTradeMs) : -1;
 
-  return NextResponse.json({
+  const fallbackPayload = {
+    contract_version: "txt.market-bus-snapshot.v1",
     instrument,
     venue,
     timeframe,
@@ -253,7 +257,8 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
     meta: {
       health: {
         status: fallbackStatus,
-        reason: response.status === 404 ? "control_plane_snapshot_missing" : "control_plane_snapshot_unavailable",
+        reason: controlPlaneAssessment.reasons[0]
+          || (response.status === 404 ? "control_plane_snapshot_missing" : "control_plane_snapshot_unavailable"),
         components: {
           ohlcv: {
             freshness_ms: ohlcvFreshnessMs,
@@ -285,11 +290,19 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
         },
       },
     },
+    observation: {
+      observed_at: new Date().toISOString(),
+      source: "mission-control-market-bus-fallback",
+    },
     as_of: new Date().toISOString(),
-  }, {
+  };
+  const fallbackAssessment = assessMarketSnapshot(fallbackPayload);
+  return NextResponse.json(attachMarketSnapshotAssessment(fallbackPayload, fallbackAssessment), {
     status: 200,
     headers: {
       "X-Data-Source": "market-bus-snapshot-fallback",
+      "X-Market-Snapshot-Availability": fallbackAssessment.state,
+      "X-Control-Plane-Contract-Error": controlPlaneAssessment.reasons.join(",").slice(0, 512),
     },
   });
 }
